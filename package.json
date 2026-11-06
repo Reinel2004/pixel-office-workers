@@ -1,0 +1,17 @@
+{
+  "name": "wad-ai-office",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "test": "node scripts/shared-sync.mjs --check && npm --prefix backend test && npm --prefix frontend test",
+    "sync-shared": "node scripts/shared-sync.mjs",
+    "start": "npm --prefix backend start",
+    "dev:server": "npm --prefix backend run dev",
+    "build:server": "npm --prefix backend run build"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "wad-ai-office-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc --noEmit && esbuild src/index.ts --bundle --platform=node --format=esm --target=node18 --outfile=dist/index.js",
+    "start": "node dist/index.js",
+    "hash-password": "tsx scripts/hash-password.ts",
+    "gemini-models": "tsx scripts/gemini-models.ts",
+    "test": "tsx --test src/tests/adapters.test.ts src/tests/ai.test.ts src/tests/app.test.ts src/tests/calc.test.ts src/tests/client.test.ts src/tests/runner.test.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.21.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}

@@ -1,0 +1,43 @@
+# Render Blueprint for the WAD AI Office back end (the API server in backend/).
+# Render reads this file from the repository root. Values marked `sync: false` are secrets or
+# site-specific: Render asks for them when you create the service, and they are never stored here.
+services:
+  - type: web
+    name: wad-ai-office-api
+    runtime: node
+    rootDir: backend
+    # --include=dev: TypeScript and esbuild are needed to build, even with NODE_ENV=production.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: "true"
+      - key: APP_COOKIE_SECURE
+        value: "true"
+      # Your Vercel address, e.g. https://wad-ai-office.vercel.app (no trailing slash).
+      - key: APP_ORIGIN
+        sync: false
+      - key: APP_USERS
+        sync: false
+      - key: API_ALLOWED_HOSTS
+        value: wadfurniture-management.wadcatalog.com,wad-order-management.wadcatalog.com
+      - key: FINANCE_API_BASE_URL
+        value: https://wadfurniture-management.wadcatalog.com/api/
+      - key: FINANCE_API_TOKEN
+        sync: false
+      - key: ORDERS_API_BASE_URL
+        value: https://wad-order-management.wadcatalog.com/api/
+      - key: ORDERS_API_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+      # Render's disk is wiped on every deploy and restart; the task log goes to Render's logs instead.
+      - key: TASK_LOG_FILE
+        value: ""
