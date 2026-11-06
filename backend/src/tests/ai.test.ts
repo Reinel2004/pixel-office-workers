@@ -279,3 +279,131 @@ test('the task log records the prompt length, never the prompt text', async () =
   assert.ok(!JSON.stringify(entries).includes('Santos'));
   assert.equal(entries[0].promptChars, 'Secret plan for Mrs Santos'.length);
 });
+
+
+test('Mika: trends, product mix and pipeline are calculated by code; values only with finance access', async () => {
+  const mk = (ref: string, date: string, status: string, stage: string | null, gross: number, products: { category: string; type: string; wood: string; finish: string; qty: number; centavos: number }[], last?: string) =>
+    ({ ref, orderId: ref, status, isClosed: status === 'Delivered', dueDate: '2026-10-15', progressPercent: null, stage, createdDate: date, grossCentavos: gross, downpaymentCentavos: 0, customerName: `Customer ${ref}`, lastProgressDate: last ?? null, products }) as OrderRecord;
+  const list = [
+    mk('ORD-1', '2026-08-03', 'Delivered', 'done', 2_000_000, [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'With Varnish', qty: 2, centavos: 2_000_000 }]),
+    mk('ORD-2', '2026-09-10', 'In Progress', 'finishing', 1_300_000, [{ category: 'Door', type: 'Ordinary', wood: 'Mahogany', finish: 'With Varnish', qty: 1, centavos: 1_300_000 }], '2026-10-20'),
+    mk('ORD-3', '2026-10-01', 'Pending', 'production', 900_050, [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'Without Varnish', qty: 1, centavos: 900_050 }], '2026-11-01'),
+  ];
+  const src = orders({ listOrders: async () => list, listOpenOrders: async () => list.filter((o) => !o.isClosed) });
+  src.capabilities.payments = true;
+  src.capabilities.products = true;
+  src.capabilities.stageDates = true;
+  const fc = (name: string, args: Record<string, unknown> = {}) => ({ functionCall: { name, args } });
+  const g = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [fc('get_order_trends', { from: '2026-08-01', to: '2026-10-31' }), fc('get_product_mix', { from: '2026-08-01', to: '2026-10-31' }), fc('get_production_pipeline')] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'Carved narra doors lead.' }] } }] },
+  ]);
+  const r = runner(g.ai, { orders: src });
+  const final = await done(r, r.submitAi(admin, 'mika', 'How are we doing?').job.id);
+  assert.equal(final.status, 'completed');
+  const [trends, mix, pipe] = (g.bodies[1].contents as any[])[2].parts.map((p: any) => p.functionResponse.response);
+  assert.deepEqual(trends.periods.map((p: any) => [p.period, p.orders]), [['2026-08', 1], ['2026-09', 1], ['2026-10', 1]]);
+  assert.equal(trends.totalOrderValue, '42000.50');
+  assert.equal(trends.periods[0].averageOrderValue, '20000.00');
+  assert.equal(mix.pieces, 4);
+  assert.equal(mix.byWood[0].name, 'Narra');
+  assert.equal(mix.byWood[0].pieces, 3);
+  assert.equal(mix.byWood[0].sharePercent, 75);
+  assert.equal(mix.topCombinations[0].name, 'Door · Carved · Narra · With Varnish');
+  assert.equal(pipe.openOrders, 2);
+  assert.equal(pipe.slowestStage, 'finishing'); // last moved 2026-10-20, longer ago than production's 2026-11-01
+  assert.equal(pipe.stages.find((s: any) => s.stage === 'finishing').averageDaysSinceLastProgress, 16);
+  // no customer names in anything sent to Gemini; the office still gets them for display
+  assert.ok(!JSON.stringify(g.bodies).includes('Customer ORD'));
+  assert.equal(final.steps[0].result!.customers!['ORD-2'], 'Customer ORD-2');
+
+  // An operations user: trends without money, and no finance trends at all.
+  assert.deepEqual(toolsFor('mika', ops).sort(), ['get_order_trends', 'get_orders', 'get_product_mix', 'get_production_pipeline']);
+  const g2 = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [fc('get_order_trends', { from: '2026-08-01', to: '2026-10-31' })] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] } }] },
+  ]);
+  const r2 = runner(g2.ai, { orders: src });
+  await done(r2, r2.submitAi(ops, 'mika', 'Order trend please').job.id);
+  const t2 = (g2.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
+  assert.equal(t2.totalOrderValue, undefined);
+  assert.equal(t2.periods[0].orderValue, undefined);
+  assert.equal(t2.periods[0].orders, 1);
+});
+
+test('Mika: monthly finance trends with best and worst month', async () => {
+  const fin: FinanceSource = {
+    ...finance,
+    listIncome: async () =>
+      [
+        { ref: 'I1', kind: 'income', date: '2026-09-05', centavos: 5_000_000, currency: 'PHP', category: null, orderId: null },
+        { ref: 'I2', kind: 'income', date: '2026-10-05', centavos: 1_000_000, currency: 'PHP', category: null, orderId: null },
+      ] as FinanceRecord[],
+    listExpenses: async () =>
+      [
+        { ref: 'E1', kind: 'expense', date: '2026-09-07', centavos: 1_000_000, currency: 'PHP', category: 'Rent', orderId: null },
+        { ref: 'E2', kind: 'expense', date: '2026-10-08', centavos: 1_500_000, currency: 'PHP', category: 'Utilities', orderId: null },
+      ] as FinanceRecord[],
+  };
+  const g = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'get_finance_trends', args: { from: '2026-09-01', to: '2026-10-31' } } }] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'September was best.' }] } }] },
+  ]);
+  const r = new JobRunner({ finance: fin, orders: orders(), maxConcurrent: 1, now: () => new Date('2026-11-05T02:00:00Z'), ai: { ai: g.ai, maxToolRounds: 3, maxRangeDays: 366, knowledgeDir: 'nope' } });
+  const final = await done(r, r.submitAi(admin, 'mika', 'Best month?').job.id);
+  assert.equal(final.status, 'completed');
+  const t = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
+  assert.deepEqual(t.months.map((m: any) => [m.month, m.net]), [['2026-09', '40000.00'], ['2026-10', '-5000.00']]);
+  assert.equal(t.bestMonthByNet, '2026-09');
+  assert.equal(t.worstMonthByNet, '2026-10');
+  assert.deepEqual(t.months[1].largestExpenseCategory, { category: 'Utilities', amount: '15000.00' });
+});
+
+
+// A real (tiny) JPEG header followed by filler bytes; enough for the signature check.
+const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)]).toString('base64');
+
+test('Carlo: a photo goes to Gemini with the request, and is never logged or kept', async () => {
+  const entries: Record<string, unknown>[] = [];
+  const g = fakeGemini([{ candidates: [{ content: { role: 'model', parts: [{ text: '**What I see**\n- A carved door\n\n**Caption**\nCrafted with care.' }] } }] }]);
+  const r = new JobRunner({ finance, orders: orders(), maxConcurrent: 1, log: (e) => entries.push(e), ai: { ai: g.ai, maxToolRounds: 3, maxRangeDays: 366, knowledgeDir: 'nope' } });
+  const { job } = r.submitAi(admin, 'carlo', '', { mimeType: 'image/jpeg', data: `data:image/jpeg;base64,${JPEG}` });
+  assert.equal(job.prompt, 'Write a Facebook caption for this photo.'); // empty text is fine with a photo
+  assert.equal(job.image?.mimeType, 'image/jpeg');
+  assert.equal(job.image?.bytes, 204);
+  assert.equal(job.image?.sha256.length, 16);
+  const final = await done(r, job.id);
+  assert.equal(final.status, 'completed');
+  // The photo comes first, then the text, in the first message; the photo rules are in the instructions.
+  const parts = (g.bodies[0].contents as any[])[0].parts;
+  assert.deepEqual(parts[0], { inlineData: { mimeType: 'image/jpeg', data: JPEG } });
+  assert.equal(parts[1].text, 'Write a Facebook caption for this photo.');
+  assert.match(JSON.stringify(g.bodies[0].systemInstruction), /A photo is attached/);
+  // Never in the task log or the job snapshot; dropped from memory after the task.
+  assert.ok(!JSON.stringify(entries).includes(JPEG.slice(0, 40)));
+  assert.ok(entries.some((e) => e.imageBytes === 204));
+  assert.ok(!JSON.stringify(final).includes(JPEG.slice(0, 40)));
+  assert.equal((r as any).images.size, 0);
+});
+
+test('photos are checked: only Carlo, only real JPEG/PNG/WebP, size-limited', () => {
+  const g = fakeGemini([]);
+  const r = runner(g.ai);
+  const code = (fn: () => unknown) => {
+    try {
+      fn();
+      return 0;
+    } catch (e) {
+      return (e as SubmitError).status;
+    }
+  };
+  assert.equal(code(() => r.submitAi(admin, 'bea', 'Look', { mimeType: 'image/jpeg', data: JPEG })), 400); // Bea takes no photos
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Look', { mimeType: 'image/gif', data: JPEG })), 400); // type not allowed
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Look', { mimeType: 'image/png', data: JPEG })), 400); // bytes are not a PNG
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Look', { mimeType: 'image/jpeg', data: Buffer.from('<script>alert(1)</script>').toString('base64') })), 400);
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Look', { mimeType: 'image/jpeg', data: 'not base64 !!!' })), 400);
+  const big = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(3 * 1024 * 1024 + 10)]).toString('base64');
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Look', { mimeType: 'image/jpeg', data: big })), 413);
+  const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(50)]).toString('base64');
+  assert.equal(code(() => r.submitAi(admin, 'carlo', 'Caption please', { mimeType: 'image/webp', data: webp })), 0);
+});

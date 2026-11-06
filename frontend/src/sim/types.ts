@@ -1,4 +1,4 @@
-export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'carlo' | 'dev' | 'chief';
+export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'dev' | 'chief';
 
 export type RoomId =
   | 'intel'
@@ -63,6 +63,8 @@ export interface Settings {
   reducedMotion: boolean;
   speed: 1 | 2;
   labels: boolean;
+  /** Idle agents take breaks: gym, court, pantry or a walk. Off with reduced motion. */
+  breaks: boolean;
   feedOpen: boolean;
   mode: AppMode;
 }

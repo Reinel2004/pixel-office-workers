@@ -131,6 +131,7 @@ function SettingsMenu({ engine, live, onClose, onResetView }: { engine: Engine; 
       <Toggle label="Sound effects" checked={s.sound} onChange={(v) => engine.updateSettings({ sound: v })} />
       <Toggle label="Reduced motion" checked={s.reducedMotion} onChange={(v) => engine.updateSettings({ reducedMotion: v })} />
       <Toggle label="Name labels" checked={s.labels} onChange={(v) => engine.updateSettings({ labels: v })} />
+      <Toggle label="Breaks when idle (gym, court, walks)" checked={s.breaks} onChange={(v) => engine.updateSettings({ breaks: v })} />
       <div className="menu-row">
         <span>Simulation speed</span>
         <div className="seg">

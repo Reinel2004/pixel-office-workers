@@ -2,10 +2,10 @@
 // animates agents from these step events. A step is "completed" only after its result has
 // been received AND validated. Nothing here waits on animations.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId } from '../../shared/live';
-import { LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../shared/live';
+import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../shared/live';
 import { manilaDate } from '../../shared/manila';
 import type { FinanceRecord, FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
 import { AGENT_PROFILES, runAiTask, type AiTaskDeps } from '../ai/tasks';
@@ -134,14 +134,22 @@ export class JobRunner extends EventEmitter {
   }
 
   /** A free-text task for one agent, answered by the AI provider with read-only data tools. */
-  submitAi(user: SessionUser, agent: LiveAgentId, rawPrompt: string): { job: Job; deduplicated: boolean } {
+  submitAi(user: SessionUser, agent: LiveAgentId, rawPrompt: string, rawImage?: { mimeType: string; data: string }): { job: Job; deduplicated: boolean } {
     if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
     if (!LIVE_AGENT_IDS.includes(agent)) throw new SubmitError(400, 'Unknown agent.');
-    const prompt = rawPrompt.replace(/\s+/g, ' ').trim();
+    const image = rawImage ? checkImage(agent, rawImage) : null;
+    let prompt = rawPrompt.replace(/\s+/g, ' ').trim();
+    if (!prompt && image) prompt = 'Write a Facebook caption for this photo.';
     if (!prompt) throw new SubmitError(400, 'Type a task first.');
     if (prompt.length > MAX_PROMPT_CHARS) throw new SubmitError(400, `Keep the task under ${MAX_PROMPT_CHARS} characters.`);
     const dup = this.jobs.find(
-      (j) => j.requestedBy === user.username && j.type === 'ai.task' && j.agent === agent && j.prompt === prompt && (j.status === 'queued' || j.status === 'working'),
+      (j) =>
+        j.requestedBy === user.username &&
+        j.type === 'ai.task' &&
+        j.agent === agent &&
+        j.prompt === prompt &&
+        j.image?.sha256 === image?.meta.sha256 &&
+        (j.status === 'queued' || j.status === 'working'),
     );
     if (dup) return { job: dup, deduplicated: true };
     this.rateLimit(user);
@@ -156,18 +164,22 @@ export class JobRunner extends EventEmitter {
       range: { from: today, to: today },
       prompt,
       agent,
+      ...(image ? { image: image.meta } : {}),
       requestedBy: user.username,
       status: 'queued',
       createdAt: new Date().toISOString(),
       steps: [{ id: 's1', agent, label: prompt.length > 120 ? `${prompt.slice(0, 117)}…` : prompt, system: null, status: 'queued' }],
     };
     this.users.set(job.id, user);
+    if (image) this.images.set(job.id, { mimeType: image.meta.mimeType, data: image.data });
     this.enqueue(job);
     return { job, deduplicated: false };
   }
 
   /** Who submitted each pending AI task (its permissions decide which data tools the AI gets). */
   private users = new Map<string, SessionUser>();
+  /** Photos for pending AI tasks, in memory only; removed as soon as the task ends. */
+  private images = new Map<string, { mimeType: string; data: string }>();
 
   private rateLimit(user: SessionUser) {
     const now = Date.now();
@@ -206,7 +218,10 @@ export class JobRunner extends EventEmitter {
   private audit(job: Job, event: string, extra: Record<string, unknown> = {}) {
     // Task log: ids, type, user, status, timing and error codes only — no amounts, no customer data,
     // and for AI tasks only the agent and the prompt's length, never its text.
-    const what = job.type === 'ai.task' ? { agent: job.agent, promptChars: job.prompt?.length ?? 0 } : { range: job.range };
+    const what =
+      job.type === 'ai.task'
+        ? { agent: job.agent, promptChars: job.prompt?.length ?? 0, ...(job.image ? { imageBytes: job.image.bytes, imageType: job.image.mimeType } : {}) }
+        : { range: job.range };
     this.deps.log?.({ at: new Date().toISOString(), event, jobId: job.id, type: job.type, user: job.requestedBy, ...what, status: job.status, ...extra });
   }
 
@@ -242,6 +257,7 @@ export class JobRunner extends EventEmitter {
     }
     job.finishedAt = new Date().toISOString();
     this.users.delete(job.id);
+    this.images.delete(job.id);
     this.audit(job, 'finished', {
       durationMs: Date.parse(job.finishedAt) - Date.parse(job.startedAt!),
       errorCode: job.error?.code,
@@ -276,7 +292,7 @@ export class JobRunner extends EventEmitter {
     const ai = this.deps.ai;
     const user = this.users.get(job.id);
     if (!ai || !user || !job.agent || !job.prompt) throw new IntegrationError('NOT_CONFIGURED', 'AI tasks are not set up on the server.');
-    const out = await runAiTask({ ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now }, user, job.agent, job.prompt);
+    const out = await runAiTask({ ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now }, user, job.agent, job.prompt, this.images.get(job.id));
     const ok = out.lookups.filter((l) => l.ok).length;
     return {
       summary: out.lookups.length
@@ -438,4 +454,28 @@ export class JobRunner extends EventEmitter {
       };
     });
   }
+}
+
+/**
+ * Checks a photo sent with an AI task: allowed agent and type, real image bytes (the file's
+ * signature must match its type), and size. Returns the base64 data and a short fingerprint.
+ */
+function checkImage(agent: LiveAgentId, img: { mimeType: string; data: string }) {
+  if (!IMAGE_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take photos.`);
+  if (!(IMAGE_TYPES as readonly string[]).includes(img.mimeType)) throw new SubmitError(400, 'Use a JPEG, PNG or WebP photo.');
+  const data = img.data.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+  if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new SubmitError(400, 'The photo could not be read.');
+  const buf = Buffer.from(data, 'base64');
+  if (buf.length > MAX_IMAGE_BYTES) throw new SubmitError(413, `The photo is too large (max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB).`);
+  const sig =
+    img.mimeType === 'image/jpeg'
+      ? buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff
+      : img.mimeType === 'image/png'
+        ? buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+        : buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP';
+  if (!sig) throw new SubmitError(400, 'That file is not a valid photo of the type it claims to be.');
+  return {
+    data,
+    meta: { mimeType: img.mimeType, bytes: buf.length, sha256: createHash('sha256').update(buf).digest('hex').slice(0, 16) },
+  };
 }

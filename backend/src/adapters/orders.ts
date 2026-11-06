@@ -6,7 +6,8 @@
 //   ?open=1                         every order that is not Delivered
 // Response: { success, system, generated_at, data: { orders[], count, truncated } }
 //   orders[] { order_number, group_id, status, priority, order_date, due_date,
-//              items, items_done, least_stage, gross_price, downpayment, customer_name }
+//              items, items_done, least_stage, last_progress_at, gross_price, downpayment,
+//              customer_name, products?[] (with &products=1) }
 // customer_name is kept for display only: reports show it next to the order number, and the AI
 // tools never include it (server/ai/tasks.ts builds their data from explicit fields).
 // Payments: balance = max(0, gross_price - downpayment), the rule orders.php uses; a Delivered
@@ -20,7 +21,7 @@ import type { SystemConfig } from '../config';
 import type { ApiClient } from '../http/client';
 import { IntegrationError } from '../http/errors';
 import { dateOf, ensureConfigured, envelope, invalid, systemStatus, toCentavos } from './finance';
-import type { OrderCapabilities, OrderRecord, OrderSource } from './types';
+import type { OrderCapabilities, OrderListOptions, OrderRecord, OrderSource, ProductLine } from './types';
 
 const OPEN_STATUSES = new Set(['pending', 'in progress', 'finished']);
 const CLOSED_STATUSES = new Set(['delivered']);
@@ -48,12 +49,12 @@ export class OrdersAdapter implements OrderSource {
     return systemStatus(this.config, this.authConfigured, this.capabilities as unknown as Record<string, boolean>);
   }
 
-  async listOrders(range: DateRange): Promise<OrderRecord[]> {
-    return this.fetch({ from: range.from, to: range.to });
+  async listOrders(range: DateRange, opts: OrderListOptions = {}): Promise<OrderRecord[]> {
+    return this.fetch({ from: range.from, to: range.to, ...(opts.products ? { products: '1' } : {}) });
   }
 
-  async listOpenOrders(): Promise<OrderRecord[]> {
-    return (await this.fetch({ open: '1' })).filter((o) => o.isClosed !== true);
+  async listOpenOrders(opts: OrderListOptions = {}): Promise<OrderRecord[]> {
+    return (await this.fetch({ open: '1', ...(opts.products ? { products: '1' } : {}) })).filter((o) => o.isClosed !== true);
   }
 
   private async fetch(query: Record<string, string>): Promise<OrderRecord[]> {
@@ -65,6 +66,8 @@ export class OrdersAdapter implements OrderSource {
       throw new IntegrationError('RESULT_TOO_LARGE', `${name} has too many orders for this request. Choose a shorter date range.`, this.id);
     if (!Array.isArray(data.orders)) throw invalid(name, this.id, 'orders');
     this.capabilities.payments = data.payments_available === true;
+    this.capabilities.stageDates = data.stage_dates_available === true;
+    if (query.products) this.capabilities.products = data.products_available === true;
     return (data.orders as Record<string, unknown>[]).map((r) => toOrder(r, name, this.id));
   }
 }
@@ -86,8 +89,23 @@ export function toOrder(r: Record<string, unknown>, name: string, system: 'order
     progressPercent: stage !== null && items > 0 ? Math.round((100 * done) / items) : null,
     stage,
     createdDate: r.order_date ? dateOf(r.order_date, name, system) : null,
+    lastProgressDate: r.last_progress_at ? dateOf(r.last_progress_at, name, system) : null,
+    ...(Array.isArray(r.products) ? { products: (r.products as Record<string, unknown>[]).map((p) => toProduct(p, name, system)) } : {}),
     customerName: typeof r.customer_name === 'string' && r.customer_name.trim() ? r.customer_name.trim().slice(0, 120) : null,
     grossCentavos: r.gross_price == null ? null : toCentavos(r.gross_price, name, system),
     downpaymentCentavos: r.downpayment == null ? null : toCentavos(r.downpayment, name, system),
+  };
+}
+
+function toProduct(p: Record<string, unknown>, name: string, system: 'orders'): ProductLine {
+  const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 60) : null);
+  const qty = typeof p.qty === 'number' && Number.isInteger(p.qty) && p.qty > 0 ? p.qty : 0;
+  return {
+    category: text(p.category),
+    type: text(p.type),
+    wood: text(p.wood),
+    finish: text(p.finish),
+    qty,
+    centavos: p.value == null ? null : toCentavos(p.value, name, system),
   };
 }

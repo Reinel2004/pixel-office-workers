@@ -89,6 +89,16 @@ export const AGENTS: AgentDef[] = [
     blurb: 'Follows up downpayments and remaining balances.',
   },
   {
+    id: 'mika',
+    tint: '#6fd3e8',
+    name: 'Mika',
+    role: 'Data Analyst',
+    room: 'intel',
+    desk: { x: 2, y: 9 },
+    look: { skin: '#e9bf98', hair: '#2b1d14', hairStyle: 'bun', shirt: '#2f8fa6', pants: '#2a3140', accessory: 'glasses' },
+    blurb: 'Finds trends: best sellers, busy months and production bottlenecks.',
+  },
+  {
     id: 'carlo',
     tint: '#ff9566',
     name: 'Carlo',

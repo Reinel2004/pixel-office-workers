@@ -69,6 +69,12 @@ export const IconSend = (p: P) => (
     <path d="M3.5 10h11M10 5l5 5-5 5" />
   </Svg>
 );
+export const IconCamera = (p: P) => (
+  <Svg {...p}>
+    <path d="M3 7.5a1.5 1.5 0 0 1 1.5-1.5h2l1.2-2h4.6l1.2 2h2A1.5 1.5 0 0 1 17 7.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5z" />
+    <circle cx="10" cy="11" r="2.8" />
+  </Svg>
+);
 export const IconList = (p: P) => (
   <Svg {...p}>
     <path d="M7 5.5h9M7 10h9M7 14.5h9" />

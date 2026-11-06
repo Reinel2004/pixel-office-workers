@@ -5,7 +5,18 @@
 
 import type { AgentBrain } from '../agents/brain';
 import { AGENTS, AGENT_BY_ID, seatOf, type AgentDef } from '../agents/roster';
-import { MEETING_CENTER, MEETING_SLOTS, buildWalkGrid, roomAt } from '../office/layout';
+import {
+  CHAT_SCRIPTS,
+  CHAT_SPOTS,
+  LEISURE_SPOTS,
+  MEETING_CENTER,
+  MEETING_SLOTS,
+  STROLL_POINTS,
+  buildWalkGrid,
+  roomAt,
+  type ChatSpot,
+  type LeisureSpot,
+} from '../office/layout';
 import { findPath, type Tile } from '../office/pathfinding';
 import type {
   AgentId,
@@ -39,7 +50,7 @@ export interface AgentRT {
   face: Tile | null;
   dir: Dir;
   posture: 'stand' | 'sit';
-  action: 'none' | 'walk' | 'work' | 'talk';
+  action: 'none' | 'walk' | 'work' | 'talk' | 'jog' | 'exercise';
   activity: string;
   busyTaskId: string | null;
   errorTaskId: string | null;
@@ -49,7 +60,51 @@ export interface AgentRT {
   recent: { at: number; text: string }[];
   stepPhase: number;
   waitT: number;
+  /** A break the agent is on (decoration only; any task cancels it). */
+  leisure: Leisure | null;
+  /** Sim time at which this agent may start its next break, once idle at the desk. */
+  nextBreakAt: number;
 }
+
+export interface Leisure {
+  kind: 'spot' | 'stroll' | 'chat';
+  spot?: LeisureSpot;
+  phase: 'going' | 'doing' | 'returning';
+  until: number;
+  label: string;
+  /** Remaining stroll waypoints. */
+  waypoints: Tile[];
+  /** Chats: the shared conversation, and where this agent stands. */
+  chat?: Chat;
+  target?: Tile;
+  arrived?: boolean;
+}
+
+/** Two agents talking on a break. Both agents' Leisure point at the same object. */
+export interface Chat {
+  first: AgentRT;
+  second: AgentRT;
+  spot: ChatSpot;
+  lines: string[];
+  /** Sim time the conversation started (both arrived), or null while they walk over. */
+  startedAt: number | null;
+  lastLine: number;
+  /** Give up if they haven't both arrived by then. */
+  giveUpAt: number;
+}
+
+/** How long each chat line is shown, in sim ms. */
+const CHAT_LINE_MS = 2600;
+
+/** Break timing in sim ms: idle time before a break, and how long it lasts. */
+const BREAK_IDLE_MIN = 20_000;
+const BREAK_IDLE_MAX = 60_000;
+const BREAK_LEN_MIN = 10_000;
+const BREAK_LEN_MAX = 20_000;
+/** At most this many agents are away on a break at once, so the office never looks empty. */
+export const MAX_ON_BREAK = 4;
+/** Chance that a break is a chat with a colleague (when someone else is free too). */
+const CHAT_CHANCE = 0.4;
 
 export interface Task {
   id: string;
@@ -92,6 +147,7 @@ export const DEFAULT_SETTINGS: Settings = {
   reducedMotion: false,
   speed: 1,
   labels: true,
+  breaks: true,
   feedOpen: true,
   mode: 'demo',
 };
@@ -109,6 +165,16 @@ export interface LiveAgentState {
 
 type Listener = () => void;
 
+/**
+ * What the Intelligence Lab shows. Connected Mode: set by the live store from Gemini tasks.
+ * Demo Mode: "thinking" while a template draft is being prepared (no real AI is involved).
+ */
+export type AiActivity = 'idle' | 'thinking' | 'done' | 'limited' | 'error';
+export interface AiPulse {
+  state: AiActivity;
+  label: string;
+}
+
 export class Engine {
   agents: AgentRT[];
   agentById: Record<AgentId, AgentRT>;
@@ -118,6 +184,29 @@ export class Engine {
   paused = false;
   /** Simulation clock in ms; only advances while not paused. */
   now = 0;
+  /** Connected Mode AI status from the live store; `until` (sim ms) ends a done/limited/error flash. */
+  private aiLive: { state: AiActivity; label: string; until: number } = { state: 'idle', label: '', until: 0 };
+
+  /** Called by the live store whenever Gemini task states change. */
+  setAiActivity(state: AiActivity, label = '', ms = 0) {
+    this.aiLive = { state, label, until: ms ? this.now + ms : 0 };
+    this.emitNow();
+  }
+
+  /** The current AI activity for the Intelligence Lab. */
+  aiPulse(): AiPulse {
+    if (this.connected) {
+      const l = this.aiLive;
+      if (l.state === 'thinking') return { state: 'thinking', label: l.label };
+      if (l.state !== 'idle' && l.until > this.now) return { state: l.state, label: l.label };
+      return { state: 'idle', label: '' };
+    }
+    const drafting = this.tasks.find((t) => t.status === 'running' && t.pending);
+    return drafting ? { state: 'thinking', label: `Drafting (template) · ${AGENT_BY_ID[drafting.primary].name}` } : { state: 'idle', label: '' };
+  }
+
+  /** Random source for breaks (tests replace it with a seeded one). */
+  random: () => number = Math.random;
 
   private grid = buildWalkGrid();
   private listeners = new Set<Listener>();
@@ -158,10 +247,13 @@ export class Engine {
         recent: [],
         stepPhase: 0,
         waitT: 0,
+        leisure: null,
+        nextBreakAt: 0,
       };
     });
     this.agentById = Object.fromEntries(this.agents.map((a) => [a.id, a])) as Record<AgentId, AgentRT>;
     this.load();
+    for (const a of this.agents) a.nextBreakAt = this.breakDelay();
   }
 
   // ---------------------------------------------------------------- subscription
@@ -204,6 +296,7 @@ export class Engine {
     const prev = this.live.get(id);
     if (!s) this.live.delete(id);
     else this.live.set(id, s.state === 'completed' ? { ...s, until: this.now + 6000 } : s);
+    if (s && (s.state === 'queued' || s.state === 'working') && a.leisure) this.endBreak(a, 'Back to desk for a task');
     if (s) {
       a.activity = s.activity;
       this.pushRecent(a, s.activity);
@@ -217,6 +310,7 @@ export class Engine {
   stageAgent(id: AgentId, where: 'seat' | 'meeting', slot = 0) {
     const a = this.agentById[id];
     if (a.busyTaskId) return; // a demo workflow currently owns this agent
+    a.leisure = null;
     this.sendTo(a, where === 'seat' ? { seat: true } : { meeting: slot }, where === 'seat' ? 'Heading to desk' : 'Going to the meeting table', null);
   }
 
@@ -239,6 +333,7 @@ export class Engine {
       for (const a of this.agents) {
         a.errorTaskId = null;
         a.bubble = null;
+        a.leisure = null;
         const seat = seatOf(a.id);
         if (Math.round(a.x) !== seat.x || Math.round(a.y) !== seat.y) this.sendTo(a, { seat: true }, 'Returning to desk', null);
       }
@@ -375,6 +470,8 @@ export class Engine {
         completedUntil: 0,
         completedCount: 0,
         recent: [],
+        leisure: null,
+        nextBreakAt: this.now + this.breakDelay(),
       });
     }
     this.tasks = [];
@@ -395,7 +492,208 @@ export class Engine {
     for (const a of this.agents) if (a.bubble && a.bubble.until <= this.now) a.bubble = null;
     this.liveTick();
     for (const t of this.tasks) if (t.status === 'running' || t.status === 'queued') this.runTask(t, dt);
+    this.breakTick(dt);
     this.flush();
+  }
+
+  // ---------------------------------------------------------------- breaks (decoration)
+  /** An agent with nothing to do: not on a task, no error, no approval or live step pending. */
+  isFree(a: AgentRT): boolean {
+    if (a.busyTaskId || a.errorTaskId) return false;
+    if (this.connected && this.live.has(a.id)) return false;
+    return !this.tasks.some((t) => (t.status === 'awaiting_approval' && t.approval?.agent === a.id) || (t.status === 'queued' && t.cast.includes(a.id)));
+  }
+
+  onBreak(a: AgentRT): boolean {
+    return a.leisure !== null;
+  }
+
+  private breakDelay() {
+    return this.now + BREAK_IDLE_MIN + this.random() * (BREAK_IDLE_MAX - BREAK_IDLE_MIN);
+  }
+
+  private breakTick(dt: number) {
+    const breaksOn = this.settings.breaks && !this.settings.reducedMotion;
+    let away = this.agents.filter((a) => a.leisure && a.leisure.phase !== 'returning').length;
+    for (const a of this.agents) {
+      const l = a.leisure;
+      if (l) {
+        if (!breaksOn && l.phase !== 'returning') {
+          this.endBreak(a, 'Returning to desk');
+          continue;
+        }
+        if (l.kind === 'chat' && l.phase !== 'returning') {
+          this.chatTick(a, l);
+          continue;
+        }
+        if (l.phase === 'going' && !a.path.length) {
+          if (l.kind === 'stroll' && l.waypoints.length) {
+            const next = l.waypoints.shift()!;
+            this.walk(a, findPath(this.grid, a, next) ?? [], l.label);
+          } else if (l.spot?.approach && (Math.round(a.x) !== l.spot.tile.x || Math.round(a.y) !== l.spot.tile.y)) {
+            a.path = [l.spot.tile]; // step onto the treadmill belt
+            a.action = 'walk';
+          } else {
+            l.phase = 'doing';
+            l.until = this.now + BREAK_LEN_MIN + this.random() * (BREAK_LEN_MAX - BREAK_LEN_MIN);
+            if (l.spot) {
+              a.dir = dirFromDelta(l.spot.face.x - a.x, l.spot.face.y - a.y, a.dir);
+              a.action = l.spot.action;
+              this.say(a, l.spot.says[Math.floor(this.random() * l.spot.says.length)], 2600);
+            } else l.until = this.now; // a stroll ends once the last waypoint is reached
+            this.touch();
+          }
+        } else if (l.phase === 'doing') {
+          if (a.action === 'jog') a.stepPhase += 2.4 * (dt / 1000); // legs keep moving on the belt
+          if (this.now >= l.until) this.endBreak(a, 'Back to desk');
+        } else if (l.phase === 'returning' && !a.path.length) {
+          a.leisure = null;
+          a.nextBreakAt = this.breakDelay();
+          this.touch();
+        }
+        continue;
+      }
+      if (!breaksOn || !this.isFree(a) || a.path.length || a.completedUntil > this.now) {
+        if (a.nextBreakAt < this.now + BREAK_IDLE_MIN) a.nextBreakAt = this.now + BREAK_IDLE_MIN;
+        continue;
+      }
+      const s = seatOf(a.id);
+      if (Math.round(a.x) !== s.x || Math.round(a.y) !== s.y) continue;
+      if (this.now < a.nextBreakAt || away >= MAX_ON_BREAK) continue;
+      if (away + 2 <= MAX_ON_BREAK && this.random() < CHAT_CHANCE && this.startChat(a)) {
+        away += 2;
+        continue;
+      }
+      if (this.startBreak(a)) away++;
+      else a.nextBreakAt = this.breakDelay();
+    }
+  }
+
+  /** Free, idle at the desk and not on a break: can be invited to chat. */
+  private canChat(o: AgentRT) {
+    const s = seatOf(o.id);
+    return !o.leisure && !o.path.length && this.isFree(o) && o.completedUntil <= this.now && Math.round(o.x) === s.x && Math.round(o.y) === s.y;
+  }
+
+  private startChat(a: AgentRT): boolean {
+    const partners = this.agents.filter((o) => o !== a && this.canChat(o));
+    const used = new Set(this.agents.map((o) => o.leisure?.chat?.spot.id).filter(Boolean));
+    const spots = CHAT_SPOTS.filter((sp) => !used.has(sp.id) && !this.isReserved(sp.a, a) && !this.isReserved(sp.b, a));
+    if (!partners.length || !spots.length) return false;
+    const b = partners[Math.floor(this.random() * partners.length)];
+    const spot = spots[Math.floor(this.random() * spots.length)];
+    const pa = findPath(this.grid, a, spot.a);
+    const pb = findPath(this.grid, b, spot.b);
+    if (!pa || !pb) return false;
+    const chat: Chat = {
+      first: a,
+      second: b,
+      spot,
+      lines: CHAT_SCRIPTS[Math.floor(this.random() * CHAT_SCRIPTS.length)],
+      startedAt: null,
+      lastLine: -1,
+      giveUpAt: this.now + 30_000,
+    };
+    for (const [me, other, tile, path] of [
+      [a, b, spot.a, pa],
+      [b, a, spot.b, pb],
+    ] as const) {
+      me.leisure = { kind: 'chat', phase: 'going', until: 0, label: `On a break: chatting with ${other.def.name}`, waypoints: [], chat, target: tile, arrived: false };
+      me.dest = tile;
+      this.walk(me, path.slice(), me.leisure.label);
+    }
+    this.say(a, `${b.def.name}, got a minute?`, 2000);
+    return true;
+  }
+
+  private chatTick(a: AgentRT, l: Leisure) {
+    const c = l.chat!;
+    const other = c.first === a ? c.second : c.first;
+    // The other one was called away (a task, a live report, or breaks switched off).
+    if (other.leisure?.chat !== c || other.leisure.phase === 'returning') {
+      this.say(a, 'Talk later!', 1800);
+      this.endBreak(a, 'Back to desk');
+      return;
+    }
+    if (l.phase === 'going') {
+      if (!a.path.length && !l.arrived) {
+        l.arrived = true;
+        const ot = other.leisure.target!;
+        a.dir = dirFromDelta(ot.x - a.x, ot.y - a.y, a.dir);
+        this.touch();
+      }
+      if (l.arrived && other.leisure.arrived && c.startedAt === null) {
+        c.startedAt = this.now;
+        l.phase = 'doing';
+        other.leisure.phase = 'doing';
+      } else if (c.startedAt === null && this.now > c.giveUpAt) {
+        this.endBreak(a, 'Back to desk');
+        this.endBreak(other, 'Back to desk');
+      }
+      return;
+    }
+    // doing: lines alternate, one every CHAT_LINE_MS
+    const line = Math.floor((this.now - c.startedAt!) / CHAT_LINE_MS);
+    if (line >= c.lines.length) {
+      this.endBreak(c.first, 'Back to desk');
+      this.endBreak(c.second, 'Back to desk');
+      return;
+    }
+    if (line !== c.lastLine) {
+      c.lastLine = line;
+      const speaker = line % 2 === 0 ? c.first : c.second;
+      const listener = speaker === c.first ? c.second : c.first;
+      this.say(speaker, c.lines[line], CHAT_LINE_MS - 300);
+      speaker.action = 'talk';
+      listener.action = 'none';
+      this.touch();
+    }
+  }
+
+  private startBreak(a: AgentRT): boolean {
+    const taken = new Set(this.agents.filter((o) => o !== a && o.leisure?.spot).map((o) => o.leisure!.spot!.id));
+    const free = LEISURE_SPOTS.filter((sp) => !taken.has(sp.id) && !this.isReserved(sp.tile, a) && !this.isReserved(sp.approach ?? sp.tile, a));
+    const stroll = this.random() < 0.25 || !free.length;
+    if (stroll) {
+      const pts = STROLL_POINTS.slice().sort(() => this.random() - 0.5).slice(0, 2 + Math.floor(this.random() * 2));
+      const first = pts.shift()!;
+      const path = findPath(this.grid, a, first);
+      if (!path) return false;
+      a.leisure = { kind: 'stroll', phase: 'going', until: 0, label: 'On a break: taking a walk', waypoints: pts };
+      this.walk(a, path, a.leisure.label);
+      this.say(a, ['Stretching my legs', 'Quick walk', 'Lakad muna'][Math.floor(this.random() * 3)], 2200);
+      return true;
+    }
+    const spot = free[Math.floor(this.random() * free.length)];
+    const path = findPath(this.grid, a, spot.approach ?? spot.tile);
+    if (!path) return false;
+    a.leisure = { kind: 'spot', spot, phase: 'going', until: 0, label: `On a break: ${spot.label.toLowerCase()}`, waypoints: [] };
+    this.walk(a, path, a.leisure.label);
+    return true;
+  }
+
+  /** Ends a break and walks back to the desk. Off a treadmill, step down first. */
+  private endBreak(a: AgentRT, activity: string) {
+    const l = a.leisure;
+    if (!l) return;
+    const seat = seatOf(a.id);
+    const start = l.spot?.approach && Math.round(a.x) === l.spot.tile.x && Math.round(a.y) === l.spot.tile.y ? l.spot.approach : null;
+    let rest = findPath(this.grid, start ?? a, seat) ?? [seat];
+    if (!rest.length && (a.x !== seat.x || a.y !== seat.y)) rest = [seat]; // finish the last part-tile
+    l.phase = 'returning';
+    a.face = { x: seat.x, y: seat.y - 1 };
+    a.dest = seat;
+    this.walk(a, start ? [start, ...rest] : rest, activity);
+  }
+
+  private walk(a: AgentRT, path: Tile[], activity: string) {
+    a.path = path;
+    a.posture = 'stand';
+    a.action = path.length ? 'walk' : 'none';
+    a.activity = activity;
+    this.pushRecent(a, activity);
+    if (!path.length) this.arriveAt(a);
+    this.touch();
   }
 
   // ---------------------------------------------------------------- tasks
@@ -444,6 +742,16 @@ export class Engine {
       const a = this.agentById[id];
       a.busyTaskId = t.id;
       a.errorTaskId = null;
+      if (a.leisure) {
+        // The task's own first step walks them where they are needed (every workflow starts with a move).
+        const back = a.leisure.spot?.approach && Math.round(a.x) === a.leisure.spot.tile.x && Math.round(a.y) === a.leisure.spot.tile.y ? a.leisure.spot.approach : null;
+        a.leisure = null;
+        if (back) {
+          a.x = back.x; // step off the treadmill
+          a.y = back.y;
+        }
+        this.say(a, 'Coming!', 1500);
+      }
     }
     t.waitingFor = undefined;
     t.holding = true;
@@ -716,6 +1024,7 @@ export class Engine {
   }
 
   private sendTo(a: AgentRT, to: Target, activity: string, t: Task | null) {
+    if (t) a.leisure = null;
     const { tile, face } = this.resolveTarget(a, to);
     const path = findPath(this.grid, { x: a.x, y: a.y }, tile) ?? [tile];
     a.path = path;
@@ -738,7 +1047,8 @@ export class Engine {
     a.action = a.busyTaskId ? 'none' : 'none';
     if (a.face) a.dir = dirFromDelta(a.face.x - a.x, a.face.y - a.y, a.dir);
     const s = seatOf(a.id);
-    if (Math.round(a.x) === s.x && Math.round(a.y) === s.y) {
+    const breakingAway = a.leisure && a.leisure.phase !== 'returning';
+    if (Math.round(a.x) === s.x && Math.round(a.y) === s.y && !breakingAway) {
       a.posture = 'sit';
       a.dir = 'br';
       if (!a.busyTaskId) a.activity = 'At desk';

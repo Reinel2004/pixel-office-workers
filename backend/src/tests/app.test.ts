@@ -125,3 +125,16 @@ test('sign-out ends the session', async () => {
   assert.equal((await post('/api/auth/logout', {}, cookie)).status, 200);
   assert.equal((await fetch(base + '/api/auth/me', { headers: { cookie } })).status, 401);
 });
+
+test('the AI task route accepts a photo-sized request and refuses an oversized one', async () => {
+  const cookie = await login('owner', 'correct horse 1');
+  const photo = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(2 * 1024 * 1024)]).toString('base64');
+  // Gets past the size check (this test server has no AI key, so it ends at "not set up").
+  const ok = await post('/api/ai/tasks', { agent: 'carlo', prompt: 'Caption', image: { mimeType: 'image/jpeg', data: photo } }, cookie);
+  assert.equal(ok.status, 503);
+  const huge = 'A'.repeat(5 * 1024 * 1024);
+  const tooBig = await post('/api/ai/tasks', { agent: 'carlo', prompt: 'Caption', image: { mimeType: 'image/jpeg', data: huge } }, cookie);
+  assert.equal(tooBig.status, 413);
+  const bad = await post('/api/ai/tasks', { agent: 'carlo', prompt: 'Caption', image: 'nope' }, cookie);
+  assert.equal(bad.status, 400);
+});

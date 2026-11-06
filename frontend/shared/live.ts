@@ -15,8 +15,13 @@ export type ReportType = 'finance.summary' | 'orders.status' | 'orders.overdue' 
 /** "ai.task" is a free-text task answered by the AI provider, using read-only data tools. */
 export type JobType = ReportType | 'ai.task';
 export type JobStatus = 'queued' | 'working' | 'completed' | 'failed';
-export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'carlo' | 'dev' | 'chief';
-export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'carlo', 'dev', 'chief'];
+export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'dev' | 'chief';
+/** Agents that accept a photo with their task (e.g. Carlo writes a caption for a door photo). */
+export const IMAGE_AGENTS: LiveAgentId[] = ['carlo'];
+export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
+/** Largest photo accepted, in bytes (the office shrinks photos before sending, so this is rarely reached). */
+export const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'mika', 'carlo', 'dev', 'chief'];
 
 /** Why a live request did not produce a result. "No records" is NOT an error — see StepResult.empty. */
 export type ErrorCode =
@@ -161,6 +166,11 @@ export interface Job {
   /** AI tasks only: the request as typed and the agent it was assigned to. */
   prompt?: string;
   agent?: LiveAgentId;
+  /**
+   * A photo sent with the task: type, size and a short fingerprint only. The photo itself is kept
+   * in server memory just while the task runs and is never stored, logged or sent back.
+   */
+  image?: { mimeType: string; bytes: number; sha256: string };
   requestedBy: string;
   status: JobStatus;
   createdAt: string;

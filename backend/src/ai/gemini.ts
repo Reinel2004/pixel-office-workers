@@ -10,7 +10,8 @@ export const GEMINI_HOST = 'generativelanguage.googleapis.com';
 export type GeminiPart =
   | { text: string; thought?: boolean; thoughtSignature?: string }
   | { functionCall: { name: string; args?: Record<string, unknown>; id?: string }; thoughtSignature?: string }
-  | { functionResponse: { name: string; response: Record<string, unknown>; id?: string } };
+  | { functionResponse: { name: string; response: Record<string, unknown>; id?: string } }
+  | { inlineData: { mimeType: string; data: string } };
 
 export interface GeminiContent {
   role: 'user' | 'model';

@@ -1,0 +1,8 @@
+{
+  // Node.js scripts (run with tsx, not shipped to the browser): same settings as the app, plus Node's types.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["."]
+}

@@ -34,12 +34,32 @@ export interface OrderRecord {
   progressPercent: number | null;
   stage: string | null;
   createdDate: string | null;
+  /** Date any piece last moved to a new production stage (YYYY-MM-DD), when the system records it. */
+  lastProgressDate?: string | null;
+  /** What the order contains; only when requested with { products: true }. */
+  products?: ProductLine[];
   /** Customer name, for display in the office only. Never sent to the AI provider. */
   customerName?: string | null;
   /** What the customer pays for the whole order, in centavos; null when the system doesn't say. */
   grossCentavos?: number | null;
   /** Downpayment recorded for the whole order, in centavos; null when the system doesn't say. */
   downpaymentCentavos?: number | null;
+}
+
+/** Pieces of one kind within an order (no customer data). */
+export interface ProductLine {
+  category: string | null;
+  type: string | null;
+  wood: string | null;
+  finish: string | null;
+  qty: number;
+  /** Total price of these pieces in centavos, or null when unknown. */
+  centavos: number | null;
+}
+
+export interface OrderListOptions {
+  /** Also fetch what each order contains (category, type, wood, finish). */
+  products?: boolean;
 }
 
 export interface FinanceCapabilities {
@@ -59,6 +79,10 @@ export interface OrderCapabilities {
   sharedOrderId: boolean;
   /** Order price and downpayment are available (set from the last response). */
   payments?: boolean;
+  /** Stage-change dates are available (set from the last response). */
+  stageDates?: boolean;
+  /** Product details were returned in the last response that asked for them. */
+  products?: boolean;
 }
 
 export interface FinanceSource {
@@ -75,7 +99,7 @@ export interface OrderSource {
   capabilities: OrderCapabilities;
   status(): SystemStatus;
   /** Orders relevant to the range (the documented filter decides: created, due, or updated). */
-  listOrders(range: DateRange): Promise<OrderRecord[]>;
+  listOrders(range: DateRange, opts?: OrderListOptions): Promise<OrderRecord[]>;
   /** Open orders regardless of range, for the overdue check. */
-  listOpenOrders(): Promise<OrderRecord[]>;
+  listOpenOrders(opts?: OrderListOptions): Promise<OrderRecord[]>;
 }

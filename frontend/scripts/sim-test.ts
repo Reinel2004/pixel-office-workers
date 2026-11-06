@@ -3,8 +3,8 @@
 
 import { TemplateBrain } from '../src/agents/brain';
 import { AGENTS, seatOf } from '../src/agents/roster';
-import { Engine, type StorageLike } from '../src/sim/engine';
-import { FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS } from '../src/office/layout';
+import { Engine, MAX_ON_BREAK, type Chat, type StorageLike } from '../src/sim/engine';
+import { FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt } from '../src/office/layout';
 import { findPath } from '../src/office/pathfinding';
 
 let failures = 0;
@@ -59,7 +59,8 @@ async function main() {
   check(true, 'all seat-to-seat paths exist');
 
   console.log('Workflow: New Door Inquiry (approve)');
-  const e = new Engine(new TemplateBrain(), storage);
+  // Breaks are tested on their own below; here they'd make "back at desk" checks random.
+  const e = new Engine(new TemplateBrain(), storage, { breaks: false });
   const t1 = e.startDemo('inquiry');
   check(e.agentState(e.agentById.lia) !== 'idle', 'Lia becomes active');
   let sawWalking = false;
@@ -132,6 +133,114 @@ async function main() {
     const s = seatOf(ag.id);
     check(Math.round(ag.x) === s.x && Math.round(ag.y) === s.y, `${ag.def.name} back at desk`);
   }
+
+  console.log('Breaks when idle');
+  for (const sp of LEISURE_SPOTS) {
+    if (sp.approach) {
+      check(!grid[sp.tile.y][sp.tile.x] && grid[sp.approach.y][sp.approach.x], `${sp.id}: belt is furniture, approach tile is walkable`);
+      check(Math.abs(sp.approach.x - sp.tile.x) + Math.abs(sp.approach.y - sp.tile.y) === 1, `${sp.id}: approach is next to the belt`);
+    } else check(grid[sp.tile.y][sp.tile.x], `${sp.id} spot walkable`);
+    check(roomAt(sp.tile.x + 0.5, sp.tile.y + 0.5) === sp.room, `${sp.id} is in the ${sp.room}`);
+    check(!!findPath(grid, seatOf('lia'), sp.approach ?? sp.tile), `${sp.id} reachable`);
+  }
+  check(FURNITURE.some((f) => f.kind === 'coffeeMaker' && f.room === 'pantry'), 'the pantry has a coffee maker');
+  for (const c of CHAT_SPOTS)
+    for (const t of [c.a, c.b]) check(grid[t.y][t.x] && roomAt(t.x + 0.5, t.y + 0.5) === c.room && !!findPath(grid, seatOf('dev'), t), `${c.id} ${t.x},${t.y} walkable and reachable`);
+  check(CHAT_SCRIPTS.every((l) => l.length >= 2), 'every conversation has at least two lines');
+  for (const p of STROLL_POINTS) check(grid[p.y][p.x] && !!findPath(grid, seatOf('bea'), p), `walk point ${p.x},${p.y} reachable`);
+
+  let seed = 7;
+  const rng = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const mem2 = new Map<string, string>();
+  const st2: StorageLike = { getItem: (k) => mem2.get(k) ?? null, setItem: (k, v) => void mem2.set(k, v), removeItem: (k) => void mem2.delete(k) };
+  const eb = new Engine(new TemplateBrain(), st2);
+  eb.random = rng;
+  check(eb.settings.breaks, 'breaks are on by default');
+  let maxAway = 0;
+  let busyOnBreak = false;
+  const rooms = new Set<string>();
+  let jogged = false;
+  const chats = new Set<Chat>();
+  let fullChat = false;
+  await runFor(eb, 240000, () => {
+    const away = eb.agents.filter((x) => x.leisure && x.leisure.phase !== 'returning').length;
+    maxAway = Math.max(maxAway, away);
+    for (const x of eb.agents) {
+      if (x.leisure && x.busyTaskId) busyOnBreak = true;
+      if (x.leisure?.phase === 'doing' && x.leisure.spot) rooms.add(x.leisure.spot.room);
+      if (x.action === 'jog') jogged = true;
+      const c = x.leisure?.chat;
+      if (c) {
+        chats.add(c);
+        if (c.lastLine === c.lines.length - 1) fullChat = true;
+      }
+    }
+    return false;
+  });
+  check(chats.size > 0, `idle agents chat with each other (${chats.size} conversation(s))`);
+  check(fullChat, 'a conversation runs through all its lines');
+  check([...chats].every((c) => c.first !== c.second), 'nobody talks to themselves');
+  check(maxAway > 0, 'idle agents go on breaks');
+  check(maxAway <= MAX_ON_BREAK, `never more than ${MAX_ON_BREAK} away at once (saw ${maxAway})`);
+  check(rooms.size >= 2, `breaks use different rooms (${[...rooms].join(', ')})`);
+  check(jogged, 'someone ran on a treadmill');
+  check(!busyOnBreak, 'nobody is on a break while on a task');
+
+  // A task during a break: the agent comes back and does it.
+  await runFor(eb, 120000, () => eb.agents.some((x) => x.leisure?.phase === 'doing'));
+  const breaker = eb.agents.find((x) => x.leisure?.phase === 'doing');
+  check(!!breaker, 'found an agent on a break');
+  if (breaker) {
+    const job = eb.assignCustom(breaker.id, 'Quick check please');
+    eb.tick(50);
+    check(breaker.leisure === null, `${breaker.def.name} leaves the break for the task`);
+    await runFor(eb, 60000, () => job.status === 'completed');
+    check(job.status === 'completed', 'the task completes after the break');
+  }
+
+  // One chatter gets a task: the other says "Talk later!" and goes back too.
+  await runFor(eb, 300000, () => eb.agents.some((x) => x.leisure?.chat && x.leisure.phase === 'doing'));
+  const talker = eb.agents.find((x) => x.leisure?.chat && x.leisure.phase === 'doing');
+  check(!!talker, 'found a conversation in progress');
+  if (talker) {
+    const c = talker.leisure!.chat!;
+    const other = c.first === talker ? c.second : c.first;
+    const job2 = eb.assignCustom(talker.id, 'Need you for a second');
+    eb.tick(50);
+    eb.tick(50);
+    check(other.leisure?.phase === 'returning' || other.leisure === null, `${other.def.name} stops chatting when ${talker.def.name} is called away`);
+    await runFor(eb, 60000, () => job2.status === 'completed');
+    check(job2.status === 'completed', 'the task completes');
+  }
+
+  // Turning breaks off sends everyone back to their desks, and they stay there.
+  eb.updateSettings({ breaks: false });
+  await runFor(eb, 40000, () => eb.agents.every((x) => !x.leisure && !x.path.length));
+  await runFor(eb, 60000);
+  const away = eb.agents.filter((x) => x.leisure || Math.round(x.x) !== seatOf(x.id).x || Math.round(x.y) !== seatOf(x.id).y);
+  check(!away.length, `with breaks off, everyone is back at their desk${away.length ? ` (not: ${away.map((x) => `${x.def.name} at ${x.x},${x.y} "${x.activity}"`).join('; ')})` : ''}`);
+
+  console.log('Intelligence Lab: AI activity');
+  const ai = new Engine(new TemplateBrain(), null, { breaks: false });
+  check(ai.aiPulse().state === 'idle', 'the Lab is idle with no tasks');
+  const draft = ai.assignCustom('marco', 'Outline a quotation');
+  let sawThinking = false;
+  await runFor(ai, 30000, () => {
+    if (ai.aiPulse().state === 'thinking') sawThinking = true;
+    return draft.status === 'completed';
+  });
+  check(sawThinking, 'demo: the Lab shows "thinking" while a draft is prepared');
+  check(ai.aiPulse().state === 'idle', 'demo: back to idle when the draft is done');
+  ai.updateSettings({ mode: 'connected' });
+  ai.setAiActivity('thinking', 'AI thinking · Rosa');
+  check(ai.aiPulse().state === 'thinking' && ai.aiPulse().label.includes('Rosa'), 'live: thinking shows who it is for');
+  ai.setAiActivity('done', 'Answer ready · Rosa', 5000);
+  await runFor(ai, 3000);
+  check(ai.aiPulse().state === 'done', 'live: "answer ready" shows for a few seconds');
+  await runFor(ai, 3000);
+  check(ai.aiPulse().state === 'idle', 'live: then the Lab goes back to idle');
+  ai.setAiActivity('limited', 'AI usage limit reached', 30000);
+  check(ai.aiPulse().state === 'limited', 'live: usage limit is shown');
 
   console.log('Persistence & reset');
   e.saveNow();

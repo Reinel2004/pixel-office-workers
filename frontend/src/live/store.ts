@@ -4,6 +4,7 @@
 
 import type { AiStatus, DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, ReportType, SessionUser, SystemStatus } from '../../shared/live';
 import { LIVE_AGENT_IDS, SYSTEM_NAMES } from '../../shared/live';
+import { AGENT_BY_ID } from '../agents/roster';
 import { presetRange, type RangePreset } from '../../shared/manila';
 import type { Engine } from '../sim/engine';
 
@@ -139,10 +140,12 @@ export class LiveStore {
     this.stream = 'idle';
     this.user = null;
     this.jobs = [];
+    this.images.clear();
     this.systems = [];
     this.server = 'signed_out';
     this.ai = null;
     for (const id of LIVE_AGENT_IDS) this.engine.setLiveAgent(id, null);
+    this.engine.setAiActivity('idle');
     this.addLog(note, 'info');
     this.emit();
   }
@@ -236,15 +239,23 @@ export class LiveStore {
     return { ok: true };
   }
 
-  /** Assigns a free-text task to one agent. The server runs it with the AI and read-only data tools. */
-  async submitAi(agent: LiveAgentId, prompt: string): Promise<Job | null> {
-    const key = `ai|${agent}|${prompt}`;
+  /**
+   * Photos sent with tasks, kept only in this tab's memory (as data URLs) so the task can show
+   * the photo and "Run again" can resend it. Never saved; gone after a reload or sign-out.
+   */
+  images = new Map<string, string>();
+
+  /** Assigns a free-text task to one agent, optionally with a photo (JPEG data URL). */
+  async submitAi(agent: LiveAgentId, prompt: string, photo?: string): Promise<Job | null> {
+    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}`;
     if (this.submitting.has(key)) return null;
     this.submitting.add(key);
     this.lastError = null;
     this.emit();
     try {
-      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt }) });
+      const image = photo ? { mimeType: photo.slice(5, photo.indexOf(';')), data: photo.slice(photo.indexOf(',') + 1) } : undefined;
+      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, ...(image ? { image } : {}) }) });
+      if (photo) this.images.set(job.id, photo);
       this.applyJob(job, false);
       return job;
     } catch (e) {
@@ -286,8 +297,28 @@ export class LiveStore {
           this.addLog(job.type === 'ai.task' ? `Task assigned — ${job.title}` : `Report queued: ${job.title} (${job.range.from} to ${job.range.to}).`, 'info', who, job.id);
         if (job.status === 'completed') this.addLog(`${what} completed: ${job.title}.`, 'success', who, job.id);
         if (job.status === 'failed') this.addLog(`${what} failed: ${job.title} — ${job.error?.message ?? 'see details.'}`, 'error', who, job.id);
+        if (job.type === 'ai.task' && (job.status === 'completed' || job.status === 'failed')) this.aiFinished(job);
       }
     }
+    if (job.type === 'ai.task') this.updateAiThinking();
+  }
+
+  /** The Intelligence Lab lights up while any Gemini task is queued or running. */
+  private updateAiThinking() {
+    const running = this.jobs.filter((j) => j.type === 'ai.task' && (j.status === 'queued' || j.status === 'working'));
+    if (running.length) {
+      const names = [...new Set(running.map((j) => (j.agent ? AGENT_BY_ID[j.agent].name : 'a worker')))];
+      this.engine.setAiActivity('thinking', `AI thinking · ${names.join(', ')}`);
+    } else if (this.engine.aiPulse().state === 'thinking') this.engine.setAiActivity('idle');
+  }
+
+  private aiFinished(job: Job) {
+    if (this.jobs.some((j) => j.type === 'ai.task' && (j.status === 'queued' || j.status === 'working'))) return;
+    const who = job.agent ? AGENT_BY_ID[job.agent].name : 'worker';
+    const code = job.error?.code ?? job.steps[0]?.error?.code;
+    if (job.status === 'completed') this.engine.setAiActivity('done', `Answer ready · ${who}`, 5000);
+    else if (code === 'RATE_LIMITED') this.engine.setAiActivity('limited', 'AI usage limit reached', 30000);
+    else this.engine.setAiActivity('error', 'AI request failed', 8000);
   }
 
   private onStep(job: Job, step: JobStep) {

@@ -2,13 +2,13 @@
 
 import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { ErrorCode, Job, JobStep, LiveAgentId, Money, ReportPayload, ReportType, StepResult, SystemStatus } from '../../../shared/live';
-import { LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../../shared/live';
+import { IMAGE_AGENTS, LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../../shared/live';
 import { formatManila, isIsoDate, type RangePreset } from '../../../shared/manila';
 import { AGENT_BY_ID } from '../../agents/roster';
 import type { AgentId } from '../../sim/types';
 import type { LiveStore } from '../../live/store';
 import { Empty } from '../ActivityPanel';
-import { IconAlert, IconChevron, IconRetry, IconSend } from '../icons';
+import { IconAlert, IconCamera, IconChevron, IconClose, IconRetry, IconSend } from '../icons';
 import { Avatar } from '../shared';
 
 export function useLive(store: LiveStore) {
@@ -82,6 +82,7 @@ const TASK_EXAMPLES: Record<LiveAgentId, string> = {
   nina: 'Plan deliveries for open orders due in the next 2 weeks',
   bea: 'What were our biggest expense categories this month?',
   rosa: 'Which finished orders still have a balance? Draft a reminder for the biggest one',
+  mika: 'What sold best in the last 6 months, and where does production slow down?',
   carlo: 'Write a Facebook caption for a finished narra main door',
   dev: 'Check open orders for missing due dates or odd statuses',
   chief: 'What should the team prioritise today?',
@@ -102,6 +103,10 @@ export function ConnectedBar({
 }) {
   useLive(store);
   const [text, setText] = useState('');
+  const [photo, setPhoto] = useState<string | null>(null);
+  const [photoNote, setPhotoNote] = useState<string | null>(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (focusSignal) input.current?.focus();
@@ -111,13 +116,31 @@ export function ConnectedBar({
   const rangeOk = isIsoDate(r.from) && isIsoDate(r.to) && r.from <= r.to;
   const assign = store.canAssign();
   const who = agent as LiveAgentId;
+  const takesPhoto = IMAGE_AGENTS.includes(who);
+  const usePhoto = takesPhoto ? photo : null;
   const submitTask = async () => {
     const v = text.trim();
-    if (!v || !assign.ok) return;
-    const job = await store.submitAi(who, v);
+    if ((!v && !usePhoto) || !assign.ok) return;
+    const job = await store.submitAi(who, v, usePhoto ?? undefined);
     if (job) {
       setText('');
+      setPhoto(null);
+      setPhotoNote(null);
       onOpenJob(job.id);
+    }
+  };
+  const pickPhoto = async (file: File | undefined) => {
+    if (!file) return;
+    setPhotoBusy(true);
+    setPhotoNote(null);
+    try {
+      setPhoto(await shrinkPhoto(file));
+    } catch (e) {
+      setPhoto(null);
+      setPhotoNote((e as Error).message);
+    } finally {
+      setPhotoBusy(false);
+      if (fileInput.current) fileInput.current.value = '';
     }
   };
   return (
@@ -191,15 +214,52 @@ export function ConnectedBar({
           value={text}
           maxLength={MAX_PROMPT_CHARS}
           onChange={(e) => setText(e.target.value)}
-          placeholder={assign.ok ? `e.g. ${TASK_EXAMPLES[who]}` : 'AI tasks are not set up on the server'}
+          placeholder={
+            !assign.ok ? 'AI tasks are not set up on the server' : usePhoto ? 'Optional: details, e.g. narra, for a Batangas client' : `e.g. ${TASK_EXAMPLES[who]}`
+          }
           disabled={!assign.ok}
           autoComplete="off"
         />
-        <button className="btn primary" type="submit" disabled={!assign.ok || !text.trim()} title={assign.reason}>
+        {takesPhoto && (
+          <>
+            <input
+              ref={fileInput}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              hidden
+              onChange={(e) => void pickPhoto(e.target.files?.[0])}
+            />
+            {usePhoto ? (
+              <span className="photo-chip" title="This photo will be sent with the task">
+                <img src={usePhoto} alt="Selected photo" />
+                <button type="button" className="icon-btn" aria-label="Remove photo" onClick={() => setPhoto(null)}>
+                  <IconClose size={12} />
+                </button>
+              </span>
+            ) : (
+              <button
+                type="button"
+                className="btn"
+                disabled={!assign.ok || photoBusy}
+                onClick={() => fileInput.current?.click()}
+                title={`Add a photo for ${AGENT_BY_ID[who].name} to look at (JPEG, PNG or WebP). It is sent to Google Gemini for analysis.`}
+              >
+                <IconCamera size={16} />
+                <span className="hide-narrow">{photoBusy ? 'Reading…' : 'Photo'}</span>
+              </button>
+            )}
+          </>
+        )}
+        <button className="btn primary" type="submit" disabled={!assign.ok || (!text.trim() && !usePhoto)} title={assign.reason}>
           <IconSend size={16} />
           <span>Assign</span>
         </button>
       </form>
+      {photoNote && takesPhoto && (
+        <p className="muted small photo-note" role="alert">
+          {photoNote}
+        </p>
+      )}
       <p className="ai-note">
         {store.ai?.ready
           ? `Reports are calculated by code. Assigned tasks are answered by AI (Gemini) using read-only live data — check answers before acting on them.`
@@ -401,6 +461,13 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
           )}
         </div>
         {isAi && <blockquote className="prompt">{job.prompt}</blockquote>}
+        {isAi && job.image && (
+          store.images.get(job.id) ? (
+            <img className="task-photo" src={store.images.get(job.id)} alt="Photo sent with this task" />
+          ) : (
+            <p className="muted small">A photo was sent with this task (not kept after a reload).</p>
+          )
+        )}
         <p className="muted small">Requested {formatManila(job.createdAt)} by {job.requestedBy}</p>
       </div>
       {job.steps.map((s) => (
@@ -411,7 +478,7 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
           className="btn"
           disabled={!can.ok}
           title={can.reason}
-          onClick={() => (isAi ? store.submitAi(job.agent!, job.prompt!) : store.submit(job.type as ReportType, job.range))}
+          onClick={() => (isAi ? store.submitAi(job.agent!, job.prompt!, store.images.get(job.id)) : store.submit(job.type as ReportType, job.range))}
         >
           <IconRetry size={15} /> Run again
         </button>
@@ -503,6 +570,10 @@ const TOOL_LABEL: Record<string, string> = {
   get_open_orders: 'Open orders',
   get_finance: 'Finance records',
   get_collections: 'Order balances',
+  get_order_trends: 'Order trends',
+  get_product_mix: 'Product mix',
+  get_production_pipeline: 'Production pipeline',
+  get_finance_trends: 'Finance trends',
 };
 
 function AiResultView({ r }: { r: StepResult }) {
@@ -554,8 +625,9 @@ function AiResultView({ r }: { r: StepResult }) {
 function OrderName({ ref_, names }: { ref_: string; names: Record<string, string> }) {
   const name = names[ref_];
   return name ? (
-    <b title={ref_}>
-      {name} <span className="order-ref">{ref_}</span>
+    <b className="order-name" title={ref_}>
+      <span className="order-customer">{name}</span>
+      <span className="order-ref">{ref_}</span>
     </b>
   ) : (
     <b>{ref_}</b>
@@ -659,12 +731,12 @@ function ReportView({ rep, names }: { rep: ReportPayload; names: Record<string, 
       );
     case 'orders.overdue':
       return (
-        <ul className="flags">
+        <ul className="flags stacked">
           {rep.overdue.map((o) => (
             <li key={o.ref} className="warn">
               <OrderName ref_={o.ref} names={names} />
               <span>
-                {o.daysOverdue} day(s) overdue · due {o.dueDate} · {o.status}
+                {o.daysOverdue} {o.daysOverdue === 1 ? 'day' : 'days'} overdue · due {o.dueDate} · {o.status}
                 {o.progressPercent !== null ? ` · ${o.progressPercent}%` : ''}
               </span>
             </li>
@@ -673,7 +745,7 @@ function ReportView({ rep, names }: { rep: ReportPayload; names: Record<string, 
       );
     case 'combined.report':
       return rep.linking === 'unavailable' ? null : (
-        <ul className="flags">
+        <ul className="flags stacked">
           {rep.matched.map((m) => (
             <li key={m.orderRef} className={m.costsIncomplete ? 'warn' : ''}>
               <OrderName ref_={m.orderRef} names={names} />
@@ -696,6 +768,7 @@ const LIVE_ROLE: Record<LiveAgentId, string> = {
   nina: 'Installations — plans dates from open orders and due dates in WAD Order Management.',
   bea: 'Finance — reads income, expenses and budgets from WAD Furniture Management, and order balances.',
   rosa: 'Collections — reads order prices, downpayments and balances from WAD Order Management; drafts payment reminders (never sends them).',
+  mika: 'Data Analyst — trends over time: orders by month, best-selling products, production bottlenecks, and monthly income vs. expenses. Order values only for accounts with finance access.',
   carlo: 'Marketing — writes captions and posts (no live data).',
   dev: 'Systems — checks order data for gaps and inconsistencies in WAD Order Management.',
   chief: 'Coordinator — combines both systems; reports link records only by a verified order ID.',
@@ -732,4 +805,42 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
       )}
     </section>
   );
+}
+
+/**
+ * Shrinks a photo in the browser before upload: longest side at most 1600 px, re-encoded as
+ * JPEG. This keeps uploads small and fast, and drops the camera's hidden data (EXIF, such as GPS
+ * location) because only the pixels are redrawn.
+ */
+async function shrinkPhoto(file: File): Promise<string> {
+  if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Choose a JPEG, PNG or WebP photo.');
+  if (file.size > 25 * 1024 * 1024) throw new Error('That photo is too large (over 25 MB).');
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error('That file could not be opened as a photo.'));
+      i.src = url;
+    });
+    const max = 1600;
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('This browser cannot prepare the photo.');
+    ctx.fillStyle = '#ffffff'; // transparent PNGs get a white background in the JPEG
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    for (const q of [0.85, 0.7, 0.55]) {
+      const data = canvas.toDataURL('image/jpeg', q);
+      if (data.length * 0.75 <= 2.5 * 1024 * 1024) return data;
+    }
+    throw new Error('That photo is still too large after shrinking. Try a smaller one.');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }

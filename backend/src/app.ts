@@ -5,6 +5,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import type { AiStatus, DateRange, Job, LiveAgentId, ReportType, SessionUser } from '../shared/live';
+import { MAX_IMAGE_BYTES } from '../shared/live';
 import { validateRange } from '../shared/manila';
 import type { FinanceSource, OrderSource } from './adapters/types';
 import { Auth, SESSION_COOKIE, parseCookies } from './auth';
@@ -163,13 +164,22 @@ export function createApp(deps: AppDeps) {
       if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
       let body: Record<string, unknown>;
       try {
-        body = await readJson(req);
+        // Room for one photo (base64 is about 4/3 of the photo's size).
+        body = await readJson(req, Math.ceil((MAX_IMAGE_BYTES * 4) / 3) + 64 * 1024);
       } catch {
-        return send(res, 400, { error: 'Invalid request body.' });
+        return send(res, 413, { error: 'The request is too large. Use a smaller photo.' });
       }
       if (typeof body.agent !== 'string' || typeof body.prompt !== 'string') return send(res, 400, { error: 'Choose an agent and type a task.' });
+      const img = body.image as { mimeType?: unknown; data?: unknown } | undefined;
+      if (img !== undefined && (typeof img !== 'object' || img === null || typeof img.mimeType !== 'string' || typeof img.data !== 'string'))
+        return send(res, 400, { error: 'The photo could not be read.' });
       try {
-        const { job, deduplicated } = runner.submitAi(s.user, body.agent as LiveAgentId, body.prompt);
+        const { job, deduplicated } = runner.submitAi(
+          s.user,
+          body.agent as LiveAgentId,
+          body.prompt,
+          img ? { mimeType: img.mimeType as string, data: img.data as string } : undefined,
+        );
         return send(res, deduplicated ? 200 : 202, { job: structuredClone(job), deduplicated });
       } catch (e) {
         if (e instanceof SubmitError) return send(res, e.status, { error: e.message });

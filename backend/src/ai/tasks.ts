@@ -25,10 +25,28 @@ import { SYSTEM_NAMES } from '../../shared/live';
 import { manilaDate, validateRange } from '../../shared/manila';
 import type { FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
 import { IntegrationError } from '../http/errors';
-import { collections, customerNames, financeSummary, orderStatus, overdueOrders } from '../reports/calc';
+import {
+  collections,
+  customerNames,
+  financeSummary,
+  financeTrends,
+  orderStatus,
+  orderTrends,
+  overdueOrders,
+  productionPipeline,
+  productMix,
+} from '../reports/calc';
 import type { FunctionDeclaration, GeminiClient, GeminiContent, GeminiPart } from './gemini';
 
-type ToolName = 'get_orders' | 'get_open_orders' | 'get_finance' | 'get_collections';
+type ToolName =
+  | 'get_orders'
+  | 'get_open_orders'
+  | 'get_finance'
+  | 'get_collections'
+  | 'get_order_trends'
+  | 'get_product_mix'
+  | 'get_production_pipeline'
+  | 'get_finance_trends';
 
 interface AgentProfile {
   name: string;
@@ -68,6 +86,13 @@ export const AGENT_PROFILES: Record<LiveAgentId, AgentProfile> = {
     focus: 'Reports recorded income, operating expenses by category, and monthly budgets.',
     tools: ['get_finance', 'get_collections'],
   },
+  mika: {
+    name: 'Mika',
+    role: 'Data Analyst',
+    focus:
+      'Works in the Intelligence Lab. Finds trends over time: whether orders are going up or down, what customers order most (category, door type, wood, finish), where production gets stuck, and which months were best for income and expenses. Explains what the numbers mean and suggests one or two practical next steps, but never invents a cause the data does not show. Says when a period is too short to call it a trend.',
+    tools: ['get_order_trends', 'get_product_mix', 'get_production_pipeline', 'get_finance_trends', 'get_orders'],
+  },
   rosa: {
     name: 'Rosa',
     role: 'Collections Officer',
@@ -78,7 +103,8 @@ export const AGENT_PROFILES: Record<LiveAgentId, AgentProfile> = {
   carlo: {
     name: 'Carlo',
     role: 'Marketing Writer',
-    focus: 'Writes captions and posts for finished projects (doors and furniture). Never invents customer names, prices or promises.',
+    focus:
+      'Writes captions and posts for finished projects (doors and furniture). Never invents customer names, prices or promises. When given a photo, looks carefully at it first and writes the caption from what is actually visible.',
     tools: [],
   },
   dev: {
@@ -101,6 +127,20 @@ const TOOL_PERMISSIONS: Record<ToolName, Permission[]> = {
   get_open_orders: ['orders:read'],
   get_finance: ['finance:read'],
   get_collections: ['orders:read', 'finance:read'],
+  // Order values inside these are shown only to users who also have finance:read.
+  get_order_trends: ['orders:read'],
+  get_product_mix: ['orders:read'],
+  get_production_pipeline: ['orders:read'],
+  get_finance_trends: ['finance:read'],
+};
+
+const RANGE_PARAMS = {
+  type: 'object' as const,
+  properties: {
+    from: { type: 'string', description: 'Start date, YYYY-MM-DD (inclusive, Asia/Manila)' },
+    to: { type: 'string', description: 'End date, YYYY-MM-DD (inclusive, Asia/Manila)' },
+  },
+  required: ['from', 'to'],
 };
 
 const DECLARATIONS: Record<ToolName, FunctionDeclaration> = {
@@ -135,6 +175,36 @@ const DECLARATIONS: Record<ToolName, FunctionDeclaration> = {
       required: ['from', 'to'],
     },
   },
+  get_order_trends: {
+    name: 'get_order_trends',
+    description:
+      'Orders over time by order date, calculated by code: per month or week, the number of orders, pieces, how many are delivered or still open, and (if the user may see money) order value and average order value. Also the busiest period and a first-half vs second-half comparison. Use a range of several months for trends.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ...RANGE_PARAMS.properties,
+        period: { type: 'string', description: 'Group by "month" (default) or "week"' },
+      },
+      required: ['from', 'to'],
+    },
+  },
+  get_product_mix: {
+    name: 'get_product_mix',
+    description:
+      'What customers ordered in a date range, calculated by code: pieces and share by product category, door type, wood, finish, and the top combinations (e.g. Door · Carved · Narra · With Varnish). Includes value per group if the user may see money.',
+    parameters: RANGE_PARAMS,
+  },
+  get_production_pipeline: {
+    name: 'get_production_pipeline',
+    description:
+      'Where all open (not Delivered) orders are right now, by least-advanced production stage: how many, how many overdue, average days since ordered, average days since the order last moved stage, the orders waiting longest, and the slowest stage. Use it for bottleneck questions.',
+  },
+  get_finance_trends: {
+    name: 'get_finance_trends',
+    description:
+      'Income, operating expenses and net per month from WAD Furniture Management, calculated by code, with each month\'s largest expense category, and the best and worst months by net. Payroll and material purchases are not included.',
+    parameters: RANGE_PARAMS,
+  },
   get_collections: {
     name: 'get_collections',
     description:
@@ -167,13 +237,29 @@ export interface AiTaskOutcome {
   customers: Record<string, string>;
 }
 
+/** Added to the instructions when a photo comes with the task. */
+const PHOTO_RULES = `
+
+A photo is attached to this request.
+- First, under "**What I see**", list in 3 to 6 short bullets only what is visible: the product (door, cabinet, table…), design (panels, carving, V-cut, glass, louvers), colour and finish (natural, varnished, stained, painted, gloss or matte), hardware, and the setting.
+- Wood species cannot be confirmed from a photo: write "looks like narra" or similar, unless the request or the business notes name the wood.
+- If the photo is not furniture, is too dark or blurry, or you are unsure, say so plainly instead of guessing.
+- Then write the post: "**Caption**" (2 to 4 sentences, warm and proud, ends with a call to message WAD for a quotation), "**Short version**" (one line), and "**Hashtags**" (5 to 8, including #WADFurniture).
+- Do not mention people, faces, house numbers, addresses or plate numbers that appear in the photo. Never invent a customer name, price or delivery promise.`;
+
 const MAX_RECORDS_TO_AI = 150;
 /** Most data lookups one task may make, across all rounds (identical repeats are free). */
 export const MAX_TOOL_CALLS = 6;
 const MAX_ANSWER_CHARS = 8000;
 const MAX_KNOWLEDGE_CHARS = 24000;
 
-export async function runAiTask(deps: AiTaskDeps, user: SessionUser, agent: LiveAgentId, prompt: string): Promise<AiTaskOutcome> {
+export async function runAiTask(
+  deps: AiTaskDeps,
+  user: SessionUser,
+  agent: LiveAgentId,
+  prompt: string,
+  image?: { mimeType: string; data: string },
+): Promise<AiTaskOutcome> {
   const today = manilaDate(deps.now?.());
   const tools = toolsFor(agent, user);
   const profile = AGENT_PROFILES[agent];
@@ -184,11 +270,14 @@ export async function runAiTask(deps: AiTaskDeps, user: SessionUser, agent: Live
   const names = (orders: OrderRecord[]) => Object.assign(customers, customerNames(orders, undefined, 500 - Object.keys(customers).length));
   let recordCount = 0;
 
-  const contents: GeminiContent[] = [{ role: 'user', parts: [{ text: prompt }] }];
+  // A photo goes in the same first message as the request, before the text.
+  const contents: GeminiContent[] = [{ role: 'user', parts: [...(image ? [{ inlineData: image }] : []), { text: prompt }] }];
   const cache = new Map<string, Record<string, unknown>>();
   let toolCalls = 0;
   const request = (allowTools: boolean) => ({
-    systemInstruction: { parts: [{ text: systemPrompt(profile, today, tools, profile.tools.filter((t) => !tools.includes(t)), user, loadKnowledge(deps.knowledgeDir)) }] },
+    systemInstruction: {
+      parts: [{ text: systemPrompt(profile, today, tools, profile.tools.filter((t) => !tools.includes(t)), user, loadKnowledge(deps.knowledgeDir)) + (image ? PHOTO_RULES : '') }],
+    },
     contents,
     ...(tools.length ? { tools: [{ functionDeclarations: tools.map((t) => DECLARATIONS[t]) }] } : {}),
     generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
@@ -224,7 +313,7 @@ export async function runAiTask(deps: AiTaskDeps, user: SessionUser, agent: Live
       const name = functionCall.name as ToolName;
       const args = functionCall.args ?? {};
       let response: Record<string, unknown>;
-      const key = `${name}|${String(args.from ?? '')}|${String(args.to ?? '')}`;
+      const key = `${name}|${String(args.from ?? '')}|${String(args.to ?? '')}|${String(args.period ?? '')}`;
       if (!tools.includes(name)) {
         response = { error: `Tool "${functionCall.name}" is not available to ${profile.name} for this user.` };
         lookups.push({ tool: String(functionCall.name), detail: 'not allowed', ok: false });
@@ -236,7 +325,7 @@ export async function runAiTask(deps: AiTaskDeps, user: SessionUser, agent: Live
       } else {
         toolCalls++;
         try {
-          response = await callTool(name, args, deps, today, { source, refs, names });
+          response = await callTool(name, args, deps, today, { source, refs, names, money: user.permissions.includes('finance:read') });
           cache.set(key, response);
           lookups.push({ tool: name, detail: describe(name, args), ok: true });
         } catch (e) {
@@ -256,6 +345,8 @@ export async function runAiTask(deps: AiTaskDeps, user: SessionUser, agent: Live
 function describe(name: ToolName, args: Record<string, unknown>) {
   if (name === 'get_open_orders') return 'all open orders';
   if (name === 'get_collections') return 'balances on open orders';
+  if (name === 'get_production_pipeline') return 'all open orders by stage';
+  if (name === 'get_order_trends') return `${String(args.from ?? '?')} to ${String(args.to ?? '?')}, by ${args.period === 'week' ? 'week' : 'month'}`;
   return `${String(args.from ?? '?')} to ${String(args.to ?? '?')}`;
 }
 
@@ -275,7 +366,7 @@ async function callTool(
   args: Record<string, unknown>,
   deps: AiTaskDeps,
   today: string,
-  track: { source: (s: SystemId, n: number) => void; refs: Set<string>; names: (o: OrderRecord[]) => void },
+  track: { source: (s: SystemId, n: number) => void; refs: Set<string>; names: (o: OrderRecord[]) => void; money: boolean },
 ): Promise<Record<string, unknown>> {
   if (name === 'get_finance') {
     const range = rangeArg(args, deps.maxRangeDays);
@@ -316,6 +407,63 @@ async function callTool(
       orders: report.rows.slice(0, MAX_RECORDS_TO_AI).map((r, i) => ({ ...r, orderDate: orders[i]?.createdDate ?? null })),
       ordersTruncated: report.rows.length > MAX_RECORDS_TO_AI,
       notes: [...notes, 'Only "Delivered" closes an order. A "Finished" order past its due date is still overdue.'],
+    };
+  }
+  if (name === 'get_order_trends') {
+    const range = rangeArg(args, deps.maxRangeDays);
+    const orders = await deps.orders.listOrders(range, { products: true });
+    track.source('orders', orders.length);
+    track.names(orders);
+    const period = args.period === 'week' ? 'week' : 'month';
+    return {
+      ...orderTrends(range, orders, period, track.money && deps.orders.capabilities.payments === true),
+      calculatedByCode: true,
+      notes: [
+        'Grouped by the date each order was placed. "stillOpen" means not yet Delivered.',
+        ...(track.money ? [] : ['Order values are hidden: this user has no finance permission.']),
+        ...(deps.orders.capabilities.products ? [] : ['Piece counts are unavailable (the order system did not return product details).']),
+      ],
+    };
+  }
+  if (name === 'get_product_mix') {
+    const range = rangeArg(args, deps.maxRangeDays);
+    const orders = await deps.orders.listOrders(range, { products: true });
+    track.source('orders', orders.length);
+    track.names(orders);
+    if (deps.orders.capabilities.products !== true)
+      return { error: 'WAD Order Management did not return product details.', note: 'Product mix is unavailable. Do not estimate it.' };
+    return {
+      range,
+      ...productMix(orders, track.money && deps.orders.capabilities.payments === true),
+      calculatedByCode: true,
+      notes: ['Counts are pieces (one row per piece in the order system). sharePercent is of all pieces in the range.'],
+    };
+  }
+  if (name === 'get_production_pipeline') {
+    const open = await deps.orders.listOpenOrders();
+    track.source('orders', open.length);
+    track.names(open);
+    const p = productionPipeline(open, today, deps.orders.capabilities.stageDates === true);
+    p.stages.forEach((s) => s.longestWaiting.forEach((w) => track.refs.add(w.ref)));
+    return {
+      ...p,
+      calculatedByCode: true,
+      notes: [
+        'Each order is counted at the stage of its least-advanced piece. "unknown" = no recognised stage.',
+        p.stageDatesAvailable
+          ? '"Days since last progress" counts from the last time any piece of the order moved stage.'
+          : 'Stage-change dates are not available, so waiting time is measured from the order date.',
+      ],
+    };
+  }
+  if (name === 'get_finance_trends') {
+    const range = rangeArg(args, deps.maxRangeDays);
+    const [income, expenses] = await Promise.all([deps.finance.listIncome(range), deps.finance.listExpenses(range)]);
+    track.source('finance', income.length + expenses.length);
+    return {
+      ...financeTrends(range, income, expenses),
+      calculatedByCode: true,
+      notes: ['Income is every recorded income entry. Payroll and material purchases are not included in expenses.'],
     };
   }
   if (name === 'get_collections') {
@@ -366,7 +514,7 @@ function systemPrompt(p: AgentProfile, today: string, tools: ToolName[], missing
     `Today is ${today} (Asia/Manila). Amounts are in Philippine pesos (₱). You are answering ${user.username}, a staff member.`,
     tools.length
       ? `You can look up live company data with these read-only tools: ${tools.join(', ')}. Use them for ANY question about orders, production, deadlines, income, expenses or budgets — never answer those from memory.`
-      : 'You have no access to live company data. If the request needs live order or finance figures, say which colleague can get them (Paolo for orders and production, Bea for finance, Rosa for unpaid balances, Chief for all of these).',
+      : 'You have no access to live company data. If the request needs live order or finance figures, say which colleague can get them (Paolo for orders and production, Bea for finance, Rosa for unpaid balances, Mika for trends and best sellers, Chief for all of these).',
     missing.length ? `This user's account cannot use: ${missing.join(', ')}. If the request needs that data, say so plainly.` : '',
     'Rules:',
     '- Use only figures that the tools returned or that appear in the business notes. Never invent, estimate or round off numbers, order references, dates, names or prices.',

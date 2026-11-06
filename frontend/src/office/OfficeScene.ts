@@ -50,6 +50,7 @@ export class OfficeScene extends Phaser.Scene {
   private rackLeds: { f: Furniture; g: Phaser.GameObjects.Graphics }[] = [];
   private bigScreen?: { f: Furniture; g: Phaser.GameObjects.Graphics };
   private holo?: { f: Furniture; g: Phaser.GameObjects.Graphics };
+  private coffee?: { f: Furniture; g: Phaser.GameObjects.Graphics };
   private roomLabels: Phaser.GameObjects.Container[] = [];
   private highlight!: Phaser.GameObjects.Graphics;
   private insets: Insets = { top: 56, right: 12, bottom: 100, left: 12 };
@@ -58,6 +59,8 @@ export class OfficeScene extends Phaser.Scene {
   private drag: { x: number; y: number; sx: number; sy: number; moved: boolean } | null = null;
   private pinch: { dist: number; zoom: number } | null = null;
   private ambientT = 0;
+  /** Status text floating above the hologram while the AI is busy (or just finished / failed). */
+  private aiLabel?: { c: Phaser.GameObjects.Container; bg: Phaser.GameObjects.Graphics; t: Phaser.GameObjects.Text; text: string };
   private screenT = 0;
   private unsubs: (() => void)[] = [];
   private zoomTween?: Phaser.Tweens.Tween;
@@ -357,6 +360,7 @@ export class OfficeScene extends Phaser.Scene {
       if (f.kind === 'rack') this.rackLeds.push({ f, g: this.add.graphics().setDepth(depth + 0.01) });
       if (f.kind === 'bigScreen') this.bigScreen = { f, g: this.add.graphics().setDepth(depth + 0.01) };
       if (f.kind === 'holoTable') this.holo = { f, g: this.add.graphics().setDepth(depth + 0.01) };
+      if (f.kind === 'coffeeMaker') this.coffee = { f, g: this.add.graphics().setDepth(depth + 0.01) };
     }
   }
 
@@ -466,7 +470,7 @@ export class OfficeScene extends Phaser.Scene {
       const p = iso(a.x + 0.5, a.y + 0.5);
       const front = a.dir[0] === 'f';
       const flip = a.dir[1] === 'l';
-      const walking = a.path.length > 0;
+      const walking = a.path.length > 0 || a.action === 'jog';
       let key: string;
       let lift = 0;
       if (walking) {
@@ -488,6 +492,7 @@ export class OfficeScene extends Phaser.Scene {
       if (!reduced && !paused && !walking) {
         if (a.action === 'work' && a.posture !== 'sit') bob = Math.sin(time / 160) > 0.6 ? 1 : 0;
         if (a.action === 'talk') bob = Math.sin(time / 120) > 0 ? 1 : 0;
+        if (a.action === 'exercise') bob = Math.sin(time / 140) > 0 ? 2 : 0;
         if (a.posture === 'sit' && a.action === 'work') bob = Math.sin(time / 260) > 0.3 ? 0.5 : 0;
       }
       const footY = p.y + 3 - (a.posture === 'sit' && !walking ? 5 : 0);
@@ -558,22 +563,28 @@ export class OfficeScene extends Phaser.Scene {
       }
     }
 
-    // ambient decor (server LEDs, command screen, hologram) — not agent activity
+    // ambient decor (server LEDs, command screen); the racks blink faster while the AI works
+    const pulse = this.engine.aiPulse();
     this.ambientT += delta;
-    if (this.ambientT > 420 || this.ambientT === delta) {
+    if (this.ambientT > (pulse.state === 'thinking' ? 140 : 420) || this.ambientT === delta) {
       this.ambientT = 0;
       this.drawAmbient(time, reduced || paused);
     }
+    // The Intelligence Lab hologram shows what the AI is doing, every frame so it moves smoothly.
+    this.drawHolo(time, reduced || paused, pulse.state);
+    this.drawAiLabel(pulse.state, pulse.label, k);
   }
 
   private drawAmbient(time: number, still: boolean) {
     const seed = still ? 1 : Math.floor(time / 420);
+    const ai = this.engine.aiPulse().state;
+    const accent = ai === 'limited' ? 0xffb547 : ai === 'error' ? 0xff5d6c : ai === 'done' ? 0x43d18a : ai === 'thinking' ? 0x5cb8ff : 0xffb547;
     for (const { f, g } of this.rackLeds) {
       g.clear();
       for (let i = 0; i < 6; i++)
         for (let j = 0; j < 3; j++) {
-          const on = Math.sin(seed * 3.1 + f.x * 7 + i * 1.9 + j * 4.3) > -0.2;
-          const col = (i + j + f.x) % 5 === 0 ? 0xffb547 : 0x5fe0d2;
+          const on = Math.sin(seed * 3.1 + f.x * 7 + i * 1.9 + j * 4.3) > (ai === 'thinking' ? -0.6 : -0.2);
+          const col = (i + j + f.x) % (ai === 'idle' ? 5 : 2) === 0 ? accent : 0x5fe0d2;
           faceL(g, f.y + 0.86, f.x + 0.22 + j * 0.12, f.x + 0.28 + j * 0.12, 6 + i * 6.3, 7.4 + i * 6.3, on ? col : 0x2a3344);
         }
     }
@@ -597,17 +608,117 @@ export class OfficeScene extends Phaser.Scene {
         faceL(g, f.y + 0.04, a, a + 0.2, z, z + 1, 0x58e0f0, 0.8);
       }
     }
-    if (this.holo) {
-      const { f, g } = this.holo;
+    if (this.coffee) {
+      // Steam rises while someone is making coffee.
+      const { f, g } = this.coffee;
       g.clear();
-      const c = P(f.x + f.w / 2, f.y + f.d / 2, 14);
-      const t = still ? 0 : time / 500;
-      g.fillStyle(0x5fe0d2, 0.1);
-      g.fillTriangle(c.x - 18, c.y, c.x + 18, c.y, c.x, c.y - 34);
-      g.lineStyle(1.5, 0x8ff5ea, 0.8);
-      g.strokeEllipse(c.x, c.y - 14 - Math.sin(t) * 3, 26 + Math.cos(t) * 6, 9);
-      g.strokeEllipse(c.x, c.y - 24 + Math.sin(t) * 2, 16, 6);
+      const brewing = this.engine.agents.some((a) => a.leisure?.spot?.id === 'coffee' && a.leisure.phase === 'doing');
+      if (brewing) {
+        const t = still ? 0 : time / 420;
+        for (let i = 0; i < 3; i++) {
+          const rise = (t + i / 3) % 1;
+          const c = P(f.x + 0.42 + Math.sin((t + i) * 2) * 0.04, f.y + 0.72, 20 + rise * 16);
+          g.fillStyle(0xffffff, 0.55 * (1 - rise));
+          g.fillCircle(c.x, c.y, 2 + rise * 2.5);
+        }
+      }
     }
+  }
+
+  /**
+   * Hologram over the Intelligence Lab table:
+   * idle = dim, slow rings · thinking = bright beam, fast rings and rising data
+   * done = green burst · limited = slow amber pulse · error = red flicker.
+   */
+  private drawHolo(time: number, still: boolean, state: string) {
+    if (!this.holo) return;
+    const { f, g } = this.holo;
+    g.clear();
+    const c = P(f.x + f.w / 2, f.y + f.d / 2, 14);
+    const t = still ? 0 : time / 1000;
+    const col = state === 'done' ? 0x43d18a : state === 'limited' ? 0xffb547 : state === 'error' ? 0xff5d6c : state === 'thinking' ? 0x5cb8ff : 0x5fe0d2;
+    const light = state === 'done' ? 0x9ff0c4 : state === 'limited' ? 0xffd590 : state === 'error' ? 0xffa0a8 : state === 'thinking' ? 0xa8dcff : 0x8ff5ea;
+
+    if (state === 'idle') {
+      g.fillStyle(col, 0.1);
+      g.fillTriangle(c.x - 18, c.y, c.x + 18, c.y, c.x, c.y - 34);
+      g.lineStyle(1.5, light, 0.8);
+      g.strokeEllipse(c.x, c.y - 14 - Math.sin(t * 2) * 3, 26 + Math.cos(t * 2) * 6, 9);
+      g.strokeEllipse(c.x, c.y - 24 + Math.sin(t * 2) * 2, 16, 6);
+      return;
+    }
+    if (state === 'thinking') {
+      g.fillStyle(col, 0.18 + 0.06 * Math.sin(t * 6));
+      g.fillTriangle(c.x - 22, c.y, c.x + 22, c.y, c.x, c.y - 44);
+      g.lineStyle(1.5, light, 0.95);
+      for (let i = 0; i < 3; i++) {
+        const ph = t * (3 + i) + i * 2.1;
+        g.strokeEllipse(c.x, c.y - 12 - i * 9 - Math.sin(ph) * 2, 30 - i * 7 + Math.cos(ph) * 5, 9 - i * 1.5);
+      }
+      // data bits rising through the beam
+      for (let i = 0; i < 6; i++) {
+        const rise = (t * 0.9 + i / 6) % 1;
+        const x = c.x + Math.sin(i * 2.4 + t * 2) * 10 * (1 - rise);
+        g.fillStyle(light, 0.9 * (1 - rise));
+        g.fillRect(x - 1, c.y - 4 - rise * 40, 2, 2);
+      }
+      return;
+    }
+    if (state === 'done') {
+      g.fillStyle(col, 0.2);
+      g.fillTriangle(c.x - 20, c.y, c.x + 20, c.y, c.x, c.y - 40);
+      const r = still ? 0.5 : (t * 0.8) % 1;
+      g.lineStyle(2, light, 1 - r);
+      g.strokeEllipse(c.x, c.y - 20, 16 + r * 30, 6 + r * 10);
+      g.lineStyle(2, light, 0.95); // a check mark
+      g.beginPath();
+      g.moveTo(c.x - 6, c.y - 28);
+      g.lineTo(c.x - 1, c.y - 23);
+      g.lineTo(c.x + 8, c.y - 34);
+      g.strokePath();
+      return;
+    }
+    // limited: slow amber pulse with a pause sign · error: red flicker with an exclamation mark
+    const a = state === 'limited' ? 0.12 + 0.1 * (Math.sin(t * 2) + 1) : Math.sin(t * 20) > 0 ? 0.28 : 0.12;
+    g.fillStyle(col, a);
+    g.fillTriangle(c.x - 18, c.y, c.x + 18, c.y, c.x, c.y - 34);
+    g.fillStyle(light, 0.95);
+    if (state === 'limited') {
+      g.fillRect(c.x - 5, c.y - 32, 3, 11);
+      g.fillRect(c.x + 2, c.y - 32, 3, 11);
+    } else {
+      g.fillRect(c.x - 1.5, c.y - 34, 3, 9);
+      g.fillRect(c.x - 1.5, c.y - 22, 3, 3);
+    }
+  }
+
+  private drawAiLabel(state: string, text: string, k: number) {
+    if (!this.holo) return;
+    if (!this.aiLabel) {
+      const t = this.add.text(0, 0, '', { fontFamily: 'Inter, system-ui, sans-serif', fontSize: '11px', fontStyle: '600', color: '#e8edf5', resolution: 3 }).setOrigin(0.5, 0.5);
+      const bg = this.add.graphics();
+      const c = this.add.container(0, 0, [bg, t]).setDepth(LABEL_DEPTH - 1).setVisible(false);
+      this.aiLabel = { c, bg, t, text: '' };
+    }
+    const L = this.aiLabel;
+    if (state === 'idle' || !text) {
+      L.c.setVisible(false);
+      return;
+    }
+    if (L.text !== text + state) {
+      L.text = text + state;
+      L.t.setText(text);
+      const w = L.t.width + 16;
+      const col = state === 'done' ? 0x43d18a : state === 'limited' ? 0xffb547 : state === 'error' ? 0xff5d6c : 0x5cb8ff;
+      L.bg.clear();
+      L.bg.fillStyle(0x0d111b, 0.9);
+      L.bg.fillRoundedRect(-w / 2, -10, w, 20, 6);
+      L.bg.lineStyle(1, col, 0.9);
+      L.bg.strokeRoundedRect(-w / 2, -10, w, 20, 6);
+    }
+    const { f } = this.holo;
+    const p = P(f.x + f.w / 2, f.y + f.d / 2, 14);
+    L.c.setPosition(p.x, p.y - 58).setScale(k).setVisible(true);
   }
 
   // ------------------------------------------------------------------ selection overlay

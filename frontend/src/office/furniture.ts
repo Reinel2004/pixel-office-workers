@@ -253,8 +253,8 @@ export function drawFurniture(g: G, f: Furniture) {
     case 'counter': {
       shadowUnder(g, x, y, w, d);
       box(g, x + 0.02, y + 0.1, w - 0.04, d - 0.2, 0, 14, 0xf4f1ea, { left: 0xa7825c, right: 0x8a6a49 });
-      box(g, x + 0.25, y + 0.25, 0.4, 0.4, 14, 12, 0x2f333d); // coffee machine
-      box(g, x + 0.33, y + 0.6, 0.2, 0.06, 18, 4, 0xd8434e, { edge: false });
+      cylinder(g, x + 0.4, y + 0.5, 0.07, 14, 4, 0xffffff); // mugs (the coffee station is next to the vending machine)
+      cylinder(g, x + 0.6, y + 0.4, 0.07, 14, 4, 0x4f9de0);
       cylinder(g, x + 1.3, y + 0.5, 0.07, 14, 4, 0xffffff);
       cylinder(g, x + 1.5, y + 0.45, 0.07, 14, 4, 0xf2c14e);
       box(g, x + 2.1, y + 0.3, 0.6, 0.4, 14, 3, 0xe8b46a); // bread board
@@ -266,6 +266,26 @@ export function drawFurniture(g: G, f: Furniture) {
       faceL(g, y + 0.9, x + 0.12, x + 0.88, 22, 23, 0xb8c0cc);
       faceL(g, y + 0.91, x + 0.75, x + 0.8, 8, 20, 0x8e98a8);
       faceL(g, y + 0.91, x + 0.75, x + 0.8, 25, 33, 0x8e98a8);
+      break;
+    }
+    case 'coffeeMaker': {
+      shadowUnder(g, x + 0.05, y + 0.1, 0.9, 0.8);
+      // wooden cabinet
+      box(g, x + 0.05, y + 0.1, 0.9, 0.8, 0, 14, 0xf4f1ea, { left: 0xa7825c, right: 0x8a6a49 });
+      faceL(g, y + 0.9, x + 0.12, x + 0.48, 3, 11, 0x96714e);
+      faceL(g, y + 0.9, x + 0.52, x + 0.88, 3, 11, 0x96714e);
+      // espresso machine body, top and dark front
+      box(g, x + 0.15, y + 0.2, 0.55, 0.45, 14, 16, 0x3a3f4a);
+      box(g, x + 0.15, y + 0.2, 0.55, 0.45, 30, 2, 0xb8c0cc);
+      faceL(g, y + 0.651, x + 0.22, x + 0.63, 18, 27, 0x23272f);
+      // red power light, group head and a cup on the drip tray
+      faceL(g, y + 0.652, x + 0.55, x + 0.6, 24.5, 26, 0xd8434e);
+      faceL(g, y + 0.652, x + 0.32, x + 0.5, 20, 22, 0x8e98a8);
+      cylinder(g, x + 0.42, y + 0.72, 0.06, 14, 3, 0xffffff);
+      // coffee bean jar and two mugs
+      cylinder(g, x + 0.82, y + 0.32, 0.07, 14, 7, 0x6b4a2b);
+      cylinder(g, x + 0.82, y + 0.62, 0.06, 14, 4, 0xf2c14e);
+      cylinder(g, x + 0.84, y + 0.8, 0.06, 14, 4, 0x5fbf8f);
       break;
     }
     case 'vending': {

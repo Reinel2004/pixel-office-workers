@@ -90,7 +90,8 @@ export type FurnitureKind =
   | 'hoop'
   | 'printer'
   | 'beanbag'
-  | 'water';
+  | 'water'
+  | 'coffeeMaker';
 
 export interface Furniture {
   id: string;
@@ -133,7 +134,6 @@ for (const a of AGENTS) desk(a.room, a.desk.x, a.desk.y, a.id);
 for (let i = 0; i < 4; i++) add('rack', 'intel', 2 + i, 1);
 for (let i = 0; i < 3; i++) add('rack', 'intel', 8 + i, 1);
 add('holoTable', 'intel', 5, 6, 2, 2);
-desk('intel', 2, 9);
 desk('intel', 8, 9);
 add('tallPlant', 'intel', 1, 4);
 add('plant', 'intel', 11, 3);
@@ -191,6 +191,7 @@ add('sofa', 'sales', 10, 33, 1, 2);
 add('counter', 'pantry', 19, 25, 3, 1);
 add('fridge', 'pantry', 22, 25);
 add('vending', 'pantry', 13, 25);
+add('coffeeMaker', 'pantry', 15, 25); // coffee station: cabinet, espresso machine, mugs
 add('diningTable', 'pantry', 15, 30, 2, 2);
 add('stool', 'pantry', 14, 30, 1, 1, { blocks: false });
 add('stool', 'pantry', 14, 31, 1, 1, { blocks: false });
@@ -259,6 +260,84 @@ export const SPOTS = {
   opsBoard: { x: 4, y: 14 },
   pantryCounter: { x: 20, y: 26 },
 };
+
+/**
+ * Where idle agents go on a break. `tile` is where they stand; `face` is what they look at.
+ * Treadmill belts are furniture (not walkable), so those spots also have an `approach` tile:
+ * the agent walks there, then steps onto the belt.
+ */
+export interface LeisureSpot {
+  id: string;
+  room: RoomId;
+  tile: { x: number; y: number };
+  face: { x: number; y: number };
+  approach?: { x: number; y: number };
+  /** jog = running in place; exercise = bouncing; none = standing (coffee, snacks). */
+  action: 'jog' | 'exercise' | 'none';
+  label: string;
+  says: string[];
+}
+
+export const LEISURE_SPOTS: LeisureSpot[] = [
+  { id: 'treadmill-1', room: 'gym', tile: { x: 2, y: 39 }, approach: { x: 1, y: 39 }, face: { x: 2, y: 37 }, action: 'jog', label: 'Running on the treadmill', says: ['Cardio time!', 'Just 10 more minutes', 'Kaya pa!'] },
+  { id: 'treadmill-2', room: 'gym', tile: { x: 4, y: 39 }, approach: { x: 5, y: 39 }, face: { x: 4, y: 37 }, action: 'jog', label: 'Running on the treadmill', says: ['Cardio time!', 'Burning the merienda', 'One more km'] },
+  { id: 'weights-1', room: 'gym', tile: { x: 8, y: 38 }, face: { x: 8, y: 37 }, action: 'exercise', label: 'Lifting weights', says: ['Lifting!', 'Feel the burn', 'Leg day? Arm day!'] },
+  { id: 'weights-2', room: 'gym', tile: { x: 9, y: 38 }, face: { x: 9, y: 37 }, action: 'exercise', label: 'Lifting weights', says: ['Spot me?', 'Strong like narra'] },
+  { id: 'stretch', room: 'gym', tile: { x: 7, y: 42 }, face: { x: 7, y: 44 }, action: 'exercise', label: 'Stretching', says: ['Stretch break', 'Ahh, much better'] },
+  { id: 'hoop', room: 'court', tile: { x: 22, y: 39 }, face: { x: 23, y: 37 }, action: 'exercise', label: 'Shooting hoops', says: ['Nothing but net!', 'Swish!', 'Three points!'] },
+  { id: 'net-1', room: 'court', tile: { x: 18, y: 39 }, face: { x: 18, y: 41 }, action: 'exercise', label: 'Playing volleyball', says: ['Serve!', 'Mine!'] },
+  { id: 'net-2', room: 'court', tile: { x: 18, y: 41 }, face: { x: 18, y: 39 }, action: 'exercise', label: 'Playing volleyball', says: ['Spike!', 'Nice one!'] },
+  { id: 'coffee', room: 'pantry', tile: { x: 15, y: 26 }, face: { x: 15, y: 25 }, action: 'none', label: 'Making coffee', says: ['Coffee break', 'Kape muna', 'Barako, please'] },
+  { id: 'counter', room: 'pantry', tile: { x: 20, y: 26 }, face: { x: 20, y: 25 }, action: 'none', label: 'Having coffee at the counter', says: ['Ahh, coffee', 'Needed this'] },
+  { id: 'snack', room: 'pantry', tile: { x: 13, y: 26 }, face: { x: 13, y: 25 }, action: 'none', label: 'Getting a snack', says: ['Snack time', 'Merienda!'] },
+  { id: 'lounge', room: 'pantry', tile: { x: 20, y: 32 }, face: { x: 20, y: 34 }, action: 'none', label: 'Relaxing in the lounge', says: ['Quick rest', 'Five minutes lang'] },
+];
+
+/** Places where two agents on a break stand and talk, facing each other. */
+export interface ChatSpot {
+  id: string;
+  room: RoomId;
+  a: { x: number; y: number };
+  b: { x: number; y: number };
+}
+
+export const CHAT_SPOTS: ChatSpot[] = [
+  { id: 'coffee-chat', room: 'pantry', a: { x: 15, y: 27 }, b: { x: 16, y: 27 } },
+  { id: 'table-chat', room: 'pantry', a: { x: 14, y: 31 }, b: { x: 17, y: 31 } },
+  { id: 'water-chat', room: 'command', a: { x: 13, y: 14 }, b: { x: 14, y: 14 } },
+  { id: 'court-chat', room: 'court', a: { x: 14, y: 38 }, b: { x: 15, y: 38 } },
+  { id: 'sofa-chat', room: 'sales', a: { x: 9, y: 33 }, b: { x: 9, y: 34 } },
+];
+
+/** Short break-time conversations: lines alternate between the two agents, first speaker first. */
+export const CHAT_SCRIPTS: string[][] = [
+  ['Kumain ka na?', 'Oo, adobo!', 'Sana all', 'May natira pa, kuha ka'],
+  ['Busy day?', 'Orders keep coming!', 'Good problem to have', 'Totoo!'],
+  ['Nice work on that narra door', 'Salamat! Took a while', 'The carving is beautiful', 'The customer will love it'],
+  ['Coffee later?', 'Sure, after lunch', "I'll bring pandesal", 'Deal!'],
+  ['Traffic was crazy today', 'EDSA as usual', 'Should have left earlier', 'Carpool next time?'],
+  ['Weekend plans?', 'Beach with the family', 'Nice! Where?', 'Batangas lang'],
+  ['Did you see the new design?', 'The V-cut one?', 'Yes! Ang ganda', 'Customers keep asking for it'],
+  ['How was the gym?', 'My legs are sore', 'Leg day ba?', 'Every day is leg day'],
+  ['Is it merienda time yet?', 'Almost!', 'Turon or banana cue?', 'Both, obviously'],
+  ['That coffee maker is new?', 'Yes, finally!', 'Espresso na tayo', 'Fancy!'],
+];
+
+/** Waypoints for a short walk around the office (two or three are picked at random). */
+export const STROLL_POINTS: { x: number; y: number }[] = [
+  { x: 16, y: 38 },
+  { x: 20, y: 43 },
+  { x: 14, y: 43 },
+  { x: 6, y: 43 },
+  { x: 3, y: 42 },
+  { x: 18, y: 28 },
+  { x: 16, y: 34 },
+  { x: 4, y: 33 },
+  { x: 30, y: 30 },
+  { x: 30, y: 18 },
+  { x: 4, y: 7 },
+  { x: 28, y: 9 },
+];
 
 export function roomAt(gx: number, gy: number): RoomId | null {
   const x = Math.floor(gx);
