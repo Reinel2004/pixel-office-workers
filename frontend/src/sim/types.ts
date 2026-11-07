@@ -1,4 +1,4 @@
-export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'dev' | 'chief';
+export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'dev' | 'chief';
 
 export type RoomId =
   | 'intel'
@@ -11,7 +11,8 @@ export type RoomId =
   | 'content'
   | 'finance'
   | 'gym'
-  | 'court';
+  | 'court'
+  | 'workshop';
 
 export type AgentState = 'idle' | 'queued' | 'working' | 'walking' | 'waiting' | 'completed' | 'error';
 

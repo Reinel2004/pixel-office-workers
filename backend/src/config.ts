@@ -21,7 +21,16 @@ export interface SystemConfig {
   problems: string[];
 }
 
+export interface FacebookConfig {
+  pageId: string | null;
+  token: string | null;
+  appSecret: string | null;
+  version: string;
+  problems: string[];
+}
+
 export interface AppConfig {
+  facebook: FacebookConfig;
   port: number;
   host: string;
   production: boolean;
@@ -35,6 +44,8 @@ export interface AppConfig {
   maxRetries: number;
   maxPages: number;
   maxConcurrentJobs: number;
+  /** Live updates: how often the server re-checks orders and Facebook while an office is open (ms); 0 = off. */
+  liveRefreshMs: number;
   maxRangeDays: number;
   taskLogFile: string | null;
   /** Folder of the built front end to serve, or null for an API-only server (front end hosted elsewhere, e.g. Vercel). */
@@ -58,10 +69,12 @@ export interface AiConfig {
 }
 
 export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
-  admin: ['finance:read', 'orders:read'],
+  admin: ['finance:read', 'orders:read', 'social:post'],
   manager: ['finance:read', 'orders:read'],
   finance: ['finance:read'],
   operations: ['orders:read'],
+  /** Can post to the Facebook Page (with Carlo); no business data. */
+  marketing: ['social:post'],
 };
 
 function int(v: string | undefined, def: number, min: number, max: number) {
@@ -146,9 +159,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
     maxRetries: int(env.API_MAX_RETRIES, 2, 0, 5),
     maxPages: int(env.API_MAX_PAGES, 50, 1, 500),
     maxConcurrentJobs: int(env.MAX_CONCURRENT_JOBS, 2, 1, 8),
+    // Seconds between live checks (60 to 3600, default 120); LIVE_REFRESH_SECONDS=0 switches them off.
+    liveRefreshMs: env.LIVE_REFRESH_SECONDS?.trim() === '0' ? 0 : int(env.LIVE_REFRESH_SECONDS, 120, 60, 3600) * 1000,
     maxRangeDays: int(env.REPORT_MAX_RANGE_DAYS, MAX_RANGE_DAYS, 1, MAX_RANGE_DAYS),
     taskLogFile: env.TASK_LOG_FILE === '' ? null : env.TASK_LOG_FILE || 'logs/tasks.jsonl',
     staticDir: env.STATIC_DIR || null,
+    facebook: facebookConfig(env),
     trustProxy: env.TRUST_PROXY === 'true',
     systems,
     ai: {
@@ -166,4 +182,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
   }
   if (production && !config.cookieSecure) problems.push('APP_COOKIE_SECURE is false in production — sessions would travel over plain http.');
   return { config, problems };
+}
+
+function facebookConfig(env: NodeJS.ProcessEnv): FacebookConfig {
+  const pageId = env.FACEBOOK_PAGE_ID?.trim() || null;
+  const token = env.FACEBOOK_PAGE_TOKEN?.trim() || null;
+  const version = env.FACEBOOK_GRAPH_VERSION?.trim() || 'v27.0';
+  const problems: string[] = [];
+  if (!pageId) problems.push('FACEBOOK_PAGE_ID is not set.');
+  else if (!/^\d{5,25}$/.test(pageId)) problems.push('FACEBOOK_PAGE_ID must be the numeric Page ID.');
+  if (!token) problems.push('FACEBOOK_PAGE_TOKEN is not set.');
+  if (!/^v\d{1,2}\.\d$/.test(version)) problems.push('FACEBOOK_GRAPH_VERSION must look like v27.0.');
+  return { pageId: problems.length ? null : pageId, token: problems.length ? null : token, appSecret: env.FACEBOOK_APP_SECRET?.trim() || null, version, problems };
 }

@@ -3,8 +3,10 @@
 
 import { TemplateBrain } from '../src/agents/brain';
 import { AGENTS, seatOf } from '../src/agents/roster';
+import { captionFrom, replyFrom, scheduleFrom } from '../src/live/caption';
 import { Engine, MAX_ON_BREAK, type Chat, type StorageLike } from '../src/sim/engine';
-import { FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt } from '../src/office/layout';
+import { FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt, SHOP_BENCHES, SHOP_ENTRANCE, SHOP_LUMBER, SHOP_SWEEP } from '../src/office/layout';
+import { DEMO_SHOP_LOAD, SHOP_SPOTS, lookFor } from '../src/sim/workshop';
 import { findPath } from '../src/office/pathfinding';
 
 let failures = 0;
@@ -241,6 +243,116 @@ async function main() {
   check(ai.aiPulse().state === 'idle', 'live: then the Lab goes back to idle');
   ai.setAiActivity('limited', 'AI usage limit reached', 30000);
   check(ai.aiPulse().state === 'limited', 'live: usage limit is shown');
+
+  console.log('Creative Studio: photo easel and posts board');
+  check(FURNITURE.some((f) => f.kind === 'postBoard' && f.room === 'creative' && f.wall), 'the Creative Studio has a posts board on the wall');
+  check(FURNITURE.some((f) => f.kind === 'easel' && f.room === 'creative' && f.x === 27), 'the photo easel is in place');
+  check(roomAt(SPOTS.photoEasel.x + 0.5, SPOTS.photoEasel.y + 0.5) === 'creative', 'the easel spot is in the Creative Studio');
+  const cs = new Engine(new TemplateBrain(), null, { breaks: false });
+  cs.updateSettings({ mode: 'connected' });
+  cs.stageAgentAt('carlo', SPOTS.photoEasel, { x: SPOTS.photoEasel.x, y: SPOTS.photoEasel.y - 1 }, 'Studying the photo in the Creative Studio');
+  cs.setEaselPhoto('data:image/jpeg;base64,AAAA');
+  await runFor(cs, 30000, () => !cs.agentById.carlo.path.length);
+  check(
+    Math.round(cs.agentById.carlo.x) === SPOTS.photoEasel.x && Math.round(cs.agentById.carlo.y) === SPOTS.photoEasel.y,
+    'Carlo walks to the easel for a photo task',
+  );
+  check(cs.easelPhoto !== null, 'the photo stays on the easel while he works');
+  cs.setEaselPhoto(cs.easelPhoto, 15000);
+  await runFor(cs, 16000);
+  check(cs.easelPhoto === null, 'the photo leaves the easel 15 seconds after the task');
+  cs.setPostBoard({ configured: true, count: 2, next: '2026-11-10T01:00:00.000Z' });
+  check(cs.postBoard?.count === 2, 'the board holds the scheduled post count');
+
+  console.log("Facebook caption from Carlo's answer");
+  const answer = [
+    '**What I see**',
+    '- A two-panel door',
+    '- Brown finish',
+    '**Caption**',
+    'A classic door, crafted with care. Message WAD for a quotation!',
+    '**Short version**',
+    'Classic door.',
+    '**Hashtags**',
+    '#WADFurniture #WoodenDoor',
+  ].join('\n');
+  check(
+    captionFrom(answer) === 'A classic door, crafted with care. Message WAD for a quotation!\n\n#WADFurniture #WoodenDoor',
+    'caption + hashtags, without "What I see" or the short version',
+  );
+  check(captionFrom('Just a caption.') === 'Just a caption.', 'plain answers are used as they are');
+  check(!captionFrom('**What I see**\n- a door\n**Post**\nHello').includes('a door'), '"What I see" never goes into the post');
+
+  console.log('Carlo: caption + schedule from one request');
+  {
+    const ans = ['**What I see**', '- A carved narra door', '**Caption**', 'Crafted with care. Message WAD!', '**Short version**', 'Carved door.', '**Hashtags**', '#WADFurniture #Narra', '', 'Ready for your approval.', '**Schedule:** 2026-11-14 09:00'].join('\n');
+    const w = scheduleFrom(ans);
+    check(!!w && w.kind === 'at' && w.date === '2026-11-14' && w.time === '09:00', 'the time Carlo read is picked up');
+    check(captionFrom(ans) === 'Crafted with care. Message WAD!\n\n#WADFurniture #Narra', 'the schedule line never goes into the post');
+    check(scheduleFrom('**Caption**\nHi\n**Schedule:** now')?.kind === 'now', '"post now" is understood');
+    check(scheduleFrom('**Schedule:** 2026-02-30 09:00') === null && scheduleFrom('**Schedule:** 2026-11-14 25:00') === null, 'impossible dates and times are rejected');
+    check(scheduleFrom('**Caption**\nNo time asked') === null, 'no time asked: nothing is scheduled');
+    check(!captionFrom('Plain caption\n**Schedule:** 2026-11-14 9:00').includes('Schedule'), 'plain answers drop the schedule line too');
+    check(scheduleFrom('**Schedule:** 2026-11-14 9:05')?.kind === 'at' && (scheduleFrom('**Schedule:** 2026-11-14 9:05') as { time: string }).time === '09:05', 'single-digit hours are accepted');
+  }
+
+  console.log('Customer Service (Joy)');
+  const joy = AGENTS.find((a) => a.id === 'joy');
+  check(!!joy && roomAt(joy.desk.x + 0.5, joy.desk.y + 0.5) === 'sales', 'Joy has a desk in Sales & Growth');
+  check(FURNITURE.filter((f) => f.kind === 'desk' && f.x === 3 && f.y === 32).length === 1, "only one desk at Joy's spot");
+  const csAnswer = ['**Reply**', 'Hi po [Customer name]! Your door is in finishing.', '', '**Notes for staff**', '- Confirm the date.'].join('\n');
+  check(replyFrom(csAnswer, 'Maria Santos') === 'Hi po Maria Santos! Your door is in finishing.', 'the reply is copied without staff notes, with the name filled in');
+  check(replyFrom(csAnswer) === 'Hi po [Customer name]! Your door is in finishing.', 'without a known name the placeholder stays');
+  check(replyFrom('Just a reply.') === 'Just a reply.', 'answers without sections are used as they are');
+
+  console.log('Workshop: carpenters from WAD Order Management');
+  {
+    const grid = buildWalkGrid();
+    const inShop = (t: { x: number; y: number }) => roomAt(t.x + 0.5, t.y + 0.5) === 'workshop';
+    const spots = [...SHOP_SPOTS, SHOP_LUMBER.tile, ...SHOP_SWEEP, SPOTS.shopInspect, SHOP_ENTRANCE];
+    check(spots.every((t) => inShop(t) && grid[t.y][t.x]), 'every Workshop spot is inside the room and walkable');
+    check(SHOP_SPOTS.length === 8, 'eight places at four benches');
+    check(SHOP_BENCHES.every((b) => FURNITURE.some((f) => f.room === 'workshop' && f.kind === b.kind && f.x === b.bench.x && f.y === b.bench.y)), 'each bench is in the room');
+    check(DOORS.filter((d) => d.a === 'workshop' || d.b === 'workshop').length === 2, 'the Workshop has doors to Finance and the court');
+    check(!!findPath(grid, seatOf('paolo'), SPOTS.shopInspect), 'Paolo can walk from his desk to the shop floor');
+    check(spots.every((t) => !!findPath(grid, SHOP_ENTRANCE, t) || (t.x === SHOP_ENTRANCE.x && t.y === SHOP_ENTRANCE.y)), 'every Workshop spot can be reached from the door');
+    check(JSON.stringify(lookFor('Ramon')) === JSON.stringify(lookFor('ramon')), 'the same carpenter always looks the same');
+
+    const ws = new Engine(new TemplateBrain(), null, { breaks: false });
+    check(ws.workshop.crew.map((c) => c.def.name).join() === DEMO_SHOP_LOAD.carpenters.map((c) => c.name).join(), 'demo: sample carpenters');
+    const live = (carpenters: { name: string; inProgress: number; pending: number; finished?: number }[]) =>
+      ws.setShopLoad({ available: true, carpenters: carpenters.map((c) => ({ finished: 0, hamba: 0, ...c })), unassigned: 0, ready: 1, open: 5, overdue: 0, source: 'live', asOf: 'x' });
+    live([
+      { name: 'Ramon', inProgress: 2, pending: 0 },
+      { name: 'Jun', inProgress: 0, pending: 1 },
+      { name: 'Pedro', inProgress: 0, pending: 0, finished: 1 },
+    ]);
+    check(ws.workshop.crew.map((c) => c.def.name).join() === 'Ramon,Jun,Pedro', 'one pixel carpenter per real carpenter, in roster order');
+    await runFor(ws, 30000, () => !ws.workshop.crew[0].path.length && ws.workshop.crew[0].action === 'work');
+    const ramon = ws.workshop.crew[0];
+    check(Math.round(ramon.x) === SHOP_SPOTS[0].x && Math.round(ramon.y) === SHOP_SPOTS[0].y && ramon.activity.includes('2 in progress'), 'a carpenter with orders in progress works at their bench');
+    check(ws.workshop.crew[1].slot === 1, 'each carpenter keeps their own place');
+    check(ws.workshop.crew[2].errand?.kind === 'sweep', 'a carpenter with no open orders sweeps');
+    const before = ws.workshop.crew[0];
+    live([
+      { name: 'Ramon', inProgress: 1, pending: 0 },
+      { name: 'Ana', inProgress: 1, pending: 0 },
+    ]);
+    check(ws.workshop.crew[0] === before && ws.workshop.crew.length === 2, 'a refresh keeps known carpenters where they are and drops ones no longer listed');
+    const many = Array.from({ length: 11 }, (_, i) => ({ name: `C${i}`, inProgress: i >= 3 ? 1 : 0, pending: 0 }));
+    live(many);
+    check(ws.workshop.crew.length === 8 && ws.workshop.crew.every((c) => c.info.inProgress === 1), 'more than eight: the busiest eight stand at the benches');
+    ws.setShopLoad({ ...DEMO_SHOP_LOAD, available: false, carpenters: [], source: 'live' });
+    check(ws.workshop.crew.length === 0, 'no carpenter data: nobody is invented');
+    ws.setMode('connected');
+    check(ws.workshop.load === null && ws.workshop.note === 'loading' && ws.workshop.crew.length === 0, 'Connected Mode waits for the real carpenters (no demo names)');
+    ws.visitShop('paolo');
+    await runFor(ws, 60000, () => !ws.agentById.paolo.path.length);
+    check(Math.round(ws.agentById.paolo.x) === SPOTS.shopInspect.x && Math.round(ws.agentById.paolo.y) === SPOTS.shopInspect.y, 'Paolo walks to the shop floor');
+    ws.leaveShop('paolo');
+    await runFor(ws, 90000, () => ws.agentById.paolo.posture === 'sit');
+    check(ws.agentById.paolo.posture === 'sit', 'Paolo goes back to his desk after checking');
+  }
 
   console.log('Persistence & reset');
   e.saveNow();

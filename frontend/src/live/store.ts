@@ -2,9 +2,11 @@
 // holds all credentials. Live results are kept in memory here and never written to
 // localStorage, and they are never mixed with the demo engine's mock tasks.
 
+import type { FacebookStatus, OrderPick, ScheduledPost, ShopCounts } from '../../shared/live';
 import type { AiStatus, DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, ReportType, SessionUser, SystemStatus } from '../../shared/live';
 import { LIVE_AGENT_IDS, SYSTEM_NAMES } from '../../shared/live';
 import { AGENT_BY_ID } from '../agents/roster';
+import { SPOTS } from '../office/layout';
 import { presetRange, type RangePreset } from '../../shared/manila';
 import type { Engine } from '../sim/engine';
 
@@ -68,7 +70,34 @@ export class LiveStore {
   private logId = 1;
   private seenStep = new Map<string, string>();
 
-  constructor(private engine: Engine) {}
+  constructor(private engine: Engine) {
+    engine.shopRefresh = () => void this.loadWorkshop(true);
+  }
+
+  // ---------------------------------------------------------------- Workshop
+  private shopLoadedAt = 0;
+  private shopLoading = false;
+
+  /**
+   * Reads the carpenters and their open orders, for the Workshop room: at sign-in, after Paolo's
+   * tasks and order reports, or when someone clicks Refresh (automatic reads are skipped if the
+   * last one was under a minute ago). Between those, the server pushes changes ("shop" events).
+   */
+  async loadWorkshop(force = false) {
+    if (!this.user || !this.engine.connected) return;
+    if (!this.user.permissions.includes('orders:read')) return this.engine.setShopLoad(null, 'no-access');
+    if (this.shopLoading || (!force && Date.now() - this.shopLoadedAt < 60_000)) return;
+    this.shopLoading = true;
+    try {
+      const { shop } = await api<{ shop: ShopCounts }>('/api/orders/workshop');
+      this.shopLoadedAt = Date.now();
+      this.engine.setShopLoad({ ...shop, source: 'live' });
+    } catch {
+      if (this.engine.workshop.load?.source !== 'live') this.engine.setShopLoad(null, 'unavailable');
+    } finally {
+      this.shopLoading = false;
+    }
+  }
 
   subscribe = (fn: () => void) => {
     this.listeners.add(fn);
@@ -141,6 +170,15 @@ export class LiveStore {
     this.user = null;
     this.jobs = [];
     this.images.clear();
+    this.facebook = null;
+    this.scheduledPosts = null;
+    this.fbError = null;
+    this.orderPicks = null;
+    this.orderPicksError = null;
+    this.shopLoadedAt = 0;
+    if (this.engine.connected) this.engine.setShopLoad(null, 'loading');
+    this.engine.setPostBoard(null);
+    this.engine.setEaselPhoto(null);
     this.systems = [];
     this.server = 'signed_out';
     this.ai = null;
@@ -161,6 +199,8 @@ export class LiveStore {
     this.types = types.types;
     this.maxRangeDays = types.maxRangeDays;
     this.ai = types.ai ?? null;
+    void this.loadFacebook();
+    void this.loadWorkshop(true);
     this.addLog(`Signed in as ${user.username} (${user.role}).`, 'info');
     this.openStream();
     this.emit();
@@ -184,6 +224,20 @@ export class LiveStore {
     });
     es.addEventListener('job', (ev) => {
       this.applyJob(JSON.parse((ev as MessageEvent).data) as Job, false);
+      this.emit();
+    });
+    // Live updates pushed by the server (it re-checks every couple of minutes while an office is
+    // open, and sends only what changed): the Workshop carpenters and the scheduled Facebook posts.
+    es.addEventListener('shop', (ev) => {
+      const { shop } = JSON.parse((ev as MessageEvent).data) as { shop: ShopCounts };
+      this.shopLoadedAt = Date.now();
+      if (this.engine.connected) this.engine.setShopLoad({ ...shop, source: 'live' });
+    });
+    es.addEventListener('fb-scheduled', (ev) => {
+      const { posts } = JSON.parse((ev as MessageEvent).data) as { posts: ScheduledPost[] };
+      this.scheduledPosts = posts;
+      this.fbError = null;
+      this.updatePostBoard();
       this.emit();
     });
     es.addEventListener('session-expired', () => this.signedOut('Your session expired. Sign in again to continue.'));
@@ -239,6 +293,89 @@ export class LiveStore {
     return { ok: true };
   }
 
+  // ---------------------------------------------------------------- Facebook (Carlo)
+  facebook: FacebookStatus | null = null;
+  scheduledPosts: ScheduledPost[] | null = null;
+  /** Open orders for Joy's order picker; loaded only when asked (no polling). */
+  orderPicks: OrderPick[] | null = null;
+  orderPicksError: string | null = null;
+  private loadingPicks = false;
+
+  async loadOrderPicks() {
+    if (this.loadingPicks) return;
+    this.loadingPicks = true;
+    try {
+      this.orderPicks = (await api<{ orders: OrderPick[] }>('/api/orders/open')).orders;
+      this.orderPicksError = null;
+    } catch (e) {
+      this.orderPicksError = `Could not load open orders: ${(e as Error).message}`;
+    } finally {
+      this.loadingPicks = false;
+      this.emit();
+    }
+  }
+  fbError: string | null = null;
+
+  canPostFacebook(): { ok: boolean; reason?: string } {
+    if (this.server !== 'signed_in' || !this.user) return { ok: false, reason: 'Sign in first.' };
+    if (!this.user.permissions.includes('social:post')) return { ok: false, reason: 'Your account cannot post to Facebook.' };
+    if (!this.facebook) return { ok: false, reason: 'Checking Facebook…' };
+    if (!this.facebook.configured)
+      return { ok: false, reason: `Facebook posting is not set up on the server. ${this.facebook.problems.join(' ')} See README, "Facebook posting".` };
+    return { ok: true };
+  }
+
+  async loadFacebook() {
+    if (!this.user?.permissions.includes('social:post')) return;
+    try {
+      this.facebook = (await api<{ facebook: FacebookStatus }>('/api/facebook/status')).facebook;
+    } catch (e) {
+      this.facebook = { configured: false, pageName: null, problems: [(e as Error).message] };
+    }
+    this.updatePostBoard();
+    this.emit();
+    if (this.facebook.configured) void this.loadScheduled();
+  }
+
+  async loadScheduled() {
+    try {
+      this.scheduledPosts = (await api<{ posts: ScheduledPost[] }>('/api/facebook/scheduled')).posts;
+      this.fbError = null;
+    } catch (e) {
+      this.scheduledPosts = this.scheduledPosts ?? [];
+      this.fbError = `Could not load pending posts: ${(e as Error).message}`;
+    }
+    this.updatePostBoard();
+    this.emit();
+  }
+
+  /** Posts (or schedules) one approved post. `key` makes a repeated click or resend post only once. */
+  async postToFacebook(p: { key: string; message: string; photo?: string; scheduleAt?: string }) {
+    const image = p.photo ? { mimeType: p.photo.slice(5, p.photo.indexOf(';')), data: p.photo.slice(p.photo.indexOf(',') + 1) } : undefined;
+    try {
+      const { post } = await api<{ post: { postId: string; link: string | null; scheduledAt: string | null } }>('/api/facebook/posts', {
+        method: 'POST',
+        body: JSON.stringify({ key: p.key, message: p.message, ...(image ? { image } : {}), ...(p.scheduleAt ? { scheduleAt: p.scheduleAt } : {}) }),
+      });
+      this.addLog(post.scheduledAt ? `Facebook post scheduled for ${post.scheduledAt.slice(0, 16).replace('T', ' ')} UTC.` : 'Posted to Facebook.', 'success', 'carlo');
+      return post;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      throw e;
+    }
+  }
+
+  async cancelScheduled(id: string) {
+    try {
+      await api(`/api/facebook/scheduled/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      this.addLog('Scheduled Facebook post cancelled.', 'info', 'carlo');
+      await this.loadScheduled();
+    } catch (e) {
+      this.fbError = (e as Error).message;
+      this.emit();
+    }
+  }
+
   /**
    * Photos sent with tasks, kept only in this tab's memory (as data URLs) so the task can show
    * the photo and "Run again" can resend it. Never saved; gone after a reload or sign-out.
@@ -246,15 +383,15 @@ export class LiveStore {
   images = new Map<string, string>();
 
   /** Assigns a free-text task to one agent, optionally with a photo (JPEG data URL). */
-  async submitAi(agent: LiveAgentId, prompt: string, photo?: string): Promise<Job | null> {
-    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}`;
+  async submitAi(agent: LiveAgentId, prompt: string, photo?: string, orderRef?: string): Promise<Job | null> {
+    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}|${orderRef ?? ''}`;
     if (this.submitting.has(key)) return null;
     this.submitting.add(key);
     this.lastError = null;
     this.emit();
     try {
       const image = photo ? { mimeType: photo.slice(5, photo.indexOf(';')), data: photo.slice(photo.indexOf(',') + 1) } : undefined;
-      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, ...(image ? { image } : {}) }) });
+      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, ...(image ? { image } : {}), ...(orderRef ? { orderRef } : {}) }) });
       if (photo) this.images.set(job.id, photo);
       this.applyJob(job, false);
       return job;
@@ -303,6 +440,24 @@ export class LiveStore {
     if (job.type === 'ai.task') this.updateAiThinking();
   }
 
+  private isPhotoTask(job: Job) {
+    return job.type === 'ai.task' && job.agent === 'carlo' && !!job.image;
+  }
+
+  /** Carlo walks back to his desk; the photo stays on the easel a little longer. */
+  private leaveEasel(job: Job) {
+    this.engine.stageAgent('carlo', 'seat');
+    if (this.engine.easelPhoto && this.engine.easelPhoto === this.images.get(job.id)) this.engine.setEaselPhoto(this.engine.easelPhoto, 15000);
+  }
+
+  /** Keeps the Creative Studio board in step with the Page's schedule. */
+  private updatePostBoard() {
+    if (!this.user?.permissions.includes('social:post') || !this.facebook) return this.engine.setPostBoard(null);
+    if (!this.facebook.configured) return this.engine.setPostBoard({ configured: false, count: null, next: null });
+    const posts = this.scheduledPosts;
+    this.engine.setPostBoard({ configured: true, count: posts ? posts.length : null, next: posts?.find((p) => p.scheduledAt)?.scheduledAt ?? null });
+  }
+
   /** The Intelligence Lab lights up while any Gemini task is queued or running. */
   private updateAiThinking() {
     const running = this.jobs.filter((j) => j.type === 'ai.task' && (j.status === 'queued' || j.status === 'working'));
@@ -331,7 +486,12 @@ export class LiveStore {
       case 'working':
         e.setLiveAgent(who, { state: 'working', activity: step.label, jobId: job.id });
         if (who === 'chief') e.stageAgent(who, 'meeting', 1);
-        else e.stageAgent(who, 'seat');
+        else if (who === 'paolo') e.visitShop(who); // Paolo checks the shop floor while he works
+        else if (this.isPhotoTask(job)) {
+          // Carlo studies the photo at the Creative Studio easel; the photo shows on the canvas.
+          e.stageAgentAt(who, SPOTS.photoEasel, { x: SPOTS.photoEasel.x, y: SPOTS.photoEasel.y - 1 }, 'Studying the photo in the Creative Studio');
+          e.setEaselPhoto(this.images.get(job.id) ?? null);
+        } else e.stageAgent(who, 'seat');
         if (step.system) e.liveSay(who, `Checking ${SYSTEM_NAMES[step.system]}`);
         else if (job.type === 'ai.task') e.liveSay(who, 'On it…');
         break;
@@ -339,12 +499,17 @@ export class LiveStore {
         e.setLiveAgent(who, { state: 'completed', activity: step.result?.summary ?? 'Done', jobId: job.id });
         e.liveSay(who, job.type === 'ai.task' ? 'Done — see my answer' : step.result?.empty ? 'No records found' : 'Results ready');
         if (who === 'chief') e.stageAgent(who, 'seat');
+        if (who === 'paolo') e.leaveShop(who);
+        if (this.isPhotoTask(job)) this.leaveEasel(job);
+        if (who === 'paolo' || job.type.startsWith('orders.') || job.type === 'combined.report') void this.loadWorkshop();
         this.addLog(`${step.label}: ${step.result?.summary ?? 'done'}`, step.result?.empty ? 'warn' : 'success', who, job.id);
         break;
       case 'failed':
         e.setLiveAgent(who, { state: 'failed', activity: step.error?.message ?? 'Failed', jobId: job.id });
         e.liveSay(who, step.error?.code === 'AWAITING_DOCUMENTATION' || step.error?.code === 'NOT_CONFIGURED' ? 'Not set up yet' : 'Request failed');
         if (who === 'chief') e.stageAgent(who, 'seat');
+        if (who === 'paolo') e.leaveShop(who);
+        if (this.isPhotoTask(job)) this.leaveEasel(job);
         this.addLog(`${step.label}: ${step.error?.message ?? 'failed'}`, 'error', who, job.id);
         break;
     }

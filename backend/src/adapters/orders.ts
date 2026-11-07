@@ -7,7 +7,8 @@
 // Response: { success, system, generated_at, data: { orders[], count, truncated } }
 //   orders[] { order_number, group_id, status, priority, order_date, due_date,
 //              items, items_done, least_stage, last_progress_at, gross_price, downpayment,
-//              customer_name, products?[] (with &products=1) }
+//              customer_name, carpenters[], hamba_carpenters[], products?[] (with &products=1) }
+//   data.carpenters_available, data.carpenter_roster (names, or null)
 // customer_name is kept for display only: reports show it next to the order number, and the AI
 // tools never include it (server/ai/tasks.ts builds their data from explicit fields).
 // Payments: balance = max(0, gross_price - downpayment), the rule orders.php uses; a Delivered
@@ -37,6 +38,7 @@ export class OrdersAdapter implements OrderSource {
     payments: false,
   };
   authConfigured: boolean;
+  carpenterRoster: string[] | null = null;
 
   constructor(
     private config: SystemConfig,
@@ -68,6 +70,10 @@ export class OrdersAdapter implements OrderSource {
     this.capabilities.payments = data.payments_available === true;
     this.capabilities.stageDates = data.stage_dates_available === true;
     if (query.products) this.capabilities.products = data.products_available === true;
+    this.capabilities.carpenters = data.carpenters_available === true;
+    this.capabilities.laborCheck = data.labor_check_available === true;
+    this.capabilities.priceCheck = data.price_check_available === true;
+    this.carpenterRoster = Array.isArray(data.carpenter_roster) ? names(data.carpenter_roster) : null;
     return (data.orders as Record<string, unknown>[]).map((r) => toOrder(r, name, this.id));
   }
 }
@@ -91,10 +97,25 @@ export function toOrder(r: Record<string, unknown>, name: string, system: 'order
     createdDate: r.order_date ? dateOf(r.order_date, name, system) : null,
     lastProgressDate: r.last_progress_at ? dateOf(r.last_progress_at, name, system) : null,
     ...(Array.isArray(r.products) ? { products: (r.products as Record<string, unknown>[]).map((p) => toProduct(p, name, system)) } : {}),
+    carpenters: names(r.carpenters),
+    hambaCarpenters: names(r.hamba_carpenters),
+    laborMissing: count(r.labor_missing),
+    zeroPriceItems: count(r.zero_price_items),
     customerName: typeof r.customer_name === 'string' && r.customer_name.trim() ? r.customer_name.trim().slice(0, 120) : null,
     grossCentavos: r.gross_price == null ? null : toCentavos(r.gross_price, name, system),
     downpaymentCentavos: r.downpayment == null ? null : toCentavos(r.downpayment, name, system),
   };
+}
+
+/** A non-negative whole number, or null. */
+function count(v: unknown): number | null {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null;
+}
+
+/** A list of names: strings only, trimmed, at most 60 characters, no repeats (at most 50). */
+function names(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.filter((n): n is string => typeof n === 'string').map((n) => n.trim().slice(0, 60)).filter(Boolean))].slice(0, 50);
 }
 
 function toProduct(p: Record<string, unknown>, name: string, system: 'orders'): ProductLine {

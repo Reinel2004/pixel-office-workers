@@ -38,6 +38,15 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-flash-lite-latest
+      - key: FACEBOOK_PAGE_ID
+        sync: false
+      - key: FACEBOOK_PAGE_TOKEN
+        sync: false
+      - key: FACEBOOK_APP_SECRET
+        sync: false
+      # Live updates: seconds between the server's checks while an office is open (0 = off).
+      - key: LIVE_REFRESH_SECONDS
+        value: "120"
       # Render's disk is wiped on every deploy and restart; the task log goes to Render's logs instead.
       - key: TASK_LOG_FILE
         value: ""

@@ -3,6 +3,8 @@ import { AGENTS, AGENT_BY_ID } from '../agents/roster';
 import { TEMPLATE_LABEL } from '../agents/brain';
 import { peso } from '../data/mock';
 import { ROOM_BY_ID } from '../office/layout';
+import { carpenterDef } from '../sim/workshop';
+import { agentPortrait } from '../office/sprites';
 import type { Engine, Task } from '../sim/engine';
 import type { AgentId, RoomId, Selection, TaskOutput } from '../sim/types';
 import type { LiveStore } from '../live/store';
@@ -189,6 +191,7 @@ function RoomDetail({ engine, id, open }: { engine: Engine; id: RoomId; open: (s
         <span className="swatch" style={{ background: color }} />
         <h2>{r.name}</h2>
       </div>
+      {id === 'workshop' && <WorkshopSection engine={engine} />}
       <section>
         <h3>Agents</h3>
         {assigned.length === 0 && visitors.length === 0 ? (
@@ -238,6 +241,93 @@ function RoomDetail({ engine, id, open }: { engine: Engine; id: RoomId; open: (s
         )}
       </section>
     </div>
+  );
+}
+
+/** The shop floor: each carpenter from WAD Order Management and their open orders. */
+function WorkshopSection({ engine }: { engine: Engine }) {
+  const shop = engine.workshop;
+  const load = shop.load;
+  const shown = new Map(shop.crew.map((c) => [c.def.name.toLowerCase(), c]));
+  return (
+    <section>
+      <h3>Carpenters</h3>
+      {!load ? (
+        <p className="muted small">
+          {shop.note === 'no-access'
+            ? 'Your account cannot read orders, so the carpenters are not shown.'
+            : shop.note === 'unavailable'
+              ? 'The carpenters could not be read from WAD Order Management.'
+              : 'Reading the carpenters…'}
+        </p>
+      ) : !load.available ? (
+        <p className="muted small">
+          WAD Order Management did not return carpenter assignments. Upload the latest <code>api/ceo/office-orders.php</code> to the server.
+        </p>
+      ) : load.carpenters.length === 0 ? (
+        <p className="muted small">No carpenters are listed in WAD Order Management.</p>
+      ) : (
+        <ul className="agent-list">
+          {load.carpenters.map((info) => {
+            const c = shown.get(info.name.toLowerCase());
+            const def = c?.def ?? carpenterDef(info.name);
+            const parts = [
+              info.inProgress ? `${info.inProgress} in progress` : '',
+              info.pending ? `${info.pending} pending` : '',
+              info.finished ? `${info.finished} finished` : '',
+            ].filter(Boolean);
+            return (
+              <li key={info.name}>
+                <div className="agent-row">
+                  <span className="avatar" style={{ width: 30, height: 30, ['--ring' as string]: def.tint }}>
+                    <img src={agentPortrait(def)} alt="" draggable={false} />
+                  </span>
+                  <span>
+                    <b>{info.name}</b>
+                    <span className="muted small">
+                      {parts.length ? parts.join(' · ') : 'No open orders'}
+                      {info.hamba ? ` (${info.hamba} as hamba carpenter)` : ''}
+                      {c ? '' : ' · not at a bench (only 8 fit)'}
+                    </span>
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {load && (
+        <div className="kv">
+          <div>
+            <span>Ready for delivery</span>
+            <b>{load.ready}</b>
+          </div>
+          <div>
+            <span>Not yet assigned to a carpenter</span>
+            <b>{load.unassigned}</b>
+          </div>
+          <div className="sub">
+            <span>Open orders · overdue</span>
+            <b>
+              {load.open} · {load.overdue}
+            </b>
+          </div>
+        </div>
+      )}
+      {load && (
+        <p className="muted small">
+          {load.source === 'demo'
+            ? 'Demo Mode: sample carpenters and numbers.'
+            : `From WAD Order Management${load.asOf ? `, read ${clock(Date.parse(load.asOf))}` : ''}. An order counts for each carpenter assigned to it, as carpenter or hamba carpenter. Names and counts only: no customers, prices or labor.`}
+        </p>
+      )}
+      {engine.connected && engine.shopRefresh && shop.note !== 'no-access' && (
+        <button className="btn sm" onClick={() => engine.shopRefresh?.()}>
+          <IconRetry size={13} /> Refresh
+        </button>
+      )}
+      <p className="muted small">The pixel carpenters are animation only: they work at a bench while they have orders in progress, prepare wood for pending ones, and sweep when they have none. They are not AI.</p>
+    </section>
   );
 }
 

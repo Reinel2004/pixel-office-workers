@@ -2,7 +2,7 @@ import { AGENTS } from '../agents/roster';
 import type { AgentId, RoomId } from '../sim/types';
 
 // The office is a 3×3 arrangement of 12-tile blocks (11×11 room + 1-tile gap), plus a
-// fourth front row holding the gym and the recreation court. Gaps show the dark background
+// fourth front row holding the gym, the recreation court and the Workshop (shop floor). Gaps show the dark background
 // so each room reads as a raised platform; doors are 2-tile bridges across the gaps.
 
 export const GRID_W = 37;
@@ -18,7 +18,7 @@ export interface Room {
   y1: number; // inclusive
   floor: number;
   wall: number;
-  pattern: 'check' | 'plank' | 'carpet' | 'dark' | 'court' | 'rubber';
+  pattern: 'check' | 'plank' | 'carpet' | 'dark' | 'court' | 'rubber' | 'concrete';
 }
 
 function block(bx: number, by: number, h = 11) {
@@ -37,6 +37,7 @@ export const ROOMS: Room[] = [
   { id: 'finance', name: 'Finance & Reports', short: 'Finance', ...block(2, 2), floor: 0xc8b8e6, wall: 0xece4fa, pattern: 'check' },
   { id: 'gym', name: 'Gym', short: 'Gym', ...block(0, 3, 8), floor: 0x8e97a3, wall: 0xd5dbe2, pattern: 'rubber' },
   { id: 'court', name: 'Recreation Court', short: 'Court', ...block(1, 3, 8), floor: 0x4c84c8, wall: 0xc5dcf5, pattern: 'court' },
+  { id: 'workshop', name: 'Workshop', short: 'Workshop', ...block(2, 3, 8), floor: 0xb9a68c, wall: 0xf0dfc4, pattern: 'concrete' },
 ];
 
 export const ROOM_BY_ID: Record<RoomId, Room> = Object.fromEntries(ROOMS.map((r) => [r.id, r])) as Record<RoomId, Room>;
@@ -58,6 +59,8 @@ export const DOORS: { a: RoomId; b: RoomId; tiles: [number, number][] }[] = [
   { a: 'sales', b: 'gym', tiles: [[5, 36], [6, 36]] },
   { a: 'pantry', b: 'court', tiles: [[17, 36], [18, 36]] },
   { a: 'gym', b: 'court', tiles: [[12, 40], [12, 41]] },
+  { a: 'finance', b: 'workshop', tiles: [[29, 36], [30, 36]] },
+  { a: 'court', b: 'workshop', tiles: [[24, 40], [24, 41]] },
 ];
 
 export type FurnitureKind =
@@ -91,7 +94,14 @@ export type FurnitureKind =
   | 'printer'
   | 'beanbag'
   | 'water'
-  | 'coffeeMaker';
+  | 'coffeeMaker'
+  | 'postBoard'
+  | 'sawTable'
+  | 'planer'
+  | 'workbench'
+  | 'varnishTable'
+  | 'lumberRack'
+  | 'doorRack';
 
 export interface Furniture {
   id: string;
@@ -160,7 +170,8 @@ add('tallPlant', 'dev', 13, 1);
 add('plant', 'dev', 23, 1);
 
 // --- Creative Studio (lavender, far right) ---
-add('easel', 'creative', 27, 3);
+add('easel', 'creative', 27, 3); // Carlo puts the photo he is studying here
+add('postBoard', 'creative', 28, 1, 3, 1, { wall: true, blocks: false }); // scheduled Facebook posts
 add('easel', 'creative', 31, 3);
 add('artTable', 'creative', 28, 7, 3, 2);
 add('shelf', 'creative', 33, 1, 2, 1);
@@ -179,8 +190,7 @@ add('plant', 'command', 23, 13);
 add('water', 'command', 13, 13);
 
 // --- Sales & Growth (light blue, left) ---
-desk('sales', 3, 32);
-desk('sales', 7, 32);
+desk('sales', 7, 32); // (3, 32) is Joy's desk
 add('shelf', 'sales', 1, 25, 2, 1);
 add('whiteboard', 'sales', 6, 25, 3, 1, { wall: true, blocks: false });
 add('plant', 'sales', 10, 25);
@@ -231,6 +241,18 @@ add('tallPlant', 'gym', 1, 44);
 add('net', 'court', 15, 40, 7, 1);
 add('hoop', 'court', 23, 37);
 
+// --- Workshop (shop floor, front-right) ---
+// Four benches with two spots each; carpenters stand behind a bench (on the row above it) facing the
+// front, so you see them working. The door rack holds finished doors waiting for delivery.
+add('sawTable', 'workshop', 26, 39, 2, 1);
+add('planer', 'workshop', 32, 39, 2, 1);
+add('workbench', 'workshop', 26, 42, 2, 1);
+add('varnishTable', 'workshop', 32, 42, 2, 1);
+add('lumberRack', 'workshop', 35, 39, 1, 3); // narra, mahogany and plywood
+add('doorRack', 'workshop', 33, 37, 3, 1); // finished doors waiting for delivery
+add('tallPlant', 'workshop', 25, 37);
+add('cabinet', 'workshop', 26, 37);
+
 export const FURNITURE = F;
 
 export const RUGS: Rug[] = [
@@ -257,9 +279,37 @@ export const MEETING_CENTER = { x: 18, y: 18 };
 /** Named points of interest used by workflows. */
 export const SPOTS = {
   creativeEasel: { x: 29, y: 5 },
+  /** In front of the left easel, where Carlo studies a photo. */
+  photoEasel: { x: 27, y: 4 },
   opsBoard: { x: 4, y: 14 },
   pantryCounter: { x: 20, y: 26 },
+  /** Where Paolo stands when he checks the shop floor (in the aisle, facing the benches). */
+  shopInspect: { x: 30, y: 40 },
 };
+
+/**
+ * The Workshop benches. Each carpenter from WAD Order Management gets one of the eight spots (two
+ * per bench), in the order system's own carpenter order, and stands behind it facing the front.
+ */
+export const SHOP_BENCHES: { kind: 'sawTable' | 'planer' | 'workbench' | 'varnishTable'; label: string; work: string; bench: { x: number; y: number }; spots: { x: number; y: number }[] }[] = [
+  { kind: 'sawTable', label: 'Saw table', work: 'Cutting wood', bench: { x: 26, y: 39 }, spots: [{ x: 26, y: 38 }, { x: 27, y: 38 }] },
+  { kind: 'planer', label: 'Planer', work: 'Planing the panels', bench: { x: 32, y: 39 }, spots: [{ x: 32, y: 38 }, { x: 33, y: 38 }] },
+  { kind: 'workbench', label: 'Workbench', work: 'Assembling', bench: { x: 26, y: 42 }, spots: [{ x: 26, y: 41 }, { x: 27, y: 41 }] },
+  { kind: 'varnishTable', label: 'Sanding & varnish', work: 'Sanding and varnishing', bench: { x: 32, y: 42 }, spots: [{ x: 32, y: 41 }, { x: 33, y: 41 }] },
+];
+/** Where carpenters come in (the Finance-side door). */
+export const SHOP_ENTRANCE = { x: 29, y: 37 };
+/** Carpenters fetch wood here (facing the lumber rack). */
+export const SHOP_LUMBER = { tile: { x: 34, y: 40 }, face: { x: 35, y: 40 } };
+/** Where idle carpenters sweep and tidy up. */
+export const SHOP_SWEEP: { x: number; y: number }[] = [
+  { x: 29, y: 38 },
+  { x: 30, y: 43 },
+  { x: 27, y: 44 },
+  { x: 34, y: 44 },
+  { x: 25, y: 43 },
+  { x: 31, y: 40 },
+];
 
 /**
  * Where idle agents go on a break. `tile` is where they stand; `face` is what they look at.

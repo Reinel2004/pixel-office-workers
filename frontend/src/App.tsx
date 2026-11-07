@@ -144,6 +144,7 @@ export default function App() {
   const openJob = (id: string) => setSelection({ kind: 'job', id });
   const setMode = (m: 'demo' | 'connected') => {
     engine.setMode(m);
+    if (m === 'connected') void live.loadWorkshop(true); // already signed in: re-read the shop numbers
     setSelection(null);
   };
   const onAssign = (id: AgentId) => {

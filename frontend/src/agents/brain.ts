@@ -92,7 +92,8 @@ function customTemplate(agentId: AgentId, prompt: string): TaskOutput {
     rosa: `Collections check (mock figures):\n• Finished orders with a balance: 2\n• Orders with no downpayment yet: 1\n• Reminder drafts are for review only — nothing is sent in demo mode.`,
     mika: `Trend check (mock figures):\n• Orders this quarter: up 12% on last quarter\n• Best seller: narra panel doors with varnish\n• Slowest stage: finishing (avg 6 days)\nDemo figures only — live trends come from Connected Mode.`,
     carlo: `Caption idea:\n"Crafted with care, built to last. Another custom WAD door is ready for its new home. Message us for a quotation!"\nNot published — for review only.`,
-    dev: `Dev checklist:\n1. Reproduce the issue in a test copy\n2. Check recent changes and logs\n3. Fix, test, and note the change\nNo live systems are touched in demo mode.`,
+    joy: `Reply draft (not sent):\n"Hi po [Customer name]! Thank you for your message. Your door is now in finishing, and we will update you as soon as it is ready for delivery."\n\nNotes for staff:\n• Demo only: live replies use the order you pick in Connected Mode.`,
+    dev: `Data check (mock records):\n• 1 open order with no due date\n• 1 In Progress order with no carpenter\n• 1 piece with no price\nFix list: add the due date, assign a carpenter, enter the price. Demo only: live checks run in Connected Mode.`,
     chief: `Coordination plan:\n1. Break the request into owner tasks\n2. Assign to the right agent\n3. Review outputs before anything goes out\n4. Approve or send back with notes`,
   };
   return {

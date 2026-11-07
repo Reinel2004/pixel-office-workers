@@ -10,6 +10,8 @@ import type {
   OrderRow,
   OrderStatusReport,
   OverdueReport,
+  ShopCarpenter,
+  ShopCounts,
 } from '../../shared/live';
 import { daysBetween } from '../../shared/manila';
 import type { BudgetRecord, FinanceRecord, OrderRecord } from '../adapters/types';
@@ -270,6 +272,114 @@ export function collections(open: OrderRecord[], today: string): CollectionsRepo
     rows: rows.map(({ c: _c, ...r }) => r),
     missingAmounts: missing,
   };
+}
+
+/**
+ * The Workshop room: each carpenter with their open orders by status (an order counts once per
+ * carpenter, whether as carpenter or hamba carpenter). The roster's order is kept; carpenters
+ * found only on orders follow, by name. Names and counts only.
+ */
+export function shopCounts(open: OrderRecord[], roster: string[] | null, available: boolean, today: string, asOf: string): ShopCounts {
+  const by = new Map<string, ShopCarpenter>();
+  const key = (n: string) => n.toLowerCase();
+  const get = (n: string) => {
+    let c = by.get(key(n));
+    if (!c) by.set(key(n), (c = { name: n, inProgress: 0, pending: 0, finished: 0, hamba: 0 }));
+    return c;
+  };
+  for (const n of roster ?? []) get(n);
+  let unassigned = 0;
+  let ready = 0;
+  for (const o of open) {
+    const s = o.status.toLowerCase();
+    if (s === 'finished') ready++;
+    const main = o.carpenters ?? [];
+    const frame = o.hambaCarpenters ?? [];
+    const all = new Map<string, string>();
+    for (const n of [...main, ...frame]) if (!all.has(key(n))) all.set(key(n), n);
+    if (!all.size && s !== 'finished') unassigned++;
+    for (const [k, n] of all) {
+      const c = get(n);
+      if (s === 'in progress') c.inProgress++;
+      else if (s === 'finished') c.finished++;
+      else c.pending++;
+      if (frame.some((f) => key(f) === k) && !main.some((m) => key(m) === k)) c.hamba++;
+    }
+  }
+  const inRoster = new Set((roster ?? []).map(key));
+  const carpenters = [...by.values()].sort((a, b) => {
+    const ra = inRoster.has(key(a.name));
+    const rb = inRoster.has(key(b.name));
+    if (ra !== rb) return ra ? -1 : 1;
+    if (ra) return (roster ?? []).findIndex((n) => key(n) === key(a.name)) - (roster ?? []).findIndex((n) => key(n) === key(b.name));
+    return a.name.localeCompare(b.name);
+  });
+  return { available, carpenters: carpenters.slice(0, 30), unassigned, ready, open: open.length, overdue: overdueOrders(open, today).report.overdue.length, asOf };
+}
+
+export interface DataCheck {
+  id: string;
+  label: string;
+  /** false = the order system does not provide what this check needs (not "no problems"). */
+  available: boolean;
+  count: number;
+  /** Order numbers with this problem (at most 30). */
+  orders: string[];
+  /** Only for possible duplicates: groups of order numbers that look like one order entered twice. */
+  groups?: string[][];
+}
+
+/**
+ * Data-quality checks on orders, calculated by code. Order numbers only: customer names are used
+ * to spot possible duplicates but never appear in the result.
+ */
+export function dataChecks(
+  orders: OrderRecord[],
+  today: string,
+  opts: { money: boolean; payments: boolean; carpenters: boolean; laborCheck: boolean; priceCheck: boolean },
+): { ordersChecked: number; checks: DataCheck[]; problemOrders: number } {
+  const MAX = 30;
+  const make = (id: string, label: string, available: boolean, hit: (o: OrderRecord) => boolean): DataCheck => {
+    const refs = available ? orders.filter(hit).map((o) => o.ref) : [];
+    return { id, label, available, count: refs.length, orders: refs.slice(0, MAX) };
+  };
+  const st = (o: OrderRecord) => o.status.toLowerCase();
+  const assigned = (o: OrderRecord) => (o.carpenters?.length ?? 0) + (o.hambaCarpenters?.length ?? 0) > 0;
+  const checks: DataCheck[] = [
+    make('missing_due_date', 'Open order with no due date', true, (o) => o.isClosed !== true && !o.dueDate),
+    make('unknown_status', 'Status is not Pending, In Progress, Finished or Delivered', true, (o) => o.isClosed === null),
+    make('missing_order_date', 'No order date', true, (o) => !o.createdDate),
+    make('due_before_order', 'Due date is before the order date', true, (o) => !!o.dueDate && !!o.createdDate && o.dueDate < o.createdDate),
+    make('no_carpenter_in_progress', 'In Progress but no carpenter assigned', opts.carpenters, (o) => st(o) === 'in progress' && !assigned(o)),
+    make('labor_missing', 'Carpenter assigned but no labor amount entered', opts.laborCheck, (o) => (o.laborMissing ?? 0) > 0),
+    make('zero_price', 'A piece has no price or a price of zero', opts.priceCheck, (o) => (o.zeroPriceItems ?? 0) > 0),
+    make(
+      'finished_no_downpayment',
+      'Finished or Delivered with no downpayment recorded',
+      opts.money && opts.payments,
+      (o) => (st(o) === 'finished' || st(o) === 'delivered') && o.downpaymentCentavos === 0,
+    ),
+  ];
+  // Possible duplicates: same customer (ignoring case and spaces) on the same order date.
+  const byKey = new Map<string, string[]>();
+  for (const o of orders) {
+    const name = (o.customerName ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!name || !o.createdDate) continue;
+    const k = `${name}|${o.createdDate}`;
+    byKey.set(k, [...(byKey.get(k) ?? []), o.ref]);
+  }
+  const groups = [...byKey.values()].filter((g) => g.length > 1);
+  checks.push({
+    id: 'possible_duplicate',
+    label: 'Same customer and order date as another order (maybe entered twice)',
+    available: true,
+    count: groups.reduce((n, g) => n + g.length, 0),
+    orders: groups.flat().slice(0, MAX),
+    groups: groups.slice(0, 15).map((g) => g.slice(0, 5)),
+  });
+  const problem = new Set(checks.flatMap((c) => c.orders));
+  void today;
+  return { ordersChecked: orders.length, checks, problemOrders: problem.size };
 }
 
 /** Order number -> customer name for the given orders (display only; capped). */

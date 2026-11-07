@@ -443,3 +443,33 @@ button:disabled { cursor: not-allowed; }
 .task-photo { display: block; max-width: 100%; max-height: 260px; margin-top: 8px; border-radius: 8px; border: 1px solid var(--line); object-fit: contain; background: rgba(0, 0, 0, 0.2); }
 .photo-note { margin: 4px 0 0; color: var(--amber); }
 @media (max-width: 640px) { .hide-narrow { display: none; } }
+
+/* Facebook posting (Carlo) */
+.fb-composer textarea { width: 100%; min-height: 120px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25); color: var(--text); font: inherit; font-size: 13px; line-height: 1.45; }
+.fb-when { display: flex; gap: 14px; font-size: 13px; }
+.fb-when label, .fb-confirm { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.fb-confirm { font-size: 12.5px; }
+.fb-date input { padding: 5px 8px; border-radius: 7px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25); color: var(--text); font: inherit; font-size: 13px; }
+.fb-photo-preview { position: relative; display: inline-block; }
+.fb-photo-preview img { display: block; max-width: 100%; max-height: 220px; border-radius: 8px; border: 1px solid var(--line); }
+.fb-photo-preview .icon-btn { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; padding: 0; display: grid; place-items: center; border-radius: 50%; background: var(--panel-solid); border: 1px solid var(--line-strong); color: var(--text); cursor: pointer; }
+.fb-done { display: flex; align-items: center; gap: 6px; color: var(--green); font-weight: 600; margin: 0; }
+.fb-h { margin: 6px 0 0; font-size: 13px; }
+.fb-msg { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.row.between { justify-content: space-between; }
+
+/* Carlo's prepared post (one-click approval) */
+.fb-ready { padding: 10px 12px; border: 1px solid #1877f2; border-radius: 10px; background: rgba(24, 119, 242, 0.08); }
+.fb-ready-head { margin: 0; font-size: 13px; }
+.fb-ready-body { display: flex; gap: 10px; align-items: flex-start; }
+.fb-ready-body img { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); flex: none; }
+.fb-ready-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; }
+.fb-ready-when { margin: 0; font-weight: 600; font-size: 13px; }
+@media (max-width: 420px) { .fb-ready-body { flex-direction: column; } .fb-ready-body img { width: 100%; height: auto; max-height: 220px; } }
+
+/* Customer Service (Joy) */
+.cs-panel textarea, .cs-panel input, .cs-panel select { width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25); color: var(--text); font: inherit; font-size: 13px; }
+.cs-panel textarea { min-height: 96px; resize: vertical; line-height: 1.45; }
+.cs-panel select option { background: var(--panel-solid); color: var(--text); }
+.cs-order { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.cs-reply { margin: 0; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; line-height: 1.5; border-radius: 8px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25); }

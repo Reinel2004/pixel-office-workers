@@ -10,6 +10,9 @@ import type { LiveStore } from '../../live/store';
 import { Empty } from '../ActivityPanel';
 import { IconAlert, IconCamera, IconChevron, IconClose, IconRetry, IconSend } from '../icons';
 import { Avatar } from '../shared';
+import { captionFrom, scheduleFrom } from '../../live/caption';
+import { CarloReadyPost, FacebookComposer, FacebookPanel } from './Facebook';
+import { CopyReply, CustomerReplyPanel } from './CustomerService';
 
 export function useLive(store: LiveStore) {
   return useSyncExternalStore(store.subscribe, store.getVersion);
@@ -83,8 +86,9 @@ const TASK_EXAMPLES: Record<LiveAgentId, string> = {
   bea: 'What were our biggest expense categories this month?',
   rosa: 'Which finished orders still have a balance? Draft a reminder for the biggest one',
   mika: 'What sold best in the last 6 months, and where does production slow down?',
-  carlo: 'Write a Facebook caption for a finished narra main door',
-  dev: 'Check open orders for missing due dates or odd statuses',
+  carlo: 'Short caption for this door photo, schedule it Saturday 9am',
+  joy: 'Use the "Customer reply" box in Joy\'s panel to paste a message',
+  dev: 'Check the order data and give me a fix list',
   chief: 'What should the team prioritise today?',
 };
 
@@ -461,6 +465,12 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
           )}
         </div>
         {isAi && <blockquote className="prompt">{job.prompt}</blockquote>}
+        {isAi && job.orderRef && <p className="muted small">Order picked for this reply: {job.orderRef}</p>}
+        {isAi && !!job.redacted && (
+          <p className="muted small">
+            {job.redacted} phone number(s) or email(s) were removed before the AI saw the message.
+          </p>
+        )}
         {isAi && job.image && (
           store.images.get(job.id) ? (
             <img className="task-photo" src={store.images.get(job.id)} alt="Photo sent with this task" />
@@ -473,12 +483,14 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
       {job.steps.map((s) => (
         <StepCard key={s.id} step={s} onOpenAgent={onOpenAgent} />
       ))}
+      {isAi && job.agent === 'carlo' && job.status === 'completed' && <PostFromTask store={store} job={job} />}
+      {isAi && job.agent === 'joy' && job.status === 'completed' && <CopyReply job={job} />}
       {job.status === 'failed' && (
         <button
           className="btn"
           disabled={!can.ok}
           title={can.reason}
-          onClick={() => (isAi ? store.submitAi(job.agent!, job.prompt!, store.images.get(job.id)) : store.submit(job.type as ReportType, job.range))}
+          onClick={() => (isAi ? store.submitAi(job.agent!, job.prompt!, store.images.get(job.id), job.orderRef) : store.submit(job.type as ReportType, job.range))}
         >
           <IconRetry size={15} /> Run again
         </button>
@@ -574,6 +586,8 @@ const TOOL_LABEL: Record<string, string> = {
   get_product_mix: 'Product mix',
   get_production_pipeline: 'Production pipeline',
   get_finance_trends: 'Finance trends',
+  get_data_checks: 'Data checks',
+  selected_order: 'Selected order',
 };
 
 function AiResultView({ r }: { r: StepResult }) {
@@ -645,7 +659,9 @@ function withNames(text: string, names: Record<string, string>): string {
   if (!Object.keys(names).length) return text;
   const mentioned = [...new Set([...text.matchAll(ORDER_REF)].map((m) => m[1]))].filter((r) => names[r]);
   let out = text.replace(ORDER_REF, (ref) => (names[ref] ? `${names[ref]} (${ref})` : ref));
+  const only = Object.keys(names).length === 1 ? Object.keys(names)[0] : null;
   if (mentioned.length === 1) out = out.replace(/\[Customer name\]/gi, names[mentioned[0]]);
+  else if (!mentioned.length && only) out = out.replace(/\[Customer name\]/gi, names[only]); // e.g. Joy's reply for the one picked order
   return out;
 }
 
@@ -760,6 +776,34 @@ function ReportView({ rep, names }: { rep: ReportPayload; names: Record<string, 
   }
 }
 
+/** Under Carlo's finished answer: post it to Facebook after a person checks it. */
+function PostFromTask({ store, job }: { store: LiveStore; job: Job }) {
+  const [open, setOpen] = useState(false);
+  if (!store.user?.permissions.includes('social:post')) return null;
+  const can = store.canPostFacebook();
+  const answer = job.steps[0]?.result?.answer ?? '';
+  if (!can.ok) return <p className="muted small">Facebook: {can.reason}</p>;
+  // Carlo read a posting time from the request: the post is prepared, one click to approve.
+  const when = scheduleFrom(answer);
+  if (when)
+    return (
+      <section>
+        <h3>{when.kind === 'now' ? 'Post to Facebook' : 'Scheduled post'}</h3>
+        <CarloReadyPost store={store} jobId={job.id} message={captionFrom(answer)} photo={store.images.get(job.id) ?? null} when={when} />
+      </section>
+    );
+  return open ? (
+    <section>
+      <h3>Post to Facebook</h3>
+      <FacebookComposer store={store} initialMessage={captionFrom(answer)} initialPhoto={store.images.get(job.id) ?? null} onClose={() => setOpen(false)} />
+    </section>
+  ) : (
+    <button className="btn primary" onClick={() => setOpen(true)}>
+      Post to Facebook…
+    </button>
+  );
+}
+
 // ---------------------------------------------------------------- agent panel section
 const LIVE_ROLE: Record<LiveAgentId, string> = {
   lia: 'Sales — drafts customer replies; can check order status in WAD Order Management.',
@@ -770,7 +814,8 @@ const LIVE_ROLE: Record<LiveAgentId, string> = {
   rosa: 'Collections — reads order prices, downpayments and balances from WAD Order Management; drafts payment reminders (never sends them).',
   mika: 'Data Analyst — trends over time: orders by month, best-selling products, production bottlenecks, and monthly income vs. expenses. Order values only for accounts with finance access.',
   carlo: 'Marketing — writes captions and posts (no live data).',
-  dev: 'Systems — checks order data for gaps and inconsistencies in WAD Order Management.',
+  joy: 'Customer Service — drafts replies to customer messages. Reads only the one order you pick; phone numbers and emails are removed before the AI sees the message. You copy and send the reply yourself.',
+  dev: 'Data quality — checks WAD Order Management by code for missing due dates, odd statuses, In Progress orders with no carpenter, missing labor, pieces with no price, finished orders with no downpayment (finance accounts) and possible double entries, then writes a fix list. He reads only; you correct the records in the order system.',
   chief: 'Coordinator — combines both systems; reports link records only by a verified order ID.',
 };
 
@@ -803,6 +848,8 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
           {store.ai?.ready ? 'No live task yet in this session. Use Assign Task to give one.' : 'No live task yet in this session.'}
         </p>
       )}
+      {agent === 'carlo' && <FacebookPanel store={store} />}
+      {agent === 'joy' && <CustomerReplyPanel store={store} onOpenJob={onOpenJob} />}
     </section>
   );
 }
@@ -812,7 +859,7 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
  * JPEG. This keeps uploads small and fast, and drops the camera's hidden data (EXIF, such as GPS
  * location) because only the pixels are redrawn.
  */
-async function shrinkPhoto(file: File): Promise<string> {
+export async function shrinkPhoto(file: File): Promise<string> {
   if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Choose a JPEG, PNG or WebP photo.');
   if (file.size > 25 * 1024 * 1024) throw new Error('That photo is too large (over 25 MB).');
   const url = URL.createObjectURL(file);

@@ -38,6 +38,13 @@ export interface OrderRecord {
   lastProgressDate?: string | null;
   /** What the order contains; only when requested with { products: true }. */
   products?: ProductLine[];
+  /** Carpenters assigned to the order's pieces, and its hamba (door frame) carpenters. Display only. */
+  carpenters?: string[];
+  hambaCarpenters?: string[];
+  /** Pieces with a carpenter (or hamba carpenter) but no labor amount entered; null = unknown. */
+  laborMissing?: number | null;
+  /** Pieces with no price or a price of zero; null = unknown. */
+  zeroPriceItems?: number | null;
   /** Customer name, for display in the office only. Never sent to the AI provider. */
   customerName?: string | null;
   /** What the customer pays for the whole order, in centavos; null when the system doesn't say. */
@@ -83,6 +90,11 @@ export interface OrderCapabilities {
   stageDates?: boolean;
   /** Product details were returned in the last response that asked for them. */
   products?: boolean;
+  /** Carpenter assignments are available (set from the last response). */
+  carpenters?: boolean;
+  /** Data checks: labor-entered and piece-price counts are available (set from the last response). */
+  laborCheck?: boolean;
+  priceCheck?: boolean;
 }
 
 export interface FinanceSource {
@@ -102,4 +114,6 @@ export interface OrderSource {
   listOrders(range: DateRange, opts?: OrderListOptions): Promise<OrderRecord[]>;
   /** Open orders regardless of range, for the overdue check. */
   listOpenOrders(opts?: OrderListOptions): Promise<OrderRecord[]>;
+  /** The carpenter list from the last response, in the order system's order; null if unknown. */
+  carpenterRoster?: string[] | null;
 }

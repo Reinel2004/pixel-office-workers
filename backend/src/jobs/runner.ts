@@ -5,7 +5,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId } from '../../shared/live';
-import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../shared/live';
+import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES } from '../../shared/live';
+import { redactContacts } from '../ai/redact';
 import { manilaDate } from '../../shared/manila';
 import type { FinanceRecord, FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
 import { AGENT_PROFILES, runAiTask, type AiTaskDeps } from '../ai/tasks';
@@ -134,14 +135,29 @@ export class JobRunner extends EventEmitter {
   }
 
   /** A free-text task for one agent, answered by the AI provider with read-only data tools. */
-  submitAi(user: SessionUser, agent: LiveAgentId, rawPrompt: string, rawImage?: { mimeType: string; data: string }): { job: Job; deduplicated: boolean } {
+  submitAi(
+    user: SessionUser,
+    agent: LiveAgentId,
+    rawPrompt: string,
+    rawImage?: { mimeType: string; data: string },
+    rawOrderRef?: string,
+  ): { job: Job; deduplicated: boolean } {
     if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
     if (!LIVE_AGENT_IDS.includes(agent)) throw new SubmitError(400, 'Unknown agent.');
     const image = rawImage ? checkImage(agent, rawImage) : null;
-    let prompt = rawPrompt.replace(/\s+/g, ' ').trim();
+    const orderRef = rawOrderRef?.trim() || undefined;
+    if (orderRef) {
+      if (!ORDER_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take a selected order.`);
+      if (!ORDER_REF_PATTERN.test(orderRef)) throw new SubmitError(400, 'That order number is not valid.');
+      if (!user.permissions.includes('orders:read')) throw new SubmitError(403, 'Your account cannot read orders.');
+    }
+    // Phone numbers and emails never reach the AI (or the stored task).
+    const { text: cleaned, count: redacted } = redactContacts(rawPrompt);
+    let prompt = cleaned.replace(/\s+/g, ' ').trim();
     if (!prompt && image) prompt = 'Write a Facebook caption for this photo.';
     if (!prompt) throw new SubmitError(400, 'Type a task first.');
-    if (prompt.length > MAX_PROMPT_CHARS) throw new SubmitError(400, `Keep the task under ${MAX_PROMPT_CHARS} characters.`);
+    const maxChars = ORDER_AGENTS.includes(agent) ? MAX_CS_PROMPT_CHARS : MAX_PROMPT_CHARS;
+    if (prompt.length > maxChars) throw new SubmitError(400, `Keep the task under ${maxChars} characters.`);
     const dup = this.jobs.find(
       (j) =>
         j.requestedBy === user.username &&
@@ -149,6 +165,7 @@ export class JobRunner extends EventEmitter {
         j.agent === agent &&
         j.prompt === prompt &&
         j.image?.sha256 === image?.meta.sha256 &&
+        j.orderRef === orderRef &&
         (j.status === 'queued' || j.status === 'working'),
     );
     if (dup) return { job: dup, deduplicated: true };
@@ -165,6 +182,8 @@ export class JobRunner extends EventEmitter {
       prompt,
       agent,
       ...(image ? { image: image.meta } : {}),
+      ...(orderRef ? { orderRef } : {}),
+      ...(redacted ? { redacted } : {}),
       requestedBy: user.username,
       status: 'queued',
       createdAt: new Date().toISOString(),
@@ -292,7 +311,7 @@ export class JobRunner extends EventEmitter {
     const ai = this.deps.ai;
     const user = this.users.get(job.id);
     if (!ai || !user || !job.agent || !job.prompt) throw new IntegrationError('NOT_CONFIGURED', 'AI tasks are not set up on the server.');
-    const out = await runAiTask({ ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now }, user, job.agent, job.prompt, this.images.get(job.id));
+    const out = await runAiTask({ ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now }, user, job.agent, job.prompt, this.images.get(job.id), job.orderRef);
     const ok = out.lookups.filter((l) => l.ok).length;
     return {
       summary: out.lookups.length
@@ -460,7 +479,7 @@ export class JobRunner extends EventEmitter {
  * Checks a photo sent with an AI task: allowed agent and type, real image bytes (the file's
  * signature must match its type), and size. Returns the base64 data and a short fingerprint.
  */
-function checkImage(agent: LiveAgentId, img: { mimeType: string; data: string }) {
+export function checkImage(agent: LiveAgentId, img: { mimeType: string; data: string }) {
   if (!IMAGE_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take photos.`);
   if (!(IMAGE_TYPES as readonly string[]).includes(img.mimeType)) throw new SubmitError(400, 'Use a JPEG, PNG or WebP photo.');
   const data = img.data.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');

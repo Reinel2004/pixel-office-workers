@@ -407,3 +407,96 @@ test('photos are checked: only Carlo, only real JPEG/PNG/WebP, size-limited', ()
   const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(50)]).toString('base64');
   assert.equal(code(() => r.submitAi(admin, 'carlo', 'Caption please', { mimeType: 'image/webp', data: webp })), 0);
 });
+
+test('Joy: contact details are removed, the picked order is looked up by code, and names stay out of Gemini', async () => {
+  const open: OrderRecord[] = [
+    { ref: 'ORD-J1', orderId: 'J1', status: 'In Progress', isClosed: false, dueDate: '2026-11-20', progressPercent: 70, stage: 'finishing', createdDate: '2026-10-01', grossCentavos: 3000000, downpaymentCentavos: 1000000, customerName: 'Maria Santos', products: [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'Varnish', qty: 1, centavos: 3000000 }] },
+  ];
+  const src = orders({ listOpenOrders: async () => open });
+  src.capabilities.payments = true;
+  const g = fakeGemini([{ candidates: [{ content: { role: 'model', parts: [{ text: '**Reply**\nHi [Customer name]! Your door is in finishing po.\n\n**Notes for staff**\n- Check the date.' }] } }] }]);
+  const r = runner(g.ai, { orders: src });
+  const msg = 'Customer message: "Hello, kumusta na door ko? Call me 0917 123 4567 or maria.s@gmail.com, landline (02) 8123 4567"';
+  const { job } = r.submitAi(admin, 'joy', msg, undefined, 'ORD-J1');
+  assert.equal(job.redacted, 3);
+  assert.equal(job.orderRef, 'ORD-J1');
+  assert.ok(!job.prompt!.includes('0917') && !job.prompt!.includes('gmail') && !job.prompt!.includes('8123'));
+  const final = await done(r, job.id);
+  assert.equal(final.status, 'completed');
+  const sent = JSON.stringify(g.bodies);
+  assert.ok(!sent.includes('Maria') && !sent.includes('0917') && !sent.includes('gmail'));
+  const parts = (g.bodies[0].contents as any[])[0].parts;
+  const facts = JSON.parse(parts[1].text.slice(parts[1].text.indexOf('\n') + 1));
+  assert.equal(facts.ref, 'ORD-J1');
+  assert.equal(facts.stage, 'finishing');
+  assert.equal(facts.balance, '20000.00');
+  assert.equal(facts.items[0].wood, 'Narra');
+  assert.match((g.bodies[0].systemInstruction as any).parts[0].text, /Customer-service rules/);
+  assert.deepEqual(final.steps[0].result!.customers, { 'ORD-J1': 'Maria Santos' });
+  assert.deepEqual(final.steps[0].result!.lookups, [{ tool: 'selected_order', detail: 'ORD-J1', ok: true }]);
+});
+
+test('Joy: no balance for operations users, unknown orders are reported, and only Joy takes an order', async () => {
+  const g = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [{ text: '**Reply**\nHi po!' }] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: '**Reply**\nHi po!' }] } }] },
+  ]);
+  const src = orders();
+  src.capabilities.payments = true;
+  const r = runner(g.ai, { orders: src });
+  await done(r, r.submitAi(ops, 'joy', 'Magkano pa balance ko?', undefined, 'ORD-A').job.id);
+  const facts1 = JSON.parse((g.bodies[0].contents as any[])[0].parts[1].text.split('\n').slice(1).join('\n'));
+  assert.equal(facts1.balance, undefined);
+  assert.match(facts1.money, /not shown/);
+  const f2 = await done(r, r.submitAi(admin, 'joy', 'Where is my order?', undefined, 'ORD-GONE').job.id);
+  const facts2 = JSON.parse((g.bodies[1].contents as any[])[0].parts[1].text.split('\n').slice(1).join('\n'));
+  assert.equal(facts2.found, false);
+  assert.equal(f2.steps[0].result!.lookups![0].ok, false);
+  assert.throws(() => r.submitAi(admin, 'rosa', 'x', undefined, 'ORD-A'), (e: SubmitError) => e.status === 400);
+  assert.throws(() => r.submitAi(admin, 'joy', 'x', undefined, 'ORD A; drop'), (e: SubmitError) => e.status === 400);
+  const noOrders: SessionUser = { username: 'fin', role: 'finance', permissions: ['finance:read'] };
+  assert.throws(() => r.submitAi(noOrders, 'joy', 'x', undefined, 'ORD-A'), (e: SubmitError) => e.status === 403);
+  // Long customer messages are allowed for Joy only.
+  const long = 'a'.repeat(900);
+  assert.throws(() => r.submitAi(admin, 'lia', long), (e: SubmitError) => e.status === 400);
+});
+
+test('Dev runs the data checks by code and the AI gets order numbers only', async () => {
+  const src = orders({
+    listOpenOrders: async () => [
+      { ref: 'ORD-N', orderId: 'N', status: 'In Progress', isClosed: false, dueDate: null, progressPercent: null, stage: null, createdDate: '2026-10-01', carpenters: [], customerName: 'Pedro Penduko' } as OrderRecord,
+    ],
+  });
+  src.capabilities.carpenters = true;
+  const g = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'get_data_checks', args: {} } }] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'Fix ORD-N: add a due date and a carpenter.' }] } }] },
+  ]);
+  const r = runner(g.ai, { orders: src });
+  const final = await done(r, r.submitAi(ops, 'dev', 'Check the order data').job.id);
+  assert.equal(final.status, 'completed');
+  const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
+  const by = Object.fromEntries(resp.checks.map((c: any) => [c.id, c]));
+  assert.deepEqual(by.missing_due_date.orders, ['ORD-N']);
+  assert.deepEqual(by.no_carpenter_in_progress.orders, ['ORD-N']);
+  assert.equal(by.finished_no_downpayment.available, false); // ops has no finance permission
+  assert.equal(by.labor_missing.available, false); // not provided by this order system
+  assert.ok(!JSON.stringify(g.bodies).includes('Pedro'));
+  assert.deepEqual(final.steps[0].result!.customers, { 'ORD-N': 'Pedro Penduko' });
+  assert.deepEqual(toolsFor('dev', ops), ['get_data_checks', 'get_open_orders', 'get_orders']);
+});
+
+test('Carlo is told the current Manila time and to end with a Schedule line; he cannot post himself', async () => {
+  const g = fakeGemini([{ candidates: [{ content: { role: 'model', parts: [{ text: '**Caption**\nHi\n**Schedule:** 2026-11-07 09:00' }] } }] }]);
+  const r = runner(g.ai);
+  await done(r, r.submitAi(admin, 'carlo', 'Short caption, schedule it tomorrow 9am').job.id);
+  const sys = (g.bodies[0].systemInstruction as any).parts[0].text as string;
+  // The runner clock is 2026-11-05T02:00Z = Thursday 10:00 in Manila.
+  assert.match(sys, /It is now Thursday, 2026-11-05 10:00 \(Asia\/Manila\)/);
+  assert.match(sys, /\*\*Schedule:\*\* YYYY-MM-DD HH:MM/);
+  assert.match(sys, /You cannot post or schedule yourself/);
+  const other = fakeGemini([{ candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] } }] }]);
+  const r2 = runner(other.ai);
+  await done(r2, r2.submitAi(admin, 'paolo', 'hello').job.id);
+  assert.doesNotMatch((other.bodies[0].systemInstruction as any).parts[0].text, /Facebook scheduling/);
+});

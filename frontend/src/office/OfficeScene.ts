@@ -5,11 +5,12 @@
 import Phaser from 'phaser';
 import { AGENTS } from '../agents/roster';
 import type { Bus, Insets } from '../bridge';
-import type { Engine, AgentRT } from '../sim/engine';
+import type { Engine } from '../sim/engine';
 import type { AgentId, AgentState, Selection } from '../sim/types';
-import { drawFurniture, drawScreen, faceL, faceR, P, poly } from './furniture';
+import { drawBenchPile, drawDoorRack, drawFurniture, drawScreen, faceL, faceR, P, poly } from './furniture';
+import { SHOP_SPOTS, openCount, type Carpenter } from '../sim/workshop';
 import { footprintDepth, fromIso, iso, shade } from './iso';
-import { DOORS, FURNITURE, GRID_H, GRID_W, ROOMS, RUGS, isDoorTile, roomAt, type Furniture, type Room } from './layout';
+import { DOORS, FURNITURE, GRID_H, GRID_W, ROOMS, ROOM_BY_ID, RUGS, SHOP_BENCHES, isDoorTile, roomAt, type Furniture, type Room } from './layout';
 import { buildAgentTextures, frameKey, SPRITE_H } from './sprites';
 
 export const STATE_COLORS: Record<AgentState, number> = {
@@ -27,7 +28,7 @@ const OVERLAY_DEPTH = 90000;
 const FLOOR_DEPTH = -100000;
 
 interface AgentView {
-  id: AgentId;
+  id: string;
   sprite: Phaser.GameObjects.Image;
   shadow: Phaser.GameObjects.Ellipse;
   ring: Phaser.GameObjects.Graphics;
@@ -51,7 +52,20 @@ export class OfficeScene extends Phaser.Scene {
   private bigScreen?: { f: Furniture; g: Phaser.GameObjects.Graphics };
   private holo?: { f: Furniture; g: Phaser.GameObjects.Graphics };
   private coffee?: { f: Furniture; g: Phaser.GameObjects.Graphics };
+  /** The easel that shows Carlo's photo, and the image drawn on its canvas. */
+  private photoEasel?: Furniture;
+  private easelImg?: { src: string; img: Phaser.GameObjects.Image | null; key: string };
+  private easelSeq = 0;
+  /** Creative Studio board: post cards (graphics) and its caption. */
+  private postBoard?: { f: Furniture; g: Phaser.GameObjects.Graphics };
+  private boardLabel?: { c: Phaser.GameObjects.Container; bg: Phaser.GameObjects.Graphics; t: Phaser.GameObjects.Text; text: string };
   private roomLabels: Phaser.GameObjects.Container[] = [];
+  /** Workshop: carpenters, the order pieces on each bench, and the count tags. */
+  private crewViews = new Map<string, AgentView>();
+  private benches: { bench: number; f: Furniture; g: Phaser.GameObjects.Graphics }[] = [];
+  private doorRack?: { f: Furniture; g: Phaser.GameObjects.Graphics };
+  private shopTags: { key: string; c: Phaser.GameObjects.Container; bg: Phaser.GameObjects.Graphics; t: Phaser.GameObjects.Text; text: string; at: { x: number; y: number } }[] = [];
+  private shopRev = -1;
   private highlight!: Phaser.GameObjects.Graphics;
   private insets: Insets = { top: 56, right: 12, bottom: 100, left: 12 };
   private selection: Selection = null;
@@ -88,7 +102,8 @@ export class OfficeScene extends Phaser.Scene {
     this.drawRoomLabels();
     this.bus.emit('scene:progress', { value: 0.7 });
     for (const a of AGENTS) buildAgentTextures(this, a);
-    for (const a of this.engine.agents) this.createAgentView(a);
+    for (const a of this.engine.agents) this.views.set(a.id, this.createAgentView(a));
+
     this.highlight = this.add.graphics().setDepth(OVERLAY_DEPTH);
 
     this.setupInput();
@@ -204,6 +219,9 @@ export class OfficeScene extends Phaser.Scene {
         return (x + y) % 2 ? shade(c, 0.93) : c;
       case 'court':
         return c;
+      case 'concrete':
+        // poured floor with a few darker patches and saw-dust specks
+        return (x * 5 + y * 3) % 7 === 0 ? shade(c, 0.93) : (x * 11 + y * 7) % 13 === 0 ? shade(c, 1.05) : c;
     }
   }
 
@@ -361,6 +379,11 @@ export class OfficeScene extends Phaser.Scene {
       if (f.kind === 'bigScreen') this.bigScreen = { f, g: this.add.graphics().setDepth(depth + 0.01) };
       if (f.kind === 'holoTable') this.holo = { f, g: this.add.graphics().setDepth(depth + 0.01) };
       if (f.kind === 'coffeeMaker') this.coffee = { f, g: this.add.graphics().setDepth(depth + 0.01) };
+      if (f.kind === 'easel' && f.room === 'creative' && f.x === 27) this.photoEasel = f;
+      if (f.kind === 'postBoard') this.postBoard = { f, g: this.add.graphics().setDepth(depth + 0.01) };
+      const bench = SHOP_BENCHES.findIndex((b) => b.kind === f.kind && b.bench.x === f.x && b.bench.y === f.y);
+      if (bench >= 0) this.benches.push({ bench, f, g: this.add.graphics().setDepth(depth + 0.01) });
+      if (f.kind === 'doorRack') this.doorRack = { f, g: this.add.graphics().setDepth(depth + 0.01) };
     }
   }
 
@@ -394,7 +417,7 @@ export class OfficeScene extends Phaser.Scene {
   }
 
   // ------------------------------------------------------------------ agents
-  private createAgentView(a: AgentRT) {
+  private createAgentView(a: { id: string; def: { name: string } }): AgentView {
     const shadow = this.add.ellipse(0, 0, 22, 9, 0x000000, 0.28);
     const ring = this.add.graphics();
     const sprite = this.add.image(0, 0, frameKey(a.id, 'back', 0)).setOrigin(0.5, 1);
@@ -427,7 +450,7 @@ export class OfficeScene extends Phaser.Scene {
       .setOrigin(0.5, 1);
     const bubble = this.add.container(0, 0, [bubbleBg, bubbleText]).setDepth(LABEL_DEPTH + 1).setVisible(false);
 
-    this.views.set(a.id, {
+    return {
       id: a.id,
       sprite,
       shadow,
@@ -441,7 +464,7 @@ export class OfficeScene extends Phaser.Scene {
       bubbleShown: null,
       lastState: null,
       bubbleBorn: 0,
-    });
+    };
   }
 
   private labelScale(): number {
@@ -573,6 +596,130 @@ export class OfficeScene extends Phaser.Scene {
     // The Intelligence Lab hologram shows what the AI is doing, every frame so it moves smoothly.
     this.drawHolo(time, reduced || paused, pulse.state);
     this.drawAiLabel(pulse.state, pulse.label, k);
+    this.syncEaselPhoto();
+    this.drawBoardLabel(k);
+    this.drawWorkshop(time, k, reduced, paused, showLabels);
+  }
+
+  // ------------------------------------------------------------------ Workshop
+  private drawWorkshop(time: number, k: number, reduced: boolean, paused: boolean, showLabels: boolean) {
+    const shop = this.engine.workshop;
+    if (shop.rev !== this.shopRev) {
+      this.shopRev = shop.rev;
+      const load = shop.load;
+      // Orders in progress on each bench, from the carpenters standing at it.
+      for (const b of this.benches) {
+        const n = shop.crew.filter((c) => SHOP_SPOTS[c.slot].bench === b.bench).reduce((sum, c) => sum + c.info.inProgress, 0);
+        drawBenchPile(b.g, b.f, n);
+      }
+      if (this.doorRack) drawDoorRack(this.doorRack.g, this.doorRack.f, load?.ready ?? 0);
+      this.syncCrewViews();
+      const tags: { key: string; text: string; at: { x: number; y: number } }[] = [];
+      const r = ROOM_BY_ID.workshop;
+      const centre = P((r.x0 + r.x1 + 1) / 2, (r.y0 + r.y1 + 1) / 2, 40);
+      if (!load) {
+        const msg = shop.note === 'no-access' ? 'Workshop: no order access' : shop.note === 'unavailable' ? 'Workshop: orders unavailable' : 'Loading the carpenters…';
+        tags.push({ key: 'note', text: msg, at: centre });
+      } else if (!load.available) tags.push({ key: 'note', text: 'Carpenter assignments not available yet', at: centre });
+      else if (!load.carpenters.length) tags.push({ key: 'note', text: 'No carpenters listed', at: centre });
+      if (load && this.doorRack) tags.push({ key: 'ready', text: `Ready for delivery · ${load.ready}`, at: P(this.doorRack.f.x + this.doorRack.f.w / 2, this.doorRack.f.y + 0.5, 46) });
+      this.setShopTags(tags);
+    }
+    for (const tag of this.shopTags) tag.c.setPosition(tag.at.x, tag.at.y).setScale(k).setVisible(showLabels);
+    for (const c of shop.crew) this.renderCarpenter(c, this.crewViews.get(c.id)!, time, k, reduced, paused, showLabels);
+  }
+
+  /** One view per carpenter shown; rebuilt when the numbers change so each name tag shows the count. */
+  private syncCrewViews() {
+    for (const v of this.crewViews.values()) {
+      v.sprite.destroy();
+      v.shadow.destroy();
+      v.ring.destroy();
+      v.label.destroy();
+      v.bubble.destroy();
+    }
+    this.crewViews.clear();
+    for (const c of this.engine.workshop.crew) {
+      if (!this.textures.exists(frameKey(c.id, 'front', 0))) buildAgentTextures(this, c.def);
+      const n = openCount(c.info);
+      this.crewViews.set(c.id, this.createAgentView({ id: c.id, def: { name: n ? `${c.def.name} · ${n}` : c.def.name } }));
+    }
+  }
+
+  private setShopTags(tags: { key: string; text: string; at: { x: number; y: number } }[]) {
+    for (const t of this.shopTags) if (!tags.some((n) => n.key === t.key)) t.c.destroy();
+    this.shopTags = this.shopTags.filter((t) => tags.some((n) => n.key === t.key));
+    for (const n of tags) {
+      let tag = this.shopTags.find((t) => t.key === n.key);
+      if (!tag) {
+        const t = this.add.text(0, 0, '', { fontFamily: 'Inter, system-ui, sans-serif', fontSize: '10px', fontStyle: '600', color: '#fff4e0', resolution: 3 }).setOrigin(0.5, 0.5);
+        const bg = this.add.graphics();
+        tag = { key: n.key, c: this.add.container(0, 0, [bg, t]).setDepth(LABEL_DEPTH - 3), bg, t, text: '', at: n.at };
+        this.shopTags.push(tag);
+      }
+      tag.at = n.at;
+      if (tag.text !== n.text) {
+        tag.text = n.text;
+        tag.t.setText(n.text);
+        const w = tag.t.width + 12;
+        tag.bg.clear();
+        tag.bg.fillStyle(0x2a1d12, 0.9);
+        tag.bg.fillRoundedRect(-w / 2, -8, w, 16, 4);
+        tag.bg.lineStyle(1, 0xd2a86e, 0.9);
+        tag.bg.strokeRoundedRect(-w / 2, -8, w, 16, 4);
+      }
+    }
+  }
+
+  private renderCarpenter(c: Carpenter, v: AgentView, time: number, k: number, reduced: boolean, paused: boolean, showLabels: boolean) {
+    const p = iso(c.x + 0.5, c.y + 0.5);
+    const front = c.dir[0] === 'f';
+    const walking = c.path.length > 0;
+    let key: string;
+    let lift = 0;
+    if (walking) {
+      const f = reduced ? 0 : Math.floor(c.stepPhase * 4) % 4;
+      key = frameKey(c.id, front ? 'front' : 'back', f === 1 ? 1 : f === 3 ? 2 : 0);
+      if (!reduced && (f === 1 || f === 3)) lift = 1;
+    } else key = frameKey(c.id, front ? 'front' : 'back', 0);
+    if (v.sprite.texture.key !== key) v.sprite.setTexture(key);
+    v.sprite.setFlipX(c.dir[1] === 'l');
+    // Sawing, planing, sanding: a steady working rhythm.
+    const bob = !reduced && !paused && !walking && c.action === 'work' ? (Math.sin(time / 150 + c.x) > 0.2 ? 1.5 : 0) : 0;
+    const footY = p.y + 3;
+    v.sprite.setPosition(Math.round(p.x), Math.round(footY - lift - bob));
+    const depth = c.x + c.y + 1;
+    v.sprite.setDepth(depth);
+    v.shadow.setPosition(p.x, p.y + 2).setDepth(depth - 0.05);
+    const top = footY - SPRITE_H + 4;
+    v.label.setVisible(showLabels).setScale(k).setPosition(p.x, top - 9 * k);
+    const state: AgentState = walking ? 'walking' : c.action === 'work' ? 'working' : 'idle';
+    if (v.lastState !== state) {
+      v.labelDot.setFillStyle(STATE_COLORS[state]);
+      v.lastState = state;
+    }
+    const text = c.bubble?.text ?? null;
+    if (text !== v.bubbleShown) {
+      v.bubbleShown = text;
+      v.bubbleBorn = time;
+      if (text) {
+        v.bubbleText.setText(text);
+        const bw = v.bubbleText.width + 14;
+        const bh = v.bubbleText.height + 8;
+        v.bubbleBg.clear();
+        v.bubbleBg.fillStyle(0x000000, 0.25);
+        v.bubbleBg.fillRoundedRect(-bw / 2 + 1, -bh - 4, bw, bh, 7);
+        v.bubbleBg.fillStyle(0xffffff, 1);
+        v.bubbleBg.fillRoundedRect(-bw / 2, -bh - 6, bw, bh, 7);
+        v.bubbleBg.fillTriangle(-4, -6.5, 4, -6.5, 0, -1);
+        v.bubbleText.setPosition(0, -10);
+      }
+      v.bubble.setVisible(!!text);
+    }
+    if (text) {
+      const pop = reduced ? 1 : Math.min(1, 0.6 + (time - v.bubbleBorn) / 250);
+      v.bubble.setScale(k * pop).setPosition(p.x, top - (showLabels ? 18 : 6) * k);
+    }
   }
 
   private drawAmbient(time: number, still: boolean) {
@@ -690,6 +837,127 @@ export class OfficeScene extends Phaser.Scene {
       g.fillRect(c.x - 1.5, c.y - 34, 3, 9);
       g.fillRect(c.x - 1.5, c.y - 22, 3, 3);
     }
+  }
+
+  /**
+   * Puts the photo Carlo is studying on the easel's canvas, slanted to match the canvas face, so
+   * it looks painted on. The photo is only in this browser (a data URL); nothing is uploaded.
+   */
+  private syncEaselPhoto() {
+    const src = this.engine.easelPhoto;
+    const f = this.photoEasel;
+    if (!f) return;
+    if (!src) {
+      if (this.easelImg) {
+        this.easelImg.img?.destroy();
+        if (this.textures.exists(this.easelImg.key)) this.textures.remove(this.easelImg.key);
+        this.easelImg = undefined;
+      }
+      return;
+    }
+    if (this.easelImg?.src === src) return;
+    this.easelImg?.img?.destroy();
+    if (this.easelImg && this.textures.exists(this.easelImg.key)) this.textures.remove(this.easelImg.key);
+    const key = `wad-easel-${this.easelSeq++}`;
+    const entry: { src: string; img: Phaser.GameObjects.Image | null; key: string } = { src, img: null, key };
+    this.easelImg = entry;
+    const photo = new Image();
+    photo.onload = () => {
+      if (this.easelImg !== entry) return; // replaced meanwhile
+      // Canvas face of the easel (see furniture.ts 'easel'): plane gy = y+0.6, gx x+0.12..x+0.88, z 12..32.
+      const gy = f.y + 0.605;
+      const tl = P(f.x + 0.14, gy, 31.5);
+      const tr = P(f.x + 0.86, gy, 31.5);
+      const bl = P(f.x + 0.14, gy, 12.5);
+      const minX = Math.min(tl.x, bl.x);
+      const minY = Math.min(tl.y, tr.y);
+      const maxX = Math.max(tr.x, tl.x);
+      const maxY = Math.max(bl.y, bl.y + (tr.y - tl.y));
+      const R = 4; // draw at 4x for a crisp result when zoomed in
+      const W = Math.max(2, Math.ceil((maxX - minX) * R));
+      const H = Math.max(2, Math.ceil((maxY - minY) * R));
+      const tex = this.textures.createCanvas(key, W, H);
+      if (!tex) return;
+      const ctx = tex.getContext();
+      // Cover-crop the photo to the canvas proportions, then map it onto the slanted face.
+      const faceW = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+      const faceH = bl.y - tl.y;
+      const want = faceW / faceH;
+      let sw = photo.naturalWidth;
+      let sh = photo.naturalHeight;
+      let sx = 0;
+      let sy = 0;
+      if (sw / sh > want) {
+        sw = sh * want;
+        sx = (photo.naturalWidth - sw) / 2;
+      } else {
+        sh = sw / want;
+        sy = (photo.naturalHeight - sh) / 2;
+      }
+      ctx.setTransform(((tr.x - tl.x) * R) / sw, ((tr.y - tl.y) * R) / sw, 0, (faceH * R) / sh, (tl.x - minX) * R, (tl.y - minY) * R);
+      ctx.drawImage(photo, sx, sy, sw, sh, 0, 0, sw, sh);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      tex.refresh();
+      const depth = footprintDepth(f.x, f.y, f.w, f.d) + 0.02;
+      entry.img = this.add.image(minX, minY, key).setOrigin(0, 0).setScale(1 / R).setDepth(depth);
+    };
+    photo.src = src;
+  }
+
+  /** Post cards on the Creative Studio board: one card per scheduled post (up to 6). */
+  private drawPostBoard() {
+    const b = this.postBoard;
+    if (!b) return;
+    const { f, g } = b;
+    g.clear();
+    const info = this.engine.postBoard;
+    const n = info?.configured && info.count ? info.count : 0;
+    for (let i = 0; i < 6; i++) {
+      const a = f.x + 0.22 + i * 0.44;
+      const filled = i < n;
+      faceL(g, f.y + 0.04, a, a + 0.34, 14 + (i % 2) * 2, 25 + (i % 2) * 2, filled ? 0xffffff : 0xc9b48f, filled ? 1 : 0.5);
+      if (filled) {
+        faceL(g, f.y + 0.045, a + 0.04, a + 0.3, 21 + (i % 2) * 2, 24 + (i % 2) * 2, 0x8fb8f5); // a little photo
+        faceL(g, f.y + 0.045, a + 0.15, a + 0.19, 25 + (i % 2) * 2, 26.5 + (i % 2) * 2, 0xe0605e); // pin
+      }
+    }
+  }
+
+  private drawBoardLabel(k: number) {
+    const b = this.postBoard;
+    if (!b) return;
+    const info = this.engine.postBoard;
+    if (!this.boardLabel) {
+      const t = this.add.text(0, 0, '', { fontFamily: 'Inter, system-ui, sans-serif', fontSize: '10px', fontStyle: '600', color: '#e8edf5', resolution: 3 }).setOrigin(0.5, 0.5);
+      const bg = this.add.graphics();
+      const c = this.add.container(0, 0, [bg, t]).setDepth(LABEL_DEPTH - 2).setVisible(false);
+      this.boardLabel = { c, bg, t, text: '' };
+    }
+    const L = this.boardLabel;
+    if (!info) {
+      L.c.setVisible(false);
+      return;
+    }
+    const text = !info.configured
+      ? 'Facebook: not set up'
+      : info.count === null
+        ? 'Scheduled posts: …'
+        : info.count === 0
+          ? 'No posts scheduled'
+          : `${info.count} post${info.count === 1 ? '' : 's'} scheduled${info.next ? ` · next ${formatShort(info.next)}` : ''}`;
+    if (L.text !== text) {
+      L.text = text;
+      L.t.setText(text);
+      const w = L.t.width + 14;
+      L.bg.clear();
+      L.bg.fillStyle(0x0d111b, 0.88);
+      L.bg.fillRoundedRect(-w / 2, -9, w, 18, 5);
+      L.bg.lineStyle(1, 0x1877f2, 0.9);
+      L.bg.strokeRoundedRect(-w / 2, -9, w, 18, 5);
+      this.drawPostBoard();
+    }
+    const p = P(b.f.x + b.f.w / 2, b.f.y, 40);
+    L.c.setPosition(p.x, p.y).setScale(k).setVisible(true);
   }
 
   private drawAiLabel(state: string, text: string, k: number) {
@@ -918,7 +1186,7 @@ export class OfficeScene extends Phaser.Scene {
       const inSprite = wx >= s.x - 13 && wx <= s.x + 13 && wy >= s.y - s.height + 2 && wy <= s.y + 4;
       const lb = v.label.visible ? v.label.getBounds() : null;
       const inLabel = !!lb && lb.contains(wx, wy);
-      if ((inSprite || inLabel) && (!best || s.depth + (inLabel ? 1000 : 0) > best.depth)) best = { id: v.id, depth: s.depth + (inLabel ? 1000 : 0) };
+      if ((inSprite || inLabel) && (!best || s.depth + (inLabel ? 1000 : 0) > best.depth)) best = { id: v.id as AgentId, depth: s.depth + (inLabel ? 1000 : 0) };
     }
     void k;
     return best?.id ?? null;
@@ -926,3 +1194,8 @@ export class OfficeScene extends Phaser.Scene {
 }
 
 export const WORLD_SIZE = { w: GRID_W, h: GRID_H };
+
+/** "Nov 10, 9:00 AM" in Manila time. */
+function formatShort(iso: string) {
+  return new Intl.DateTimeFormat('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(iso));
+}

@@ -143,8 +143,8 @@ export function productionWorkflow(): TaskTemplate {
     primary: 'paolo',
     steps: [
       { t: 'log', text: 'Production review started (mock orders).', kind: 'info', agent: 'paolo' },
-      { t: 'move', agent: 'paolo', to: { tile: SPOTS.opsBoard, face: { x: 4, y: 12 } }, activity: 'Going to the production board' },
-      { t: 'work', agent: 'paolo', ms: 2200, activity: 'Reading the production board', say: 'Pulling the order list' },
+      { t: 'move', agent: 'paolo', to: { tile: SPOTS.shopInspect, face: { x: SPOTS.shopInspect.x + 1, y: SPOTS.shopInspect.y + 1 } }, activity: 'Walking to the Workshop' },
+      { t: 'work', agent: 'paolo', ms: 2600, activity: 'Checking the benches with the carpenters', say: 'Kumusta ang mga pinto?' },
       { t: 'move', agent: 'paolo', to: seat, activity: 'Back to desk' },
       ...checks,
       {

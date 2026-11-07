@@ -8,20 +8,45 @@ export const SYSTEM_NAMES: Record<SystemId, string> = {
   orders: 'WAD Order Management',
 };
 
-export type Permission = 'finance:read' | 'orders:read';
+export type Permission = 'finance:read' | 'orders:read' | 'social:post';
+
+/** Facebook Page posting status (never includes the token). */
+export interface FacebookStatus {
+  configured: boolean;
+  pageName: string | null;
+  problems: string[];
+}
+
+/** A post waiting in the Facebook Page's schedule. */
+export interface ScheduledPost {
+  id: string;
+  message: string;
+  scheduledAt: string | null; // ISO
+  hasPicture: boolean;
+  link: string | null;
+}
+
+/** Facebook allows scheduling 10 minutes to 30 days ahead; the office keeps a small margin. */
+export const FB_MIN_SCHEDULE_MINUTES = 15;
+export const FB_MAX_SCHEDULE_DAYS = 29;
+export const MAX_POST_CHARS = 5000;
 
 /** Fixed reports, calculated by code. */
 export type ReportType = 'finance.summary' | 'orders.status' | 'orders.overdue' | 'combined.report';
 /** "ai.task" is a free-text task answered by the AI provider, using read-only data tools. */
 export type JobType = ReportType | 'ai.task';
 export type JobStatus = 'queued' | 'working' | 'completed' | 'failed';
-export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'dev' | 'chief';
+export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'dev' | 'chief';
 /** Agents that accept a photo with their task (e.g. Carlo writes a caption for a door photo). */
 export const IMAGE_AGENTS: LiveAgentId[] = ['carlo'];
 export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 /** Largest photo accepted, in bytes (the office shrinks photos before sending, so this is rarely reached). */
 export const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
-export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'mika', 'carlo', 'dev', 'chief'];
+export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'mika', 'carlo', 'joy', 'dev', 'chief'];
+/** Agents that take one order picked by a staff member (e.g. Joy answers a customer about their order). */
+export const ORDER_AGENTS: LiveAgentId[] = ['joy'];
+/** An order number as the order system shows it (letters, digits and dashes). */
+export const ORDER_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/;
 
 /** Why a live request did not produce a result. "No records" is NOT an error — see StepResult.empty. */
 export type ErrorCode =
@@ -171,6 +196,10 @@ export interface Job {
    * in server memory just while the task runs and is never stored, logged or sent back.
    */
   image?: { mimeType: string; bytes: number; sha256: string };
+  /** Customer-service tasks: the order a staff member picked for the reply. */
+  orderRef?: string;
+  /** How many phone numbers and email addresses were removed from the request before the AI saw it. */
+  redacted?: number;
   requestedBy: string;
   status: JobStatus;
   createdAt: string;
@@ -214,4 +243,42 @@ export interface AiStatus {
 }
 
 export const MAX_PROMPT_CHARS = 600;
+/** Customer-service tasks carry the customer's whole message, so they may be longer. */
+export const MAX_CS_PROMPT_CHARS = 2000;
+
+/** One carpenter in the Workshop room, with how many open orders they are assigned to. */
+export interface ShopCarpenter {
+  name: string;
+  /** Open orders by status where this carpenter is assigned (as carpenter or hamba carpenter). */
+  inProgress: number;
+  pending: number;
+  finished: number;
+  /** Of those, how many as the hamba (door frame) carpenter. */
+  hamba: number;
+}
+
+/**
+ * The Workshop room: the carpenters assigned to open orders in WAD Order Management (names and
+ * counts only: no customers, order numbers, prices or labor).
+ */
+export interface ShopCounts {
+  /** false when the order system does not return carpenter assignments. */
+  available: boolean;
+  carpenters: ShopCarpenter[];
+  /** Open, not-yet-finished orders with no carpenter assigned. */
+  unassigned: number;
+  /** Status Finished: waiting for delivery. */
+  ready: number;
+  open: number;
+  overdue: number;
+  asOf: string;
+}
+
+/** One open order for the customer-service order picker (names are shown only in the office). */
+export interface OrderPick {
+  ref: string;
+  customer: string | null;
+  status: string;
+  dueDate: string | null;
+}
 export const MAX_RANGE_DAYS = 366;

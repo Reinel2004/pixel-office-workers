@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "hash-password": "tsx scripts/hash-password.ts",
     "gemini-models": "tsx scripts/gemini-models.ts",
-    "test": "tsx --test src/tests/adapters.test.ts src/tests/ai.test.ts src/tests/app.test.ts src/tests/calc.test.ts src/tests/client.test.ts src/tests/runner.test.ts"
+    "test": "tsx --test src/tests/adapters.test.ts src/tests/ai.test.ts src/tests/app.test.ts src/tests/calc.test.ts src/tests/client.test.ts src/tests/facebook.test.ts src/tests/redact.test.ts src/tests/refresher.test.ts src/tests/runner.test.ts"
   },
   "dependencies": {},
   "devDependencies": {

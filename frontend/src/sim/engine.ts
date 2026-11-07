@@ -11,6 +11,7 @@ import {
   LEISURE_SPOTS,
   MEETING_CENTER,
   MEETING_SLOTS,
+  SPOTS,
   STROLL_POINTS,
   buildWalkGrid,
   roomAt,
@@ -18,6 +19,7 @@ import {
   type LeisureSpot,
 } from '../office/layout';
 import { findPath, type Tile } from '../office/pathfinding';
+import { DEMO_SHOP_LOAD, Workshop, type ShopLoad, type ShopNote } from './workshop';
 import type {
   AgentId,
   AgentState,
@@ -187,6 +189,33 @@ export class Engine {
   /** Connected Mode AI status from the live store; `until` (sim ms) ends a done/limited/error flash. */
   private aiLive: { state: AiActivity; label: string; until: number } = { state: 'idle', label: '', until: 0 };
 
+  // ---------------------------------------------------------------- Creative Studio
+  /** The photo Carlo is studying (a data URL kept in this browser only), shown on the easel. */
+  easelPhoto: string | null = null;
+  private easelUntil = 0;
+  /** Scheduled Facebook posts board: null = hidden (demo, or no posting permission). */
+  postBoard: { configured: boolean; count: number | null; next: string | null } | null = null;
+
+  /** Shows a photo on the easel; `ms` > 0 removes it after that long (sim time). */
+  setEaselPhoto(photo: string | null, ms = 0) {
+    this.easelPhoto = photo;
+    this.easelUntil = photo && ms ? this.now + ms : 0;
+    this.emitNow();
+  }
+
+  setPostBoard(b: { configured: boolean; count: number | null; next: string | null } | null) {
+    this.postBoard = b;
+    this.emitNow();
+  }
+
+  /** Cosmetic: walk an agent to a tile (e.g. the Creative Studio easel) while a live step runs. */
+  stageAgentAt(id: AgentId, tile: { x: number; y: number }, face: { x: number; y: number }, activity: string) {
+    const a = this.agentById[id];
+    if (a.busyTaskId) return;
+    a.leisure = null;
+    this.sendTo(a, { tile, face }, activity, null);
+  }
+
   /** Called by the live store whenever Gemini task states change. */
   setAiActivity(state: AiActivity, label = '', ms = 0) {
     this.aiLive = { state, label, until: ms ? this.now + ms : 0 };
@@ -209,6 +238,46 @@ export class Engine {
   random: () => number = Math.random;
 
   private grid = buildWalkGrid();
+
+  // ---------------------------------------------------------------- Workshop
+  /** The shop floor: carpenters that follow the orders per production stage (decoration only). */
+  workshop = new Workshop(this.grid, () => this.random());
+  /** Set by the live store: re-reads the shop numbers from WAD Order Management (Refresh button). */
+  shopRefresh: (() => void) | null = null;
+  /** Paolo (or another agent) checking the shop floor during a live step. */
+  private shopVisit: { id: AgentId; done: boolean; leaveAt: number | null } | null = null;
+
+  setShopLoad(load: ShopLoad | null, note: ShopNote = null) {
+    this.workshop.setLoad(load, note, this.now);
+    this.emitNow();
+  }
+
+  /** Cosmetic: an agent walks to the shop floor while a live step runs. */
+  visitShop(id: AgentId) {
+    const a = this.agentById[id];
+    if (a.busyTaskId) return;
+    a.leisure = null;
+    const t = SPOTS.shopInspect;
+    this.sendTo(a, { tile: t, face: { x: t.x + 1, y: t.y + 1 } }, 'Checking the shop floor', null);
+    this.shopVisit = { id, done: false, leaveAt: null };
+  }
+
+  /** The step finished: look around a few more seconds after arriving, then go back to the desk. */
+  leaveShop(id: AgentId) {
+    if (this.shopVisit?.id === id) this.shopVisit.done = true;
+  }
+
+  private shopVisitTick() {
+    const v = this.shopVisit;
+    if (!v || !v.done) return;
+    const a = this.agentById[v.id];
+    if (a.path.length) return;
+    if (v.leaveAt === null) v.leaveAt = this.now + 6000;
+    else if (this.now >= v.leaveAt) {
+      this.shopVisit = null;
+      this.stageAgent(v.id, 'seat');
+    }
+  }
   private listeners = new Set<Listener>();
   private version = 0;
   private dirty = false;
@@ -253,6 +322,7 @@ export class Engine {
     });
     this.agentById = Object.fromEntries(this.agents.map((a) => [a.id, a])) as Record<AgentId, AgentRT>;
     this.load();
+    if (this.connected) this.workshop.setLoad(null, 'loading');
     for (const a of this.agents) a.nextBreakAt = this.breakDelay();
   }
 
@@ -338,6 +408,9 @@ export class Engine {
         if (Math.round(a.x) !== seat.x || Math.round(a.y) !== seat.y) this.sendTo(a, { seat: true }, 'Returning to desk', null);
       }
     }
+    // Demo Mode shows sample shop numbers; Connected Mode waits for the real ones.
+    this.shopVisit = null;
+    this.workshop.setLoad(mode === 'connected' ? null : DEMO_SHOP_LOAD, 'loading', this.now);
     this.updateSettings({ mode });
     this.addLog(mode === 'connected' ? 'Switched to Connected Mode (read-only live data).' : 'Switched to Demo Mode (simulated data).', 'info');
   }
@@ -491,8 +564,15 @@ export class Engine {
     for (const a of this.agents) this.moveAgent(a, dt / 1000);
     for (const a of this.agents) if (a.bubble && a.bubble.until <= this.now) a.bubble = null;
     this.liveTick();
+    if (this.easelUntil && this.now >= this.easelUntil) {
+      this.easelPhoto = null;
+      this.easelUntil = 0;
+      this.touch();
+    }
     for (const t of this.tasks) if (t.status === 'running' || t.status === 'queued') this.runTask(t, dt);
     this.breakTick(dt);
+    this.workshop.tick(dt, this.now);
+    this.shopVisitTick();
     this.flush();
   }
 

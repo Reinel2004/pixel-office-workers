@@ -61,8 +61,10 @@ test('orders adapter maps statuses, progress and due dates', async () => {
     data: {
       truncated: false,
       payments_available: true,
+      carpenters_available: true,
+      carpenter_roster: ['Ramon ', '', 'Jun', 42],
       orders: [
-        { order_number: 'ORD-1', group_id: 'GRP-1', status: 'Finished', order_date: '2026-10-02', due_date: '2026-10-20', items: 4, items_done: 4, least_stage: 'done', gross_price: '25000.50', downpayment: '10000.00', customer_name: ' Juan Santos ', last_progress_at: '2026-10-18', products: [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'With Varnish', qty: 4, value: '25000.50' }] },
+        { carpenters: [' Ramon', 'Ramon', ''], hamba_carpenters: ['Jun'], order_number: 'ORD-1', group_id: 'GRP-1', status: 'Finished', order_date: '2026-10-02', due_date: '2026-10-20', items: 4, items_done: 4, least_stage: 'done', gross_price: '25000.50', downpayment: '10000.00', customer_name: ' Juan Santos ', last_progress_at: '2026-10-18', products: [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'With Varnish', qty: 4, value: '25000.50' }] },
         { order_number: 'ORD-2', group_id: 'GRP-2', status: 'In Progress', order_date: '2026-10-05', due_date: '0000-00-00', items: 2, items_done: 0, least_stage: null },
         { order_number: 'ORD-3', group_id: 'GRP-3', status: 'Delivered', order_date: '2026-10-06', due_date: null, items: 1, items_done: 1, least_stage: 'done' },
       ],
@@ -85,6 +87,11 @@ test('orders adapter maps statuses, progress and due dates', async () => {
   assert.deepEqual(rows[0].products, [{ category: 'Door', type: 'Carved', wood: 'Narra', finish: 'With Varnish', qty: 4, centavos: 2500050 }]);
   assert.equal(rows[1].products, undefined);
   assert.equal(rows[1].customerName, null);
+  assert.deepEqual(rows[0].carpenters, ['Ramon']);
+  assert.deepEqual(rows[0].hambaCarpenters, ['Jun']);
+  assert.deepEqual(rows[1].carpenters, []);
+  assert.equal(o.capabilities.carpenters, true);
+  assert.deepEqual(o.carpenterRoster, ['Ramon', 'Jun']);
   const open = await o.listOpenOrders();
   assert.match(seen[1].url, /office-orders\.php\?open=1$/);
   assert.deepEqual(open.map((r) => r.ref), ['ORD-1', 'ORD-2']);

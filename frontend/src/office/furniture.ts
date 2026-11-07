@@ -268,6 +268,14 @@ export function drawFurniture(g: G, f: Furniture) {
       faceL(g, y + 0.91, x + 0.75, x + 0.8, 25, 33, 0x8e98a8);
       break;
     }
+    case 'postBoard': {
+      // Cork-style board with a Facebook-blue header; the post cards are drawn live by the scene.
+      faceL(g, y + 0.02, x + 0.05, x + w - 0.05, 10, 32, 0x2a2f3c);
+      faceL(g, y + 0.03, x + 0.1, x + w - 0.1, 11.5, 27.5, 0xd9c6a5);
+      faceL(g, y + 0.03, x + 0.1, x + w - 0.1, 27.5, 30.5, 0x1877f2);
+      faceL(g, y + 0.035, x + 0.18, x + 0.42, 28.3, 29.7, 0xffffff);
+      break;
+    }
     case 'coffeeMaker': {
       shadowUnder(g, x + 0.05, y + 0.1, 0.9, 0.8);
       // wooden cabinet
@@ -459,6 +467,90 @@ export function drawFurniture(g: G, f: Furniture) {
       break;
     case 'meetingChair':
       break;
+    // ---------------------------------------------------------------- Workshop
+    case 'sawTable': {
+      shadowUnder(g, x, y, w, d);
+      for (const [lx, ly] of [[x + 0.15, y + 0.15], [x + w - 0.25, y + 0.15], [x + 0.15, y + d - 0.25], [x + w - 0.25, y + d - 0.25]])
+        box(g, lx, ly, 0.1, 0.1, 0, 11, 0x5c6474, { edge: false });
+      box(g, x + 0.05, y + 0.1, w - 0.1, d - 0.2, 11, 2, 0xaeb6c2, { left: 0x8a929e, right: 0x707884 });
+      // circular blade through the middle of the table, and its guard
+      const c = P(x + w / 2, y + d / 2, 15);
+      g.fillStyle(0xdfe4ea, 1);
+      g.fillEllipse(c.x, c.y, 16, 9);
+      g.lineStyle(1, 0x8a929e, 1);
+      g.strokeEllipse(c.x, c.y, 16, 9);
+      box(g, x + w / 2 - 0.12, y + 0.3, 0.24, 0.4, 15, 4, 0xe0605e, { edge: false });
+      // a board waiting to be cut
+      box(g, x + 0.12, y + 0.55, 0.7, 0.3, 13, 1.6, 0xd2a86e, { edge: false });
+      break;
+    }
+    case 'planer': {
+      shadowUnder(g, x, y, w, d);
+      box(g, x + 0.1, y + 0.15, w - 0.2, d - 0.3, 0, 9, 0x3f6f52, { left: 0x335b43, right: 0x284836 });
+      box(g, x + 0.05, y + 0.1, w - 0.1, d - 0.2, 9, 2, 0x9aa3ae);
+      box(g, x + 0.55, y + 0.2, 0.9, 0.6, 11, 7, 0x4d8a63);
+      cylinder(g, x + 1.55, y + 0.5, 0.08, 11, 4, 0xf2c14e);
+      break;
+    }
+    case 'workbench': {
+      shadowUnder(g, x, y, w, d);
+      for (const [lx, ly] of [[x + 0.12, y + 0.15], [x + w - 0.22, y + 0.15], [x + 0.12, y + d - 0.25], [x + w - 0.22, y + d - 0.25]])
+        box(g, lx, ly, 0.1, 0.1, 0, 10, 0x8b6a4b, { edge: false });
+      box(g, x + 0.1, y + 0.2, w - 0.2, d - 0.4, 3, 1.5, 0x8b6a4b, { edge: false }); // lower shelf
+      box(g, x + 0.05, y + 0.08, w - 0.1, d - 0.16, 10, 3, 0xc99a5e, { left: 0xa47a45, right: 0x86622f });
+      // vise and two orange clamps
+      box(g, x + 0.05, y + d - 0.3, 0.3, 0.25, 9, 4, 0x4a5262, { edge: false });
+      box(g, x + 1.2, y + 0.25, 0.08, 0.5, 13, 3, 0xf08a4b, { edge: false });
+      box(g, x + 1.55, y + 0.25, 0.08, 0.5, 13, 3, 0xf08a4b, { edge: false });
+      break;
+    }
+    case 'varnishTable': {
+      shadowUnder(g, x, y, w, d);
+      box(g, x + 0.1, y + 0.15, w - 0.2, d - 0.3, 0, 10, 0x6d5a45, { left: 0x5a4a38, right: 0x463a2c });
+      box(g, x + 0.05, y + 0.1, w - 0.1, d - 0.2, 10, 1.5, 0x9b8668);
+      // cans of varnish and stain, and a brush
+      cylinder(g, x + 1.55, y + 0.35, 0.09, 11.5, 5, 0xc0392b);
+      cylinder(g, x + 1.75, y + 0.6, 0.09, 11.5, 5, 0x8a5a2b);
+      box(g, x + 1.3, y + 0.62, 0.25, 0.06, 11.5, 1, 0xf2c14e, { edge: false });
+      break;
+    }
+    case 'lumberRack': {
+      shadowUnder(g, x, y, w, d);
+      box(g, x + 0.1, y + 0.05, 0.12, d - 0.1, 0, 34, 0x5c4630, { edge: false }); // back frame
+      const woods = [0xc8955a, 0x9b5a3c, 0xd9b27a, 0x7a4a2e, 0xe2c79a];
+      for (let lvl = 0; lvl < 4; lvl++) {
+        box(g, x + 0.2, y + 0.05, w - 0.3, d - 0.1, 2 + lvl * 8, 1.2, 0x5c4630, { edge: false });
+        for (let j = 0; j < 2; j++) box(g, x + 0.25 + j * 0.3, y + 0.1, 0.26, d - 0.2, 3.2 + lvl * 8, 3, woods[(lvl * 2 + j) % woods.length], { edge: false });
+      }
+      break;
+    }
+    case 'doorRack': {
+      // low frame along the back wall; the finished doors on it are drawn by the scene
+      box(g, x + 0.05, y + 0.25, w - 0.1, 0.5, 0, 3, 0x5c4630, { edge: false });
+      for (let i = 0; i <= 3; i++) box(g, x + 0.05 + i * ((w - 0.15) / 3), y + 0.2, 0.06, 0.06, 0, 26, 0x5c4630, { edge: false });
+      break;
+    }
+  }
+}
+
+/** Order "pieces" on a shop bench: one slab per order at that stage (up to 5), stacked on the top. */
+export function drawBenchPile(g: G, f: Furniture, count: number) {
+  g.clear();
+  const n = Math.min(count, 5);
+  const top = f.kind === 'sawTable' ? 13 : f.kind === 'planer' ? 11 : f.kind === 'workbench' ? 13 : 11.5;
+  const woods = [0xd2a86e, 0xb9804f, 0xe0bf8a, 0xa06a40, 0xcf9d63];
+  for (let i = 0; i < n; i++) box(g, f.x + 0.25 + (i % 2) * 0.05, f.y + 0.2, 0.75, 0.55, top + i * 2, 1.8, woods[i % woods.length]);
+}
+
+/** Finished doors standing in the rack (one per order ready for delivery, up to 8). */
+export function drawDoorRack(g: G, f: Furniture, count: number) {
+  g.clear();
+  const n = Math.min(count, 8);
+  const colors = [0x9b5a3c, 0xc8955a, 0x7a4a2e, 0xb07040];
+  for (let i = 0; i < n; i++) {
+    const gx = f.x + 0.2 + i * ((f.w - 0.4) / 8);
+    box(g, gx, f.y + 0.3, 0.09, 0.45, 3, 28, colors[i % colors.length], { edge: false });
+    faceL(g, f.y + 0.75, gx + 0.02, gx + 0.07, 15, 17, 0xf2c14e); // handle
   }
 }
 

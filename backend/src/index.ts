@@ -9,6 +9,7 @@ import { GeminiClient } from './ai/gemini';
 import { createApp } from './app';
 import { Auth } from './auth';
 import { loadConfig } from './config';
+import { FacebookClient } from './social/facebook';
 import { loadEnvFile } from './env';
 import { ApiClient } from './http/client';
 import { createTaskLog } from './jobs/log';
@@ -43,9 +44,13 @@ const aiStatus = () => ({
 });
 const runner = new JobRunner({ finance, orders, maxConcurrent: config.maxConcurrentJobs, log: taskLog, ai });
 const auth = new Auth(config);
-const app = createApp({ config, auth, runner, finance, orders, aiStatus, log });
+const fb = config.facebook;
+const facebook =
+  fb.pageId && fb.token ? new FacebookClient({ pageId: fb.pageId, token: fb.token, appSecret: fb.appSecret, version: fb.version, timeoutMs: 60_000, log }) : null;
+const app = createApp({ config, auth, runner, finance, orders, aiStatus, facebook, audit: taskLog, log });
 
 for (const p of problems) log(`[config] ${p}`);
+log(`[config] Facebook posting: ${facebook ? `ready (Page ${fb.pageId}, Graph ${fb.version})` : `off — ${fb.problems.join(' ')}`}`);
 for (const s of [finance.status(), orders.status()]) log(`[config] ${s.name}: ${s.state}${s.problems.length ? ` — ${s.problems.join(' ')}` : ''}`);
 log(`[config] AI tasks: ${ai ? `ready (Gemini, model ${config.ai.model})` : 'off — set GEMINI_API_KEY to enable'}`);
 
