@@ -21,6 +21,8 @@ interface State {
   failures: number;
   nextAt: number;
   running: boolean;
+  lastOkAt: number | null;
+  lastErrorAt: number | null;
 }
 
 export class LiveRefresher {
@@ -40,7 +42,7 @@ export class LiveRefresher {
       now?: () => number;
     },
   ) {
-    this.states = sources.map((source) => ({ source, last: null, lastKey: null, failures: 0, nextAt: 0, running: false }));
+    this.states = sources.map((source) => ({ source, last: null, lastKey: null, failures: 0, nextAt: 0, running: false, lastOkAt: null, lastErrorAt: null }));
   }
 
   private now() {
@@ -50,6 +52,22 @@ export class LiveRefresher {
   /** The last value read for a source (sent to a browser when it connects). */
   latest(name: string): unknown {
     return this.states.find((s) => s.source.name === name)?.last ?? null;
+  }
+
+  /** For the Systems Monitor: how each live check is doing. */
+  status() {
+    const iso = (t: number | null) => (t ? new Date(t).toISOString() : null);
+    return {
+      intervalSeconds: Math.round(this.opts.intervalMs / 1000),
+      running: !!this.timer,
+      sources: this.states.map((s) => ({
+        name: s.source.name,
+        failuresInARow: s.failures,
+        lastOkAt: iso(s.lastOkAt),
+        lastErrorAt: iso(s.lastErrorAt),
+        switchedOff: s.lastKey === 'null',
+      })),
+    };
   }
 
   /** Starts the timer if it is not running (called when a browser connects). */
@@ -94,6 +112,7 @@ export class LiveRefresher {
     try {
       const v = await s.source.read();
       s.failures = 0;
+      s.lastOkAt = this.now();
       const key = v === null ? 'null' : JSON.stringify(s.source.fingerprint ? s.source.fingerprint(v) : v);
       if (key !== s.lastKey) {
         const first = s.lastKey === null;
@@ -103,6 +122,7 @@ export class LiveRefresher {
       } else s.last = v;
     } catch (e) {
       s.failures++;
+      s.lastErrorAt = this.now();
       this.opts.log?.(`[live] ${s.source.name} check failed (${s.failures} in a row): ${(e as Error).message}`);
     } finally {
       s.running = false;

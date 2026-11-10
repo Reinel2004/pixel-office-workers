@@ -7,6 +7,7 @@ import { after, before, test } from 'node:test';
 import { FinanceAdapter } from '../adapters/finance';
 import { OrdersAdapter } from '../adapters/orders';
 import { createApp } from '../app';
+import { DiscussionService, DiscussionStore } from '../discuss/discussions';
 import { Auth, hashPassword } from '../auth';
 import { loadConfig } from '../config';
 import { ApiClient } from '../http/client';
@@ -15,6 +16,7 @@ import { JobRunner } from '../jobs/runner';
 let server: Server;
 let base = '';
 let closeApp: () => void;
+let monitor: ReturnType<typeof createApp>['monitor'];
 
 before(async () => {
   const users = `owner:admin:${await hashPassword('correct horse 1')},ops:operations:${await hashPassword('correct horse 2')}`;
@@ -32,8 +34,10 @@ before(async () => {
   const finance = new FinanceAdapter(config.systems.finance, new ApiClient(config.systems.finance, { timeoutMs: 100, maxRetries: 0, fetchImpl }));
   const orders = new OrdersAdapter(config.systems.orders, new ApiClient(config.systems.orders, { timeoutMs: 100, maxRetries: 0, fetchImpl }));
   const runner = new JobRunner({ finance, orders, maxConcurrent: 2 });
-  const app = createApp({ config, auth: new Auth(config), runner, finance, orders });
+  const discussions = new DiscussionService({ ai: null, finance, orders, store: new DiscussionStore(null), knowledgeDir: 'no-such-dir', maxRangeDays: 366 });
+  const app = createApp({ config, auth: new Auth(config), runner, finance, orders, discussions });
   closeApp = app.close;
+  monitor = app.monitor;
   server = createServer(app.handler);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -137,4 +141,43 @@ test('the AI task route accepts a photo-sized request and refuses an oversized o
   assert.equal(tooBig.status, 413);
   const bad = await post('/api/ai/tasks', { agent: 'carlo', prompt: 'Caption', image: 'nope' }, cookie);
   assert.equal(bad.status, 400);
+});
+
+test('the security log counts sign-ins and refusals without addresses or typed usernames', async () => {
+  const before = monitor.security(1);
+  await post('/api/auth/login', { username: 'owner', password: 'wrong password' });
+  await post('/api/auth/login', { username: 'not-a-real-user-xyz', password: 'whatever' });
+  const cookie = await login('ops', 'correct horse 2');
+  await post('/api/jobs', { type: 'finance.summary', range: { from: '2026-10-01', to: '2026-10-31' } }, cookie, false); // no cross-site header
+  const r = await fetch(base + '/api/facebook/status', { headers: { cookie } }); // ops cannot post
+  assert.equal(r.status, 403);
+  await new Promise((res) => setTimeout(res, 50)); // let 'finish' handlers run
+  const s = monitor.security(1) as any;
+  assert.equal(s.signIns.failed - (before as any).signIns.failed, 2);
+  assert.equal(s.signIns.failedByAccount.owner - ((before as any).signIns.failedByAccount.owner ?? 0), 1);
+  assert.equal(s.signIns.failedForUnknownUsernames >= 1, true);
+  assert.ok(s.signIns.ok >= 1);
+  assert.ok(s.crossSiteRequestsBlocked >= 1);
+  assert.ok(s.permissionDeniedByArea.facebook >= 1);
+  const text = JSON.stringify(s);
+  assert.ok(!text.includes('not-a-real-user-xyz') && !text.includes('127.0.0.1') && !text.includes('wrong password'));
+  const h = monitor.health() as any;
+  assert.equal(h.server.mode, 'development');
+  assert.ok(!JSON.stringify(h).includes('test-orders-token-must-stay-secret'));
+});
+
+test('discussion routes: sign-in, cross-site protection, owner-only access, and no AI means no discussion', async () => {
+  assert.equal((await fetch(base + '/api/discussions')).status, 401);
+  const cookie = await login('ops', 'correct horse 2');
+  const list = await fetch(base + '/api/discussions', { headers: { cookie } });
+  assert.equal(list.status, 200);
+  assert.deepEqual((await list.json()).discussions, []);
+  const body = { topic: 'Why are orders delayed?', participants: ['paolo', 'lia'] };
+  assert.equal((await post('/api/discussions', body, cookie, false)).status, 403);
+  const r = await post('/api/discussions', body, cookie);
+  assert.equal(r.status, 503); // GEMINI_API_KEY not set in this test server
+  assert.match((await r.json()).error, /GEMINI_API_KEY/);
+  const other = await fetch(base + '/api/discussions/00000000-0000-4000-8000-000000000000', { headers: { cookie } });
+  assert.equal(other.status, 404);
+  assert.equal((await post('/api/discussions/00000000-0000-4000-8000-000000000000/cancel', {}, cookie)).status, 404);
 });

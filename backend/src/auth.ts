@@ -81,6 +81,14 @@ export class Auth {
     return session;
   }
 
+  /** How many sessions are signed in right now (for the Systems Monitor). */
+  activeCount(): number {
+    const now = Date.now();
+    let n = 0;
+    for (const s of this.sessions.values()) if (s.expiresAt > now) n++;
+    return n;
+  }
+
   get(id: string | undefined): Session | null {
     if (!id) return null;
     const s = this.sessions.get(id);

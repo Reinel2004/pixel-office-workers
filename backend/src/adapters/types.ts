@@ -2,7 +2,7 @@
 // how each system's real fields map onto them is filled in only from its documentation.
 // Customer names and contact details are deliberately not part of these types.
 
-import type { DateRange, SystemId, SystemStatus } from '../../shared/live';
+import type { DateRange, OrderSpec, SystemId, SystemStatus } from '../../shared/live';
 
 export interface FinanceRecord {
   ref: string; // the system's own record reference, shown to the user
@@ -27,6 +27,8 @@ export interface BudgetRecord {
 export interface OrderRecord {
   ref: string; // display reference
   orderId: string; // shared order ID (same value finance records carry), when documented
+  /** The order's record number in WAD Order Management (its page is view_order.php?id=...), when sent. */
+  recordId?: number | null;
   status: string; // raw status text from the system
   /** true/false only when the documented status values say so; null = unknown. */
   isClosed: boolean | null;
@@ -116,4 +118,6 @@ export interface OrderSource {
   listOpenOrders(opts?: OrderListOptions): Promise<OrderRecord[]>;
   /** The carpenter list from the last response, in the order system's order; null if unknown. */
   carpenterRoster?: string[] | null;
+  /** One order's piece specifications (for Tess's inspection checklist); absent when unsupported. */
+  getOrderSpec?(ref: string): Promise<OrderSpec>;
 }

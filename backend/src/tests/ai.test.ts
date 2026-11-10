@@ -203,6 +203,24 @@ test('Gemini is not retried by default: a 503 costs one request and fails clearl
   assert.equal(calls, 1);
 });
 
+test('a task call retries an overloaded model (503) once after a wait, and says clearly when it stays busy', async () => {
+  let calls = 0;
+  const waits: number[] = [];
+  const answer = JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] });
+  const fetchImpl = (async () => (calls++ === 0 ? new Response('{}', { status: 503 }) : new Response(answer, { status: 200 }))) as unknown as typeof fetch;
+  const ai = new GeminiClient({ apiKey: 'k', model: 'm', timeoutMs: 1000, fetchImpl, sleep: async (ms) => void waits.push(ms) });
+  const r = await ai.generate({ contents: [] }, { retries: 1 });
+  assert.equal(r.content.parts.length, 1);
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [4000]);
+
+  let busy = 0;
+  const always503 = (async () => (busy++, new Response('{}', { status: 503 }))) as unknown as typeof fetch;
+  const ai2 = new GeminiClient({ apiKey: 'k', model: 'm', timeoutMs: 1000, fetchImpl: always503, sleep: async () => {} });
+  await assert.rejects(ai2.generate({ contents: [] }, { retries: 1 }), (e: IntegrationError) => e.httpStatus === 503 && /overloaded/.test(e.message));
+  assert.equal(busy, 2, 'one retry only');
+});
+
 test('Rosa reads balances calculated by code; operations users get no balances', async () => {
   const open: OrderRecord[] = [
     { ref: 'ORD-F', orderId: 'F', status: 'Finished', isClosed: false, dueDate: '2026-11-01', progressPercent: 100, stage: 'done', createdDate: '2026-10-01', grossCentavos: 2500000, downpaymentCentavos: 1000000, customerName: 'Juana Dela Cruz' },
@@ -499,4 +517,28 @@ test('Carlo is told the current Manila time and to end with a Schedule line; he 
   const r2 = runner(other.ai);
   await done(r2, r2.submitAi(admin, 'paolo', 'hello').job.id);
   assert.doesNotMatch((other.bodies[0].systemInstruction as any).parts[0].text, /Facebook scheduling/);
+});
+
+test('Sam and Ivy read the systems reports; only admin accounts get those tools', async () => {
+  const health = { server: { mode: 'development' }, systems: [{ id: 'orders', failuresInARowNow: 3, failuresByStatus: { '401': 3 } }] };
+  const g = fakeGemini([
+    { candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'get_system_health', args: {} } }] } }] },
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'The order system token looks wrong (401).' }] } }] },
+  ]);
+  const r = new JobRunner({
+    finance,
+    orders: orders(),
+    maxConcurrent: 1,
+    now: () => new Date('2026-11-05T02:00:00Z'),
+    ai: { ai: g.ai, maxToolRounds: 3, maxRangeDays: 366, knowledgeDir: join(tmpdir(), 'no-such-knowledge-dir'), monitor: { health: () => health, security: (h) => ({ hours: h }) } },
+  });
+  const sysAdmin: SessionUser = { ...admin, permissions: [...admin.permissions, 'system:read'] };
+  const final = await done(r, r.submitAi(sysAdmin, 'sam', 'Is everything working?').job.id);
+  assert.equal(final.status, 'completed');
+  const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
+  assert.equal(resp.systems[0].failuresInARowNow, 3);
+  assert.equal(resp.measuredByServer, true);
+  assert.deepEqual(toolsFor('sam', admin), []); // no system:read
+  assert.deepEqual(toolsFor('ivy', ops), []);
+  assert.deepEqual(toolsFor('ivy', sysAdmin), ['get_security_events', 'get_system_health']);
 });

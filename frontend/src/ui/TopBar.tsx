@@ -4,6 +4,7 @@ import type { Engine } from '../sim/engine';
 import { useLive } from './live/LiveViews';
 import { IconGear, IconMute, IconPause, IconPlay, IconSound } from './icons';
 import { useEngine } from './shared';
+import { AttentionBell, type AttentionOpen } from './live/Attention';
 
 interface Props {
   engine: Engine;
@@ -12,9 +13,11 @@ interface Props {
   onOpenApproval: (taskId: string) => void;
   onResetView: () => void;
   compact: boolean;
+  /** Opens the record an Attention item points to. */
+  onOpenAttention: AttentionOpen;
 }
 
-export function TopBar({ engine, live, onSetMode, onOpenApproval, onResetView, compact }: Props) {
+export function TopBar({ engine, live, onSetMode, onOpenApproval, onResetView, compact, onOpenAttention }: Props) {
   useEngine(engine);
   useLive(live);
   const connected = engine.connected;
@@ -76,6 +79,7 @@ export function TopBar({ engine, live, onSetMode, onOpenApproval, onResetView, c
         <b>{active}</b>
         {compact ? '/8' : ' / 8 active'}
       </span>
+      {connected && live.server === 'signed_in' && <AttentionBell store={live} onOpen={onOpenAttention} />}
       <button
         className={`icon-btn ${engine.paused ? 'is-on' : ''}`}
         onClick={() => engine.setPaused(!engine.paused)}

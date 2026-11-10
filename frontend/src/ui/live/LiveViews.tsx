@@ -8,11 +8,15 @@ import { AGENT_BY_ID } from '../../agents/roster';
 import type { AgentId } from '../../sim/types';
 import type { LiveStore } from '../../live/store';
 import { Empty } from '../ActivityPanel';
-import { IconAlert, IconCamera, IconChevron, IconClose, IconRetry, IconSend } from '../icons';
+import { IconAlert, IconCamera, IconChevron, IconClose, IconRetry, IconScreen, IconSend, IconTeam } from '../icons';
+import { DiscussionList } from '../Discussions';
 import { Avatar } from '../shared';
 import { captionFrom, scheduleFrom } from '../../live/caption';
 import { CarloReadyPost, FacebookComposer, FacebookPanel } from './Facebook';
 import { CopyReply, CustomerReplyPanel } from './CustomerService';
+import { ChecklistPanel } from './Checklist';
+import { UiReviewList } from '../UiReview';
+import { AiUsagePanel } from './AiUsage';
 
 export function useLive(store: LiveStore) {
   return useSyncExternalStore(store.subscribe, store.getVersion);
@@ -49,6 +53,7 @@ const ERROR_HELP: Record<ErrorCode, string> = {
   INVALID_RESPONSE: 'Unexpected response — result rejected',
   RESULT_TOO_LARGE: 'Too many records — use a shorter range',
   DEPENDENCY_FAILED: 'Could not combine — a source failed',
+  AI_LIMIT: "Office AI limit reached — see AI usage in the Systems tab",
   INTERNAL: 'Server error',
 };
 
@@ -88,7 +93,13 @@ const TASK_EXAMPLES: Record<LiveAgentId, string> = {
   mika: 'What sold best in the last 6 months, and where does production slow down?',
   carlo: 'Short caption for this door photo, schedule it Saturday 9am',
   joy: 'Use the "Customer reply" box in Joy\'s panel to paste a message',
+  tess: 'Use the "Inspection checklist" box in Tess\'s panel to pick an order',
   dev: 'Check the order data and give me a fix list',
+  sam: 'Is everything working? Anything slow or failing today?',
+  ivy: 'Any failed or suspicious sign-ins this week?',
+  aya: 'How can we make the order form easier to use on a phone?',
+  rey: 'How would you add a search box to the orders list?',
+  kim: 'Write test steps for adding a new order with a jamb',
   chief: 'What should the team prioritise today?',
 };
 
@@ -98,12 +109,18 @@ export function ConnectedBar({
   agent,
   setAgent,
   focusSignal,
+  onDiscuss,
+  onUiReview,
 }: {
   store: LiveStore;
   onOpenJob: (id: string) => void;
   agent: AgentId;
   setAgent: (id: AgentId) => void;
   focusSignal: number;
+  /** Opens the Team Discussion dialog. */
+  onDiscuss: () => void;
+  /** Opens the UI Review dialog. */
+  onUiReview: () => void;
 }) {
   useLive(store);
   const [text, setText] = useState('');
@@ -258,6 +275,14 @@ export function ConnectedBar({
           <IconSend size={16} />
           <span>Assign</span>
         </button>
+        <button type="button" className="btn" onClick={onDiscuss} disabled={!signedIn} title="Several agents discuss a topic with real AI; Chief summarises">
+          <IconTeam size={16} />
+          <span className="hide-narrow">Team discussion</span>
+        </button>
+        <button type="button" className="btn" onClick={onUiReview} disabled={!signedIn} title="Aya, Kim and Rey review screenshots of a website page">
+          <IconScreen size={16} />
+          <span className="hide-narrow">UI review</span>
+        </button>
       </form>
       {photoNote && takesPhoto && (
         <p className="muted small photo-note" role="alert">
@@ -342,9 +367,33 @@ export function ConnectGate({ store, onDemo }: { store: LiveStore; onDemo: () =>
 }
 
 // ---------------------------------------------------------------- feed (activity / reports / systems)
-export function LiveFeed({ store, open, setOpen, onOpenJob, mobile }: { store: LiveStore; open: boolean; setOpen: (o: boolean) => void; onOpenJob: (id: string) => void; mobile: boolean }) {
+export function LiveFeed({
+  store,
+  open,
+  setOpen,
+  onOpenJob,
+  onOpenDiscussion,
+  onOpenUiReview,
+  mobile,
+}: {
+  store: LiveStore;
+  open: boolean;
+  setOpen: (o: boolean) => void;
+  onOpenJob: (id: string) => void;
+  onOpenDiscussion: (id: string) => void;
+  onOpenUiReview: (id: string) => void;
+  mobile: boolean;
+}) {
   useLive(store);
-  const [tab, setTab] = useState<'activity' | 'reports' | 'systems'>('activity');
+  const [tab, setTab] = useState<'activity' | 'reports' | 'discuss' | 'ui' | 'systems'>('activity');
+  // An Attention link can ask for the Systems tab (connections, AI usage).
+  const request = store.feedTabRequest?.n ?? 0;
+  useEffect(() => {
+    if (!request || !store.feedTabRequest) return;
+    setTab(store.feedTabRequest.tab);
+    setOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request]);
   if (!open)
     return (
       <button className="feed-tab" onClick={() => setOpen(true)} aria-label="Open live activity feed">
@@ -355,9 +404,9 @@ export function LiveFeed({ store, open, setOpen, onOpenJob, mobile }: { store: L
     <aside className={`panel feed ${mobile ? 'sheet' : ''}`} aria-label="Live activity">
       <div className="panel-head">
         <div className="tabs" role="tablist">
-          {(['activity', 'reports', 'systems'] as const).map((t) => (
+          {(['activity', 'reports', 'discuss', 'ui', 'systems'] as const).map((t) => (
             <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>
-              {t === 'activity' ? 'Activity' : t === 'reports' ? 'Reports' : 'Systems'}
+              {t === 'activity' ? 'Activity' : t === 'reports' ? 'Reports' : t === 'discuss' ? 'Discuss' : t === 'ui' ? 'UI' : 'Systems'}
             </button>
           ))}
         </div>
@@ -409,7 +458,32 @@ export function LiveFeed({ store, open, setOpen, onOpenJob, mobile }: { store: L
               ))}
             </ul>
           ))}
-        {tab === 'systems' && <SystemsList systems={store.systems} />}
+        {tab === 'discuss' &&
+          (!store.discussionsLoaded && store.server === 'signed_in' ? (
+            <p className="muted small">Loading discussions…</p>
+          ) : (
+            <>
+              {store.discussionError && <p className="photo-note small">{store.discussionError}</p>}
+              <DiscussionList items={store.discussions} onOpen={onOpenDiscussion} demo={false} />
+            </>
+          ))}
+        {tab === 'ui' && (
+          <>
+            {store.uiReviewError && <p className="photo-note small">{store.uiReviewError}</p>}
+            <UiReviewList
+              items={store.uiReviews}
+              onOpen={onOpenUiReview}
+              demo={false}
+              note={store.user && !store.user.permissions.includes('ui:review') ? 'UI Review is for admin and manager accounts.' : null}
+            />
+          </>
+        )}
+        {tab === 'systems' && (
+          <div className="stack">
+            <AiUsagePanel store={store} />
+            <SystemsList systems={store.systems} />
+          </div>
+        )}
       </div>
     </aside>
   );
@@ -587,6 +661,8 @@ const TOOL_LABEL: Record<string, string> = {
   get_production_pipeline: 'Production pipeline',
   get_finance_trends: 'Finance trends',
   get_data_checks: 'Data checks',
+  get_system_health: 'System health',
+  get_security_events: 'Security events',
   selected_order: 'Selected order',
 };
 
@@ -815,7 +891,13 @@ const LIVE_ROLE: Record<LiveAgentId, string> = {
   mika: 'Data Analyst — trends over time: orders by month, best-selling products, production bottlenecks, and monthly income vs. expenses. Order values only for accounts with finance access.',
   carlo: 'Marketing — writes captions and posts (no live data).',
   joy: 'Customer Service — drafts replies to customer messages. Reads only the one order you pick; phone numbers and emails are removed before the AI sees the message. You copy and send the reply yourself.',
+  tess: 'Quality Control — builds an inspection checklist by code from the order\'s specifications in WAD Order Management (dimensions, design, wood, finish, jamb, and hardware from the notes). Anything the order does not record is marked "confirm with sales". The AI sees the checklist, never the staff notes.',
   dev: 'Data quality — checks WAD Order Management by code for missing due dates, odd statuses, In Progress orders with no carpenter, missing labor, pieces with no price, finished orders with no downpayment (finance accounts) and possible double entries, then writes a fix list. He reads only; you correct the records in the order system.',
+  sam: 'Systems Monitor — reads the office server\'s own measurements: whether the order system, finance system, Gemini and Facebook answer, how fast, and which errors; plus live updates and the server. Admin accounts only. No secrets.',
+  ivy: 'Security Officer — reads sign-ins (ok, failed, locked), blocked cross-site requests, permission denials and risky settings. Client addresses are never stored. Admin accounts only.',
+  aya: 'UI/UX Designer — reviews screenshots of a page in a UI Review: layout, navigation, readability and mobile. She never opens the website.',
+  rey: 'Developer — turns the UI Review findings into a change plan and a brief you paste into your coding tool (e.g. Claude Code in VS Code). He cannot change code or deploy.',
+  kim: 'QA Tester — finds usability problems in a UI Review, then compares your "after" screenshots with the accepted changes and says whether it is ready to release.',
   chief: 'Coordinator — combines both systems; reports link records only by a verified order ID.',
 };
 
@@ -850,6 +932,10 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
       )}
       {agent === 'carlo' && <FacebookPanel store={store} />}
       {agent === 'joy' && <CustomerReplyPanel store={store} onOpenJob={onOpenJob} />}
+      {agent === 'tess' && <ChecklistPanel store={store} onOpenJob={onOpenJob} />}
+      {(agent === 'aya' || agent === 'rey' || agent === 'kim') && (
+        <p className="muted small">UI Review: click "UI review" in the bottom bar and upload screenshots of a page. Reviews are in the "UI" tab.</p>
+      )}
     </section>
   );
 }
@@ -859,7 +945,7 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
  * JPEG. This keeps uploads small and fast, and drops the camera's hidden data (EXIF, such as GPS
  * location) because only the pixels are redrawn.
  */
-export async function shrinkPhoto(file: File): Promise<string> {
+export async function shrinkPhoto(file: File, maxBytes = 2.5 * 1024 * 1024): Promise<string> {
   if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Choose a JPEG, PNG or WebP photo.');
   if (file.size > 25 * 1024 * 1024) throw new Error('That photo is too large (over 25 MB).');
   const url = URL.createObjectURL(file);
@@ -884,7 +970,7 @@ export async function shrinkPhoto(file: File): Promise<string> {
     ctx.drawImage(img, 0, 0, w, h);
     for (const q of [0.85, 0.7, 0.55]) {
       const data = canvas.toDataURL('image/jpeg', q);
-      if (data.length * 0.75 <= 2.5 * 1024 * 1024) return data;
+      if (data.length * 0.75 <= maxBytes) return data;
     }
     throw new Error('That photo is still too large after shrinking. Try a smaller one.');
   } finally {

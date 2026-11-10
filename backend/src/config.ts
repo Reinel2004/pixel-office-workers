@@ -2,7 +2,7 @@
 // Bearer token (FINANCE_API_TOKEN / ORDERS_API_TOKEN). Tokens stay on the server: they are only
 // ever placed in the Authorization header of requests to that system's approved base URL.
 
-import type { Permission, SystemId } from '../shared/live';
+import type { AiLimits, Permission, SystemId } from '../shared/live';
 import { MAX_RANGE_DAYS, SYSTEM_NAMES } from '../shared/live';
 
 export interface AppUser {
@@ -48,6 +48,14 @@ export interface AppConfig {
   liveRefreshMs: number;
   maxRangeDays: number;
   taskLogFile: string | null;
+  /** Team discussions are saved here (JSON); null = kept in memory only. */
+  discussionsFile: string | null;
+  /** UI Reviews are saved here (JSON, without the screenshots); null = kept in memory only. */
+  uiReviewsFile: string | null;
+  /** AI usage totals and office-set limits are saved here (JSON); null = memory only. */
+  aiUsageFile: string | null;
+  /** Default AI usage limits and prices (an admin can change them in the office). */
+  aiLimits: AiLimits;
   /** Folder of the built front end to serve, or null for an API-only server (front end hosted elsewhere, e.g. Vercel). */
   staticDir: string | null;
   /** Behind a reverse proxy (Render, Vercel rewrites): take the client address from X-Forwarded-For. */
@@ -69,8 +77,11 @@ export interface AiConfig {
 }
 
 export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
-  admin: ['finance:read', 'orders:read', 'social:post'],
-  manager: ['finance:read', 'orders:read'],
+  /** system:read = the Systems team (Sam and Ivy): server health and security events. */
+  /** ui:review = UI Review in the Development Studio (Aya, Kim and Rey look at page screenshots). */
+  /** ai:usage = see the AI usage tracker; ai:limits = change its limits and prices. */
+  admin: ['finance:read', 'orders:read', 'social:post', 'system:read', 'ui:review', 'ai:usage', 'ai:limits'],
+  manager: ['finance:read', 'orders:read', 'ui:review', 'ai:usage'],
   finance: ['finance:read'],
   operations: ['orders:read'],
   /** Can post to the Facebook Page (with Carlo); no business data. */
@@ -163,6 +174,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
     liveRefreshMs: env.LIVE_REFRESH_SECONDS?.trim() === '0' ? 0 : int(env.LIVE_REFRESH_SECONDS, 120, 60, 3600) * 1000,
     maxRangeDays: int(env.REPORT_MAX_RANGE_DAYS, MAX_RANGE_DAYS, 1, MAX_RANGE_DAYS),
     taskLogFile: env.TASK_LOG_FILE === '' ? null : env.TASK_LOG_FILE || 'logs/tasks.jsonl',
+    discussionsFile: env.DISCUSSIONS_FILE === undefined ? 'data/discussions.json' : env.DISCUSSIONS_FILE.trim() || null,
+    uiReviewsFile: env.UI_REVIEWS_FILE === undefined ? 'data/ui-reviews.json' : env.UI_REVIEWS_FILE.trim() || null,
+    aiUsageFile: env.AI_USAGE_FILE === undefined ? 'data/ai-usage.json' : env.AI_USAGE_FILE.trim() || null,
+    aiLimits: aiLimits(env, problems),
     staticDir: env.STATIC_DIR || null,
     facebook: facebookConfig(env),
     trustProxy: env.TRUST_PROXY === 'true',
@@ -182,6 +197,34 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
   }
   if (production && !config.cookieSecure) problems.push('APP_COOKIE_SECURE is false in production — sessions would travel over plain http.');
   return { config, problems };
+}
+
+/**
+ * Default AI limits. Empty or "off" = no limit. Requests per day default to 500 so a mistake can
+ * never run up thousands of requests; prices default to none (no cost estimate).
+ */
+function aiLimits(env: NodeJS.ProcessEnv, problems: string[]): AiLimits {
+  const read = (key: string, def: number | null, max: number, whole: boolean): number | null => {
+    const raw = env[key]?.trim();
+    if (raw === undefined) return def;
+    if (raw === '' || raw.toLowerCase() === 'off') return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0 || n > max || (whole && !Number.isInteger(n))) {
+      problems.push(`${key} must be ${whole ? 'a whole number' : 'a number'} from 0 to ${max} (or empty for no limit); using ${def ?? 'no limit'}.`);
+      return def;
+    }
+    return n;
+  };
+  const warn = read('AI_USAGE_WARN_PERCENT', 80, 100, true);
+  return {
+    dailyRequests: read('AI_DAILY_REQUEST_LIMIT', 500, 100_000, true),
+    userDailyRequests: read('AI_USER_DAILY_REQUEST_LIMIT', null, 100_000, true),
+    dailyTokens: read('AI_DAILY_TOKEN_LIMIT', null, 1_000_000_000, true),
+    monthlyBudgetUsd: read('AI_MONTHLY_BUDGET_USD', null, 100_000, false),
+    inputUsdPerMillion: read('AI_PRICE_INPUT_USD_PER_M', null, 1_000, false),
+    outputUsdPerMillion: read('AI_PRICE_OUTPUT_USD_PER_M', null, 1_000, false),
+    warnPercent: warn !== null && warn >= 50 ? warn : 80,
+  };
 }
 
 function facebookConfig(env: NodeJS.ProcessEnv): FacebookConfig {

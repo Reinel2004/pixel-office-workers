@@ -10,6 +10,9 @@ import type { AgentId, RoomId, Selection, TaskOutput } from '../sim/types';
 import type { LiveStore } from '../live/store';
 import { Empty } from './ActivityPanel';
 import { JobDetail, LiveAgentSection } from './live/LiveViews';
+import { DiscussionDetail } from './Discussions';
+import { UiReviewDetail } from './UiReview';
+import { DemoChecklistPanel } from './live/Checklist';
 import { IconAlert, IconCheck, IconClose, IconCopy, IconRetry, IconSend, IconTarget } from './icons';
 import { Avatar, StateChip, StatusChip, clock, timeAgo, useEngine } from './shared';
 
@@ -41,6 +44,28 @@ export function DetailPanel({ engine, selection, setSelection, onAssign, onLocat
       <JobDetail store={live} job={j} onOpenAgent={(id) => setSelection({ kind: 'agent', id })} />
     ) : (
       <Empty title="Report not found" text="Live reports are kept on the server for the current session only." />
+    );
+  } else if (selection.kind === 'discussion') {
+    title = 'Team discussion';
+    // Connected Mode shows only the server's discussions; Demo Mode only the browser's samples.
+    const d = engine.connected ? live.discussions.find((x) => x.id === selection.id) : engine.demoTalks.get(selection.id);
+    body = d ? (
+      <DiscussionDetail
+        d={d}
+        onCancel={() => (d.mode === 'demo' ? engine.cancelDemoDiscussion(d.id) : void live.cancelDiscussion(d.id))}
+        onOpenAgent={(id) => setSelection({ kind: 'agent', id })}
+      />
+    ) : (
+      <Empty title="Discussion not found" text={engine.connected ? 'It may belong to another account or Demo Mode.' : 'It may belong to Connected Mode.'} />
+    );
+  } else if (selection.kind === 'uireview') {
+    title = 'UI Review';
+    // Connected Mode shows only the server's reviews; Demo Mode only the browser's samples.
+    const r = engine.connected ? live.uiReviews.find((x) => x.id === selection.id) : engine.demoReviews.get(selection.id);
+    body = r ? (
+      <UiReviewDetail r={r} engine={engine} live={live} onOpenAgent={(id) => setSelection({ kind: 'agent', id })} />
+    ) : (
+      <Empty title="UI Review not found" text={engine.connected ? 'It may belong to another account or Demo Mode.' : 'It may belong to Connected Mode.'} />
     );
   } else {
     const t = engine.tasks.find((x) => x.id === selection.id);
@@ -124,6 +149,7 @@ function AgentDetail({
         {queued.length > 0 && <p className="muted small">{queued.length} queued task{queued.length > 1 ? 's' : ''} waiting for this agent.</p>}
       </section>
       )}
+      {!engine.connected && id === 'tess' && <DemoChecklistPanel engine={engine} />}
 
       {!engine.connected && state === 'error' && task && (
         <div className="notice error">

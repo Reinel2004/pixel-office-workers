@@ -4,9 +4,14 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
-import type { AiStatus, DateRange, Job, LiveAgentId, OrderPick, Permission, ReportType, SessionUser } from '../shared/live';
+import type { AiStatus, DateRange, Discussion, DiscussionInput, Job, LiveAgentId, OrderPick, Permission, ReportType, SessionUser, UiReview, UiReviewInput, UiVerifyInput } from '../shared/live';
+import { ORDER_REF_PATTERN, UI_REVIEW_LIMITS } from '../shared/live';
+import { buildChecklist } from '../shared/qc';
+import { UiReviewError, type UiReviewService } from './uireview/uireview';
 import { shopCounts } from './reports/calc';
 import { LiveRefresher } from './live/refresher';
+import { HealthLog, SecurityLog } from './monitor/monitor';
+import { DiscussionError, type DiscussionService } from './discuss/discussions';
 import { FB_MAX_SCHEDULE_DAYS, FB_MIN_SCHEDULE_MINUTES, MAX_IMAGE_BYTES, MAX_POST_CHARS, type FacebookStatus } from '../shared/live';
 import { FacebookClient, FacebookError, type PostResult } from './social/facebook';
 import { manilaDate, validateRange } from '../shared/manila';
@@ -15,6 +20,9 @@ import { Auth, SESSION_COOKIE, parseCookies } from './auth';
 import type { AppConfig } from './config';
 import { JOB_DEFS, JobRunner, SubmitError, checkImage, jobTypesFor } from './jobs/runner';
 import { IntegrationError } from './http/errors';
+import { validateLimits, type AiUsageMeter } from './ai/usage';
+import { buildAttention, ordersWebUrl } from './attention/attention';
+import type { OrderRecord } from './adapters/types';
 
 export interface AppDeps {
   config: AppConfig;
@@ -28,6 +36,14 @@ export interface AppDeps {
   facebook?: FacebookClient | null;
   /** Task log (who posted what, when; never the token or photo). */
   audit?: (entry: Record<string, unknown>) => void;
+  /** Response times and failures of outgoing calls (for the Systems Monitor). */
+  health?: HealthLog;
+  /** Team discussions (bounded multi-agent AI); absent when not wired (e.g. some tests). */
+  discussions?: DiscussionService | null;
+  /** UI Review (Aya, Kim, Rey); absent when not wired. */
+  uiReviews?: UiReviewService | null;
+  /** AI usage tracker (requests, tokens, limits); absent when not wired. */
+  aiUsage?: AiUsageMeter | null;
   log?: (line: string) => void;
 }
 
@@ -104,6 +120,31 @@ export function createApp(deps: AppDeps) {
   // config.liveRefreshMs, only while someone has the office open; changes are pushed to each open
   // office whose account may see them.
   const LIVE_PERMISSION: Record<string, Permission> = { shop: 'orders:read', 'fb-scheduled': 'social:post' };
+  // The open orders are read for the Workshop, Joy's picker and the Attention list. The last read is
+  // kept for a few minutes so the Attention list normally needs no extra request.
+  let openCache: { at: number; orders: OrderRecord[] } | null = null;
+  let openFail: { at: number; error: string } | null = null;
+  let openInflight: Promise<OrderRecord[]> | null = null;
+  const readOpen = async () => {
+    const orders = await deps.orders.listOpenOrders();
+    openCache = { at: Date.now(), orders };
+    openFail = null;
+    return orders;
+  };
+  const cachedOpen = async (): Promise<{ orders: OrderRecord[] | null; error: string | null }> => {
+    if (deps.orders.status().state !== 'ready') return { orders: null, error: null }; // shown as a connection problem instead
+    const fresh = Math.max(config.liveRefreshMs * 1.5, 180_000);
+    if (openCache && Date.now() - openCache.at < fresh) return { orders: openCache.orders, error: null };
+    if (openFail && Date.now() - openFail.at < 60_000) return { orders: openCache?.orders ?? null, error: openFail.error };
+    openInflight ??= readOpen().finally(() => (openInflight = null));
+    try {
+      return { orders: await openInflight, error: null };
+    } catch (e) {
+      const error = e instanceof IntegrationError ? e.message : 'The order system could not be read.';
+      openFail = { at: Date.now(), error };
+      return { orders: openCache?.orders ?? null, error };
+    }
+  };
   const liveEvent = (name: string, v: unknown) => `event: ${name}\ndata: ${JSON.stringify(name === 'shop' ? { shop: v } : { posts: v })}\n\n`;
   const refresher = new LiveRefresher(
     [
@@ -111,7 +152,7 @@ export function createApp(deps: AppDeps) {
         name: 'shop',
         read: async () => {
           if (deps.orders.status().state !== 'ready') return null;
-          const open = await deps.orders.listOpenOrders();
+          const open = await readOpen();
           return shopCounts(open, deps.orders.carpenterRoster ?? null, deps.orders.capabilities.carpenters === true, manilaDate(), new Date().toISOString());
         },
         fingerprint: (v) => ({ ...(v as Record<string, unknown>), asOf: undefined }),
@@ -129,6 +170,97 @@ export function createApp(deps: AppDeps) {
       log: deps.log,
     },
   );
+
+  // ---------------------------------------------------------------- Systems team (Sam, Ivy)
+  const security = new SecurityLog();
+  const startedAt = Date.now();
+  /** Refused requests, classified once the response is sent (sign-ins are recorded in their route). */
+  const noteRefusal = (req: IncomingMessage, res: ServerResponse, path: string, source: string) => {
+    const code = res.statusCode;
+    if (path === '/api/auth/login' && code !== 403) return;
+    const user = session(req)?.user.username ?? null;
+    if (code === 403) {
+      const mutating = req.method !== 'GET' && req.method !== 'HEAD';
+      security.record(mutating && !csrfOk(req) ? 'csrf_blocked' : 'permission_denied', { user, source, path });
+    } else if (code === 429) security.record('rate_limited', { user, source, path });
+    else if (code === 401 && path !== '/api/auth/me' && path !== '/api/events') security.record('not_signed_in', { source, path });
+  };
+  const healthReport = () => {
+    const sys = (id: 'orders' | 'finance') => {
+      const st = id === 'orders' ? deps.orders.status() : deps.finance.status();
+      return { id, name: st.name, setup: st.state, problems: st.problems, ...(deps.health?.summary(id) ?? {}) };
+    };
+    const ai = aiStatus();
+    return {
+      asOf: new Date().toISOString(),
+      server: {
+        mode: config.production ? 'production' : 'development',
+        uptimeMinutes: Math.round((Date.now() - startedAt) / 60_000),
+        memoryMB: Math.round(process.memoryUsage().rss / 1_048_576),
+        nodeVersion: process.version,
+        signedInSessions: auth.activeCount(),
+        openOffices: streams.size,
+      },
+      systems: [sys('orders'), sys('finance')],
+      ai: {
+        setup: ai.ready ? 'ready' : 'not_configured',
+        model: ai.model,
+        problems: ai.problems,
+        ...(deps.health?.summary('gemini') ?? {}),
+        ...(deps.aiUsage ? { usage: deps.aiUsage.summary() } : {}),
+      },
+      facebook: {
+        setup: deps.facebook ? 'ready' : 'not_configured',
+        problems: deps.facebook ? [] : config.facebook.problems,
+        appSecretProof: !!config.facebook.appSecret,
+        ...(deps.health?.summary('facebook') ?? {}),
+      },
+      liveUpdates: refresher.status(),
+      tasks: runner.stats(),
+      notes: [
+        'Request counts and times cover the last 24 hours since the server started; they are kept in memory only and reset on restart.',
+        'failuresByStatus: 401/403 usually mean a wrong or expired token, 429 too many requests, 5xx a problem on that system, TIMEOUT or NETWORK that it could not be reached.',
+      ],
+    };
+  };
+  const securityReport = (hours: number) => {
+    const warnings: string[] = [];
+    if (config.production && !config.cookieSecure) warnings.push('Production without secure cookies (APP_COOKIE_SECURE should be true).');
+    if (config.production && !config.appOrigin) warnings.push('APP_ORIGIN is not set in production.');
+    if (config.production && config.allowInsecureLocal) warnings.push('Insecure local connections are allowed in production.');
+    if (deps.facebook && !config.facebook.appSecret) warnings.push('Facebook App Secret is not set, so requests are sent without appsecret_proof.');
+    const admins = config.users.filter((u) => u.role === 'admin').length;
+    if (admins > 3) warnings.push(`${admins} accounts have the admin role; consider fewer.`);
+    return {
+      asOf: new Date().toISOString(),
+      ...security.summary(hours),
+      settings: {
+        mode: config.production ? 'production' : 'development',
+        secureCookies: config.cookieSecure,
+        appOriginSet: !!config.appOrigin,
+        behindProxy: config.trustProxy,
+        accounts: config.users.length,
+        accountsByRole: config.users.reduce<Record<string, number>>((m, u) => ((m[u.role] = (m[u.role] ?? 0) + 1), m), {}),
+        sessionHours: Math.round(config.sessionTtlMs / 3_600_000),
+        warnings,
+      },
+      notes: [
+        'Events are kept in server memory for up to 7 days and reset on restart. Client addresses are never stored, only an anonymous fingerprint to count distinct sources.',
+        'A few failed sign-ins are normal (typos). Many failures from one source, or for usernames that do not exist, can mean someone is guessing passwords.',
+      ],
+    };
+  };
+  const monitor = { health: healthReport, security: securityReport };
+
+  // Team discussions: progress goes only to the owner's open offices.
+  deps.discussions?.on('discussion', (d: Discussion) => {
+    for (const [res, s] of streams) if (s.user.username === d.owner) res.write(`event: discussion\ndata: ${JSON.stringify(d)}\n\n`);
+  });
+
+  // UI Reviews: progress goes only to the owner's open offices (never the screenshots).
+  deps.uiReviews?.on('review', (r: UiReview) => {
+    for (const [res, s] of streams) if (s.user.username === r.owner) res.write(`event: uireview\ndata: ${JSON.stringify(r)}\n\n`);
+  });
 
   const heartbeat = setInterval(() => {
     for (const [res, s] of streams) {
@@ -177,8 +309,18 @@ export function createApp(deps: AppDeps) {
       const password = typeof body.password === 'string' ? body.password.slice(0, 256) : '';
       if (!username || !password) return send(res, 400, { error: 'Enter your username and password.' });
       const s = await auth.login(username, password, clientKey(req, config.trustProxy));
-      if (s === 'throttled') return send(res, 429, { error: 'Too many failed sign-in attempts. Try again in a few minutes.' });
-      if (!s) return send(res, 401, { error: 'Incorrect username or password.' });
+      // Security log: a real account name only; what someone typed for an unknown account is not kept.
+      const known = config.users.some((u) => u.username === username);
+      const who = { user: known ? username : null, unknownUser: !known, source: clientKey(req, config.trustProxy), path };
+      if (s === 'throttled') {
+        security.record('login_throttled', who);
+        return send(res, 429, { error: 'Too many failed sign-in attempts. Try again in a few minutes.' });
+      }
+      if (!s) {
+        security.record('login_failed', who);
+        return send(res, 401, { error: 'Incorrect username or password.' });
+      }
+      security.record('login_ok', who);
       deps.log?.(`[auth] sign-in ok user=${s.user.username}`);
       return send(res, 200, { user: s.user }, { 'Set-Cookie': auth.cookie(s) });
     }
@@ -205,7 +347,8 @@ export function createApp(deps: AppDeps) {
         // Room for one photo (base64 is about 4/3 of the photo's size).
         body = await readJson(req, Math.ceil((MAX_IMAGE_BYTES * 4) / 3) + 64 * 1024);
       } catch {
-        return send(res, 413, { error: 'The request is too large. Use a smaller photo.' });
+        // The rest of the upload is never read, so this connection cannot be reused: close it.
+        return send(res, 413, { error: 'The request is too large. Use a smaller photo.' }, { Connection: 'close' });
       }
       if (typeof body.agent !== 'string' || typeof body.prompt !== 'string') return send(res, 400, { error: 'Choose an agent and type a task.' });
       const img = body.image as { mimeType?: unknown; data?: unknown } | undefined;
@@ -226,13 +369,73 @@ export function createApp(deps: AppDeps) {
         throw e;
       }
     }
+    // AI usage tracker: totals for admin and manager accounts; limits and prices for admins.
+    if (path === '/api/ai/usage' && method === 'GET') {
+      if (!s.user.permissions.includes('ai:usage')) return send(res, 403, { error: 'Your account cannot see AI usage.' });
+      if (!deps.aiUsage) return send(res, 503, { error: 'AI usage tracking is not available on this server.' });
+      return send(res, 200, { usage: deps.aiUsage.report(s.user) });
+    }
+    if (path === '/api/ai/usage/limits' && method === 'POST') {
+      if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      if (!s.user.permissions.includes('ai:limits')) return send(res, 403, { error: 'Only admin accounts can change AI limits.' });
+      if (!deps.aiUsage) return send(res, 503, { error: 'AI usage tracking is not available on this server.' });
+      let body: Record<string, unknown>;
+      try {
+        body = await readJson(req, 4 * 1024);
+      } catch {
+        return send(res, 400, { error: 'Invalid request body.' });
+      }
+      const before = deps.aiUsage.limits;
+      if (body.reset === true) deps.aiUsage.setLimits(null);
+      else {
+        const v = validateLimits(body.limits);
+        if ('error' in v) return send(res, 400, { error: v.error });
+        deps.aiUsage.setLimits(v.limits);
+      }
+      deps.audit?.({ event: 'ai-usage.limits', user: s.user.username, reset: body.reset === true, before, after: deps.aiUsage.limits, at: new Date().toISOString() });
+      deps.log?.(`[ai-usage] limits ${body.reset === true ? 'reset to defaults' : 'changed'} by ${s.user.username}`);
+      return send(res, 200, { usage: deps.aiUsage.report(s.user) });
+    }
+    // Attention needed: failed connections, blocked work, AI limits and overdue orders, for this user.
+    if (path === '/api/attention' && method === 'GET') {
+      const report = await buildAttention(s.user, {
+        systems,
+        health: deps.health,
+        aiStatus,
+        facebookProblems: () => (deps.facebook ? [] : config.facebook.problems.length ? config.facebook.problems : ['Facebook posting is not set up.']),
+        jobs: (u) => runner.list(u),
+        discussions: deps.discussions ? (u) => deps.discussions!.list(u) : undefined,
+        uiReviews: deps.uiReviews && s.user.permissions.includes('ui:review') ? (u) => deps.uiReviews!.list(u) : undefined,
+        aiUsage: deps.aiUsage,
+        openOrders: cachedOpen,
+        ordersWebUrl: ordersWebUrl(config.systems.orders.baseUrl),
+      });
+      return send(res, 200, { attention: report });
+    }
     if (path.startsWith('/api/facebook/')) return handleFacebook(req, res, path, method, s.user);
+    if (path === '/api/discussions' || path.startsWith('/api/discussions/')) return handleDiscussions(req, res, path, method, s.user);
+    if (path === '/api/ui-reviews' || path.startsWith('/api/ui-reviews/')) return handleUiReviews(req, res, path, method, s.user);
+
+    // Tess's inspection checklist for one order, built by code from its piece specifications.
+    if (path === '/api/orders/checklist' && method === 'GET') {
+      if (!s.user.permissions.includes('orders:read')) return send(res, 403, { error: 'Your account cannot read orders.' });
+      const ref = url.searchParams.get('order') ?? '';
+      if (!ORDER_REF_PATTERN.test(ref)) return send(res, 400, { error: 'That order number is not valid.' });
+      if (!deps.orders.getOrderSpec) return send(res, 503, { error: 'This server cannot read order specifications.' });
+      try {
+        const spec = await deps.orders.getOrderSpec(ref);
+        return send(res, 200, { checklist: buildChecklist(spec, new Date().toISOString()) });
+      } catch (e) {
+        if (e instanceof IntegrationError) return send(res, e.code === 'NOT_SUPPORTED' ? 404 : 502, { error: e.message, code: e.code });
+        throw e;
+      }
+    }
 
     // The Workshop room: how many open orders are at each production stage (counts only).
     if (path === '/api/orders/workshop' && method === 'GET') {
       if (!s.user.permissions.includes('orders:read')) return send(res, 403, { error: 'Your account cannot read orders.' });
       try {
-        const open = await deps.orders.listOpenOrders();
+        const open = await readOpen();
         const available = deps.orders.capabilities.carpenters === true;
         return send(res, 200, { shop: shopCounts(open, deps.orders.carpenterRoster ?? null, available, manilaDate(), new Date().toISOString()) });
       } catch (e) {
@@ -245,7 +448,7 @@ export function createApp(deps: AppDeps) {
     if (path === '/api/orders/open' && method === 'GET') {
       if (!s.user.permissions.includes('orders:read')) return send(res, 403, { error: 'Your account cannot read orders.' });
       try {
-        const open = await deps.orders.listOpenOrders();
+        const open = await readOpen();
         const orders: OrderPick[] = open
           .map((o) => ({ ref: o.ref, customer: o.customerName?.trim() || null, status: o.status, dueDate: o.dueDate }))
           .sort((a, b) => (a.customer ?? '\uffff').localeCompare(b.customer ?? '\uffff') || a.ref.localeCompare(b.ref))
@@ -321,6 +524,105 @@ export function createApp(deps: AppDeps) {
     throw e;
   }
 
+  /**
+   * Team discussions. Every route is limited to the signed-in owner; the discussion itself only
+   * ever sees data this user's permissions allow (checked when the evidence is gathered).
+   */
+  async function handleDiscussions(req: IncomingMessage, res: ServerResponse, path: string, method: string, user: SessionUser) {
+    const svc = deps.discussions;
+    if (!svc) return send(res, 503, { error: 'Team discussions are not available on this server.' });
+    if (path === '/api/discussions' && method === 'GET') return send(res, 200, { discussions: svc.list(user) });
+    if (path === '/api/discussions' && method === 'POST') {
+      if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      let body: Record<string, unknown>;
+      try {
+        body = await readJson(req, 8 * 1024);
+      } catch {
+        return send(res, 400, { error: 'Invalid request body.' });
+      }
+      try {
+        const { discussion, deduplicated } = svc.start(user, body as unknown as DiscussionInput);
+        return send(res, deduplicated ? 200 : 202, { discussion, deduplicated });
+      } catch (e) {
+        if (e instanceof DiscussionError) return send(res, e.status, { error: e.message, ...(e.existingId ? { existingId: e.existingId } : {}) });
+        throw e;
+      }
+    }
+    const one = path.match(/^\/api\/discussions\/([0-9a-f-]{36})(\/cancel)?$/);
+    if (one && method === 'GET' && !one[2]) {
+      const d = svc.get(user, one[1]);
+      return d ? send(res, 200, { discussion: d }) : send(res, 404, { error: 'Discussion not found.' });
+    }
+    if (one && method === 'POST' && one[2]) {
+      if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      const d = svc.cancel(user, one[1]);
+      return d ? send(res, 200, { discussion: d }) : send(res, 404, { error: 'Discussion not found.' });
+    }
+    return send(res, 404, { error: 'Not found.' });
+  }
+
+  /**
+   * UI Review. Every route is limited to the signed-in owner and the ui:review permission.
+   * Screenshots are checked and kept in server memory only; the office never opens the page.
+   */
+  async function handleUiReviews(req: IncomingMessage, res: ServerResponse, path: string, method: string, user: SessionUser) {
+    if (!user.permissions.includes('ui:review')) return send(res, 403, { error: 'Your account cannot use UI Review.' });
+    const svc = deps.uiReviews;
+    if (!svc) return send(res, 503, { error: 'UI Review is not available on this server.' });
+    const fail = (e: unknown) => {
+      if (e instanceof UiReviewError) return send(res, e.status, { error: e.message, ...(e.existingId ? { existingId: e.existingId } : {}) });
+      throw e;
+    };
+    const body = async (): Promise<Record<string, unknown> | null> => {
+      try {
+        // Room for the screenshots (base64 is about 4/3 of their size).
+        return await readJson(req, Math.ceil((UI_REVIEW_LIMITS.maxTotalBytes * 4) / 3) + 64 * 1024);
+      } catch {
+        // The rest of the upload is never read, so this connection cannot be reused: close it.
+        send(res, 413, { error: 'The screenshots are too large. Use smaller ones.' }, { Connection: 'close' });
+        return null;
+      }
+    };
+    if (path === '/api/ui-reviews' && method === 'GET') return send(res, 200, { reviews: svc.list(user) });
+    if (path === '/api/ui-reviews' && method === 'POST') {
+      if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      const b = await body();
+      if (!b) return;
+      try {
+        const { review, deduplicated } = svc.start(user, b as unknown as UiReviewInput);
+        deps.audit?.({ event: 'ui-review.started', user: user.username, reviewId: review.id, site: review.site, shots: review.before.length, at: new Date().toISOString() });
+        return send(res, deduplicated ? 200 : 202, { review, deduplicated });
+      } catch (e) {
+        return fail(e);
+      }
+    }
+    const one = path.match(/^\/api\/ui-reviews\/([0-9a-f-]{36})(?:\/(accept|verify|cancel))?$/);
+    if (!one) return send(res, 404, { error: 'Not found.' });
+    if (method === 'GET' && !one[2]) {
+      const r = svc.get(user, one[1]);
+      return r ? send(res, 200, { review: r }) : send(res, 404, { error: 'Review not found.' });
+    }
+    if (method !== 'POST' || !one[2]) return send(res, 404, { error: 'Not found.' });
+    if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+    try {
+      if (one[2] === 'cancel') {
+        const r = svc.cancel(user, one[1]);
+        return r ? send(res, 200, { review: r }) : send(res, 404, { error: 'Review not found.' });
+      }
+      const b = await body();
+      if (!b) return;
+      if (one[2] === 'accept') {
+        const r = svc.accept(user, one[1], b.changes);
+        return r ? send(res, 200, { review: r }) : send(res, 404, { error: 'Review not found.' });
+      }
+      const { review, deduplicated } = svc.verify(user, one[1], b as unknown as UiVerifyInput);
+      if (!deduplicated) deps.audit?.({ event: 'ui-review.recheck', user: user.username, reviewId: review.id, at: new Date().toISOString() });
+      return send(res, deduplicated ? 200 : 202, { review, deduplicated });
+    } catch (e) {
+      return fail(e);
+    }
+  }
+
   async function handleFacebook(req: IncomingMessage, res: ServerResponse, path: string, method: string, user: SessionUser) {
     if (!user.permissions.includes('social:post')) return send(res, 403, { error: 'Your account cannot post to Facebook.' });
     if (path === '/api/facebook/status' && method === 'GET') return send(res, 200, { facebook: await facebookStatus() });
@@ -356,7 +658,8 @@ export function createApp(deps: AppDeps) {
       try {
         body = await readJson(req, Math.ceil((MAX_IMAGE_BYTES * 4) / 3) + 64 * 1024);
       } catch {
-        return send(res, 413, { error: 'The request is too large. Use a smaller photo.' });
+        // The rest of the upload is never read, so this connection cannot be reused: close it.
+        return send(res, 413, { error: 'The request is too large. Use a smaller photo.' }, { Connection: 'close' });
       }
       const key = typeof body.key === 'string' && /^[\w-]{8,64}$/.test(body.key) ? `${user.username}|${body.key}` : null;
       if (!key) return send(res, 400, { error: 'Missing request key.' });
@@ -449,7 +752,23 @@ export function createApp(deps: AppDeps) {
   const handler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
-      if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);
+      if (url.pathname.startsWith('/api/')) {
+        // The client address is read now: once the response ends the connection may already be gone.
+        let source = 'unknown';
+        try {
+          source = clientKey(req, config.trustProxy);
+        } catch {
+          /* no socket address */
+        }
+        res.once('finish', () => {
+          try {
+            noteRefusal(req, res, url.pathname, source);
+          } catch {
+            /* the security log must never break a request */
+          }
+        });
+        await handleApi(req, res, url);
+      }
       else if (req.method === 'GET' || req.method === 'HEAD') serveStatic(req, res, url);
       else send(res, 405, { error: 'Method not allowed.' });
     } catch {
@@ -466,5 +785,6 @@ export function createApp(deps: AppDeps) {
     },
     streams,
     refresher,
+    monitor,
   };
 }

@@ -6,3 +6,5 @@ logs
 .env.*
 !.env.example
 .vercel
+# Team discussions saved by the server (business data)
+data

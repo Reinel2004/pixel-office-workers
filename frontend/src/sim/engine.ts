@@ -8,6 +8,7 @@ import { AGENTS, AGENT_BY_ID, seatOf, type AgentDef } from '../agents/roster';
 import {
   CHAT_SCRIPTS,
   CHAT_SPOTS,
+  DEV_BOARD_SLOTS,
   LEISURE_SPOTS,
   MEETING_CENTER,
   MEETING_SLOTS,
@@ -20,6 +21,9 @@ import {
 } from '../office/layout';
 import { findPath, type Tile } from '../office/pathfinding';
 import { DEMO_SHOP_LOAD, Workshop, type ShopLoad, type ShopNote } from './workshop';
+import { DemoDiscussions } from './discussionDemo';
+import { DemoUiReviews } from './uiReviewDemo';
+import type { Discussion, DiscussionInput, UiReview, UiReviewInput } from '../../shared/live';
 import type {
   AgentId,
   AgentState,
@@ -41,6 +45,17 @@ import {
   type Target,
   type TaskTemplate,
 } from './workflows';
+
+export interface MeetingMember {
+  busy: boolean;
+  prev: { tile: Tile; atSeat: boolean; activity: string };
+}
+/** Agents gathered for a team discussion (Command Center table) or a UI Review (Dev Studio whiteboard). */
+export interface Meeting {
+  id: string;
+  place: 'command' | 'devboard';
+  members: Map<AgentId, MeetingMember>;
+}
 
 export interface AgentRT {
   id: AgentId;
@@ -247,6 +262,135 @@ export class Engine {
   /** Paolo (or another agent) checking the shop floor during a live step. */
   private shopVisit: { id: AgentId; done: boolean; leaveAt: number | null } | null = null;
 
+  // ---------------------------------------------------------------- Team discussion
+  /**
+   * Participants of the running team discussion gather at the Command Center table. An agent who
+   * is already busy (a demo workflow or another live task) stays where they are and is marked
+   * "busy elsewhere". Everyone else returns to where they were when it ends.
+   */
+  private meetings = new Map<string, Meeting>();
+
+  /** The team discussion at the Command Center table, if any. */
+  get meeting(): Meeting | null {
+    return [...this.meetings.values()].find((m) => m.place === 'command') ?? null;
+  }
+  /** A UI Review at the Development Studio whiteboard, if any. */
+  get huddle(): Meeting | null {
+    return [...this.meetings.values()].find((m) => m.place === 'devboard') ?? null;
+  }
+  hasMeeting(id: string) {
+    return this.meetings.has(id);
+  }
+
+  private liveBusy(id: AgentId) {
+    return this.connected && ['queued', 'working'].includes(this.live.get(id)?.state ?? '');
+  }
+
+  /** In the meeting and not busy elsewhere. */
+  inMeeting(a: AgentRT): boolean {
+    for (const m of this.meetings.values()) {
+      const mem = m.members.get(a.id);
+      if (mem && !mem.busy && !a.busyTaskId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Gathers agents: a team discussion at the Command Center table ('command'), or a UI Review at
+   * the Development Studio whiteboard ('devboard'). One of each can run at the same time; someone
+   * already in the other gathering stays there and is marked busy here.
+   */
+  startMeeting(id: string, agents: AgentId[], place: Meeting['place'] = 'command') {
+    if (this.meetings.has(id)) return;
+    for (const m of [...this.meetings.values()]) if (m.place === place) this.endMeeting(m.id);
+    const members = new Map<AgentId, MeetingMember>();
+    agents.forEach((aid, i) => {
+      const a = this.agentById[aid];
+      const busy = !!a.busyTaskId || this.liveBusy(aid) || this.inMeeting(a);
+      const seat = seatOf(aid);
+      const tile = { x: Math.round(a.x), y: Math.round(a.y) };
+      // On a break or at the desk: afterwards they go back to the desk.
+      const atSeat = !!a.leisure || (tile.x === seat.x && tile.y === seat.y);
+      members.set(aid, { busy, prev: { tile, atSeat, activity: a.activity } });
+      if (busy) return;
+      a.leisure = null;
+      if (place === 'command') this.sendTo(a, { meeting: i }, 'Joining the team discussion', null);
+      else {
+        const t = DEV_BOARD_SLOTS[i % DEV_BOARD_SLOTS.length];
+        this.sendTo(a, { tile: t, face: { x: t.x, y: 1 } }, 'Joining the UI Review at the whiteboard', null);
+      }
+    });
+    this.meetings.set(id, { id, place, members });
+    this.emitNow();
+  }
+
+  /** Short status for a participant (full messages are in the discussion panel). */
+  meetingStatus(id: string, agent: AgentId, activity: string, say?: string) {
+    const m = this.meetings.get(id);
+    const a = this.agentById[agent];
+    const mem = m?.members.get(agent);
+    if (!m || !mem || mem.busy || a.busyTaskId) return;
+    if (a.activity !== activity) {
+      a.activity = activity;
+      this.pushRecent(a, activity);
+    }
+    if (say) this.say(a, say, 2400);
+    this.touch();
+  }
+
+  endMeeting(id: string) {
+    const m = this.meetings.get(id);
+    if (!m) return;
+    this.meetings.delete(id);
+    for (const [aid, mem] of m.members) {
+      const a = this.agentById[aid];
+      if (mem.busy || a.busyTaskId) continue; // never pull someone off other work
+      if (a.action === 'talk') a.action = 'none';
+      if (mem.prev.atSeat) this.sendTo(a, { seat: true }, 'Back to desk', null);
+      else this.sendTo(a, { tile: mem.prev.tile }, mem.prev.activity, null);
+    }
+    this.emitNow();
+  }
+
+  /** Ends every gathering (mode switch, reset). */
+  endAllMeetings() {
+    for (const id of [...this.meetings.keys()]) this.endMeeting(id);
+  }
+
+  private meetingTick() {
+    if (!this.meetings.size) return;
+    for (const a of this.agents) if (this.inMeeting(a) && !a.path.length && a.action !== 'talk') a.action = 'talk';
+  }
+
+  /** Demo Mode's sample discussions (kept in this browser, separate from Connected Mode). */
+  demoTalks: DemoDiscussions;
+  /** Demo Mode's sample UI Reviews (no AI, kept in this browser). */
+  demoReviews: DemoUiReviews;
+
+  startDemoUiReview(input: Omit<UiReviewInput, 'shots' | 'noPrivateData'> & { shots: number }): UiReview {
+    const r = this.demoReviews.start(input, this);
+    this.emitNow();
+    return r;
+  }
+
+  demoUiReviewAction(id: string, action: 'cancel' | { accept: string[] } | 'verify') {
+    if (action === 'cancel') this.demoReviews.cancel(id, this);
+    else if (action === 'verify') this.demoReviews.verify(id, this);
+    else this.demoReviews.accept(id, action.accept);
+    this.emitNow();
+  }
+
+  startDemoDiscussion(input: DiscussionInput): Discussion {
+    const d = this.demoTalks.start(input, this);
+    this.emitNow();
+    return d;
+  }
+
+  cancelDemoDiscussion(id: string) {
+    this.demoTalks.cancel(id, this);
+    this.emitNow();
+  }
+
   setShopLoad(load: ShopLoad | null, note: ShopNote = null) {
     this.workshop.setLoad(load, note, this.now);
     this.emitNow();
@@ -322,6 +466,8 @@ export class Engine {
     });
     this.agentById = Object.fromEntries(this.agents.map((a) => [a.id, a])) as Record<AgentId, AgentRT>;
     this.load();
+    this.demoTalks = new DemoDiscussions(storage);
+    this.demoReviews = new DemoUiReviews(storage);
     if (this.connected) this.workshop.setLoad(null, 'loading');
     for (const a of this.agents) a.nextBreakAt = this.breakDelay();
   }
@@ -410,6 +556,12 @@ export class Engine {
     }
     // Demo Mode shows sample shop numbers; Connected Mode waits for the real ones.
     this.shopVisit = null;
+    // A discussion belongs to one mode: leave the table, and stop a demo discussion.
+    this.endAllMeetings();
+    if (mode === 'connected') {
+      this.demoTalks.stopAll('Stopped when Connected Mode was turned on.');
+      this.demoReviews.stopAll('Stopped when Connected Mode was turned on. (Demo sample.)');
+    }
     this.workshop.setLoad(mode === 'connected' ? null : DEMO_SHOP_LOAD, 'loading', this.now);
     this.updateSettings({ mode });
     this.addLog(mode === 'connected' ? 'Switched to Connected Mode (read-only live data).' : 'Switched to Demo Mode (simulated data).', 'info');
@@ -437,12 +589,13 @@ export class Engine {
   // ---------------------------------------------------------------- public API
   agentState(a: AgentRT): AgentState {
     const l = this.connected ? this.live.get(a.id) : undefined;
-    if (l && !a.busyTaskId) {
+    if (l && !a.busyTaskId && (l.state === 'queued' || l.state === 'working' || !this.inMeeting(a))) {
       if (l.state === 'queued') return 'queued';
       if (l.state === 'failed') return 'error';
       if (l.state === 'completed') return 'completed';
       return a.path.length ? 'walking' : 'working';
     }
+    if (this.inMeeting(a)) return a.path.length ? 'walking' : 'working';
     if (a.busyTaskId) {
       if (a.action === 'walk') return 'walking';
       return 'working';
@@ -454,8 +607,9 @@ export class Engine {
     return 'idle';
   }
 
+  /** Agents doing something right now, each counted once (task, live step or team discussion). */
   activeCount(): number {
-    return this.agents.filter((a) => a.busyTaskId || (this.connected && ['queued', 'working'].includes(this.live.get(a.id)?.state ?? ''))).length;
+    return this.agents.filter((a) => a.busyTaskId || this.liveBusy(a.id) || this.inMeeting(a)).length;
   }
 
   currentTask(a: AgentRT): Task | undefined {
@@ -525,6 +679,9 @@ export class Engine {
   }
 
   resetDemo() {
+    this.endAllMeetings();
+    this.demoTalks.clear();
+    this.demoReviews.clear();
     for (const a of this.agents) {
       const s = seatOf(a.id);
       Object.assign(a, {
@@ -573,6 +730,9 @@ export class Engine {
     this.breakTick(dt);
     this.workshop.tick(dt, this.now);
     this.shopVisitTick();
+    if (!this.connected && this.demoTalks.tick(this)) this.touch();
+    if (!this.connected && this.demoReviews.tick(this)) this.touch();
+    this.meetingTick();
     this.flush();
   }
 
@@ -581,6 +741,7 @@ export class Engine {
   isFree(a: AgentRT): boolean {
     if (a.busyTaskId || a.errorTaskId) return false;
     if (this.connected && this.live.has(a.id)) return false;
+    if (this.inMeeting(a)) return false;
     return !this.tasks.some((t) => (t.status === 'awaiting_approval' && t.approval?.agent === a.id) || (t.status === 'queued' && t.cast.includes(a.id)));
   }
 
@@ -642,6 +803,12 @@ export class Engine {
       if (this.now < a.nextBreakAt || away >= MAX_ON_BREAK) continue;
       if (away + 2 <= MAX_ON_BREAK && this.random() < CHAT_CHANCE && this.startChat(a)) {
         away += 2;
+        continue;
+      }
+      // Solo breaks leave the last two places free for a chat, so colleagues still get to talk
+      // in a big team (otherwise solo breaks fill every place and nobody ever chats).
+      if (away + 2 > MAX_ON_BREAK) {
+        a.nextBreakAt = this.now + BREAK_IDLE_MIN;
         continue;
       }
       if (this.startBreak(a)) away++;

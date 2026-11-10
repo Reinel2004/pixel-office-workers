@@ -5,7 +5,8 @@ import { TemplateBrain } from '../src/agents/brain';
 import { AGENTS, seatOf } from '../src/agents/roster';
 import { captionFrom, replyFrom, scheduleFrom } from '../src/live/caption';
 import { Engine, MAX_ON_BREAK, type Chat, type StorageLike } from '../src/sim/engine';
-import { FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt, SHOP_BENCHES, SHOP_ENTRANCE, SHOP_LUMBER, SHOP_SWEEP } from '../src/office/layout';
+import { buildChecklist } from '../shared/qc';
+import { DEV_BOARD_SLOTS, FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt, SHOP_BENCHES, SHOP_ENTRANCE, SHOP_LUMBER, SHOP_SWEEP } from '../src/office/layout';
 import { DEMO_SHOP_LOAD, SHOP_SPOTS, lookFor } from '../src/sim/workshop';
 import { findPath } from '../src/office/pathfinding';
 
@@ -157,6 +158,9 @@ async function main() {
   const st2: StorageLike = { getItem: (k) => mem2.get(k) ?? null, setItem: (k, v) => void mem2.set(k, v), removeItem: (k) => void mem2.delete(k) };
   const eb = new Engine(new TemplateBrain(), st2);
   eb.random = rng;
+  // The constructor picked the first break times with Math.random; redo them from the seed so
+  // this check gives the same result on every run.
+  for (const x of eb.agents) x.nextBreakAt = 20_000 + rng() * 40_000;
   check(eb.settings.breaks, 'breaks are on by default');
   let maxAway = 0;
   let busyOnBreak = false;
@@ -352,6 +356,147 @@ async function main() {
     ws.leaveShop('paolo');
     await runFor(ws, 90000, () => ws.agentById.paolo.posture === 'sit');
     check(ws.agentById.paolo.posture === 'sit', 'Paolo goes back to his desk after checking');
+  }
+
+  console.log('Team discussion (demo samples + office movement)');
+  {
+    const mem2 = new Map<string, string>();
+    const st: StorageLike = { getItem: (k) => mem2.get(k) ?? null, setItem: (k, v) => void mem2.set(k, v), removeItem: (k) => void mem2.delete(k) };
+    const td = new Engine(new TemplateBrain(), st, { breaks: true });
+    let threw = false;
+    try {
+      td.startDemoDiscussion({ topic: 'Why are orders delayed?', participants: ['paolo'] });
+    } catch {
+      threw = true;
+    }
+    check(threw, 'fewer than two participants is refused');
+    threw = false;
+    try {
+      td.startDemoDiscussion({ topic: 'Why are orders delayed?', participants: ['paolo', 'lia', 'bea', 'rosa', 'mika'] });
+    } catch {
+      threw = true;
+    }
+    check(threw, 'more than four participants is refused');
+
+    // Paolo is busy with a demo workflow: he must stay on it and be marked busy, not pulled away.
+    const prod = td.startDemo('production');
+    await runFor(td, 3000, () => !!td.agentById.paolo.busyTaskId);
+    const d = td.startDemoDiscussion({ topic: 'Why are orders delayed?', participants: ['paolo', 'lia', 'bea'] });
+    check(d.mode === 'demo' && d.status === 'queued', 'a demo discussion starts as a labelled sample');
+    check(td.meeting?.members.get('paolo')?.busy === true, 'an agent busy on other work is marked busy elsewhere');
+    let again = false;
+    try {
+      td.startDemoDiscussion({ topic: 'Another one', participants: ['lia', 'bea'] });
+    } catch {
+      again = true;
+    }
+    check(again, 'only one demo discussion at a time');
+    const statuses: string[] = [];
+    let maxActive = 0;
+    let breakDuring = false;
+    await runFor(td, 120000, () => {
+      if (statuses[statuses.length - 1] !== d.status) statuses.push(d.status);
+      maxActive = Math.max(maxActive, td.activeCount());
+      if (['lia', 'bea', 'chief'].some((id) => td.agentById[id as 'lia'].leisure)) breakDuring = true;
+      return d.status === 'completed';
+    });
+    check(JSON.stringify(statuses) === JSON.stringify(['queued', 'gathering', 'proposals', 'reviews', 'synthesizing', 'completed']), `phases in order (${statuses.join(' > ')})`);
+    check(d.messages.filter((m) => m.status === 'done').length === 7, 'three proposals, three reviews and the summary');
+    check(d.messages.find((m) => m.round === 'synthesis')!.synthesis!.limitations.some((l) => l.includes('Demo Mode')), 'the summary says it is a demo sample');
+    check(maxActive <= AGENTS.length && maxActive >= 3, `active counter counts each agent once (max ${maxActive})`);
+    check(!breakDuring, 'participants do not wander off on a break during the discussion');
+    check(td.meeting === null, 'the table is cleared when the discussion ends');
+    await runFor(td, 60000, () => ['lia', 'bea'].every((id) => td.agentById[id as 'lia'].posture === 'sit'));
+    check(['lia', 'bea'].every((id) => td.agentById[id as 'lia'].posture === 'sit'), 'participants go back to their desks');
+    await runFor(td, 200000, () => prod.status === 'completed' || prod.status === 'awaiting_approval');
+    check(prod.status !== 'interrupted', 'the busy agent\'s own workflow was not interrupted');
+
+    // The participants really walk to the Command Center table.
+    const d2 = td.startDemoDiscussion({ topic: 'Reduce material waste', participants: ['nina', 'mika'] });
+    await runFor(td, 30000, () => ['nina', 'mika', 'chief'].every((id) => !td.agentById[id as 'nina'].path.length));
+    const atTable = ['nina', 'mika', 'chief'].every((id) => {
+      const a = td.agentById[id as 'nina'];
+      return MEETING_SLOTS.some((s) => s.x === Math.round(a.x) && s.y === Math.round(a.y));
+    });
+    check(atTable, 'participants and Chief stand at the Command Center table');
+    check(td.agentState(td.agentById.nina) === 'working', 'a participant at the table shows as working');
+    td.cancelDemoDiscussion(d2.id);
+    check(d2.status === 'cancelled' && td.meeting === null, 'cancel stops the discussion and clears the table');
+
+    // A reload cannot continue a demo discussion: it is shown as interrupted, never as running.
+    const d3 = td.startDemoDiscussion({ topic: 'Scheduling', participants: ['paolo', 'nina'] });
+    const reloaded = new Engine(new TemplateBrain(), st, { breaks: false });
+    const r3 = reloaded.demoTalks.get(d3.id)!;
+    check(r3.status === 'failed' && /Interrupted/.test(r3.error ?? ''), 'after a reload a running demo discussion is marked interrupted');
+    check(mem2.has('wad-ai-office:demo-discussions:v1'), 'demo discussions have their own storage key');
+
+    // Connected Mode never continues a demo discussion.
+    const d4 = reloaded.startDemoDiscussion({ topic: 'Scheduling again', participants: ['paolo', 'nina'] });
+    reloaded.setMode('connected');
+    check(d4.status === 'cancelled' && reloaded.meeting === null, 'switching to Connected Mode stops demo discussions and clears the table');
+    await runFor(reloaded, 20000);
+    check(d4.status === 'cancelled', 'a demo discussion does not advance in Connected Mode');
+  }
+
+  console.log('New team: Tess (QC) and the UI Review team (Aya, Rey, Kim)');
+  {
+    const g = buildWalkGrid();
+    for (const id of ['tess', 'aya', 'rey', 'kim'] as const) {
+      const a = AGENTS.find((x) => x.id === id);
+      check(!!a, `${id} is on the roster`);
+      if (a) check(!!findPath(g, seatOf(id), seatOf('chief')), `${a.name}'s desk is reachable`);
+    }
+    check(AGENTS.filter((a) => a.room === 'dev').length === 6, 'six people work in the Development Studio');
+    const desks = new Set(AGENTS.map((a) => `${a.desk.x},${a.desk.y}`));
+    check(desks.size === AGENTS.length, 'every agent has their own desk');
+    for (const t of DEV_BOARD_SLOTS) check(g[t.y][t.x] && roomAt(t.x + 0.5, t.y + 0.5) === 'dev' && !!findPath(g, seatOf('rey'), t), `whiteboard spot ${t.x},${t.y} walkable in the Dev Studio`);
+
+    // Tess's checklist (shared code, same as the server).
+    const c = buildChecklist(
+      { ref: 'ORD-X', status: 'Pending', dueDate: null, truncated: false, pieces: [{ category: 'Door', type: 'Flush', size: '30 x 80', thickness: null, wood: 'Narra', finish: 'With Varnish', jamb: 'Without Hamba', jambWood: null, jambSize: null, cnc: false, tableShape: null, length: null, width: null, height: null, notes: null, hasDesignPhoto: false, hasColorSample: false, stage: null }] },
+      'now',
+      'demo',
+    );
+    check(c.groups[0].items.some((i) => i.area === 'dimensions' && i.expected === '30 x 80'), 'checklist copies the size from the order');
+    check(c.groups[0].items.some((i) => /thickness/.test(i.text) && i.missing), 'a missing thickness is flagged, not guessed');
+
+    const mu = new Map<string, string>();
+    const su: StorageLike = { getItem: (k) => mu.get(k) ?? null, setItem: (k, v) => void mu.set(k, v), removeItem: (k) => void mu.delete(k) };
+    const eu = new Engine(new TemplateBrain(), su, { breaks: false });
+    const r = eu.startDemoUiReview({ site: 'order-management', page: 'Orders list', goal: 'Phone friendly', device: 'both', shots: 2 });
+    check(r.mode === 'demo' && eu.huddle?.place === 'devboard', 'a demo UI Review gathers the team at the whiteboard');
+    // A team discussion can run at the table at the same time.
+    const disc = eu.startDemoDiscussion({ topic: 'Scheduling', participants: ['paolo', 'nina'] });
+    check(eu.meeting?.id === disc.id && eu.huddle?.id === r.id, 'a UI Review and a team discussion can run at once');
+    const seen: string[] = [r.status];
+    const note = () => seen[seen.length - 1] !== r.status && seen.push(r.status);
+    await runFor(eu, 30000, () => (note(), ['aya', 'kim', 'rey'].every((id) => !eu.agentById[id as 'aya'].path.length)));
+    check(
+      ['aya', 'kim', 'rey'].every((id) => {
+        const a = eu.agentById[id as 'aya'];
+        return DEV_BOARD_SLOTS.some((s) => s.x === Math.round(a.x) && s.y === Math.round(a.y));
+      }),
+      'Aya, Kim and Rey stand at the Dev Studio whiteboard',
+    );
+    await runFor(eu, 60000, () => (note(), r.status === 'proposed'));
+    check(JSON.stringify(seen) === JSON.stringify(['queued', 'reviewing', 'planning', 'proposed']), `review phases in order (${seen.join(' > ')})`);
+    check(!!r.design && !!r.usability && (r.plan?.changes.length ?? 0) > 0, 'design, usability and plan are filled (sample)');
+    check(eu.huddle === null, 'the whiteboard is cleared when the plan is ready');
+    eu.demoUiReviewAction(r.id, 'verify');
+    check(r.status === 'proposed', 'no re-check before a change is accepted');
+    eu.demoUiReviewAction(r.id, { accept: ['C1', 'C3'] });
+    check(r.plan!.changes.filter((x) => x.accepted).map((x) => x.id).join() === 'C1,C3', 'accepting changes');
+    eu.demoUiReviewAction(r.id, 'verify');
+    check(r.status === 'verifying' && eu.huddle?.members.has('kim') === true, 'Kim re-checks at the whiteboard');
+    await runFor(eu, 30000, () => r.status === 'verified');
+    check(r.status === 'verified' && r.verifications[0].checks.length === 2 && r.verifications[0].verdict === 'ready', 'the sample re-check reports each accepted change');
+    const r2 = eu.startDemoUiReview({ site: 'ai-office', page: 'Home', goal: '', device: 'desktop', shots: 1 });
+    eu.demoUiReviewAction(r2.id, 'cancel');
+    check(r2.status === 'cancelled' && eu.huddle === null, 'cancel stops the review and clears the whiteboard');
+    const r3 = eu.startDemoUiReview({ site: 'ai-office', page: 'Home', goal: '', device: 'desktop', shots: 1 });
+    eu.setMode('connected');
+    check(r3.status === 'cancelled' && eu.huddle === null && eu.meeting === null, 'Connected Mode stops demo reviews and clears both gatherings');
+    check(mu.has('wad-ai-office:demo-ui-reviews:v1'), 'demo UI Reviews have their own storage key');
   }
 
   console.log('Persistence & reset');

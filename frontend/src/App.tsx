@@ -14,6 +14,8 @@ import { IconFit, IconMinus, IconPlus } from './ui/icons';
 import { useEngine } from './ui/shared';
 import { ConnectGate, ConnectedBar, LiveFeed, useLive } from './ui/live/LiveViews';
 import { TopBar } from './ui/TopBar';
+import { DiscussionDialog } from './ui/Discussions';
+import { UiReviewDialog } from './ui/UiReview';
 
 function safeStorage(): StorageLike | null {
   try {
@@ -142,9 +144,17 @@ export default function App() {
 
   const openTask = (id: string) => setSelection({ kind: 'task', id });
   const openJob = (id: string) => setSelection({ kind: 'job', id });
+  const openDiscussion = (id: string) => setSelection({ kind: 'discussion', id });
+  const [discussOpen, setDiscussOpen] = useState(false);
+  const openUiReview = (id: string) => setSelection({ kind: 'uireview', id });
+  const [uiOpen, setUiOpen] = useState(false);
   const setMode = (m: 'demo' | 'connected') => {
     engine.setMode(m);
     if (m === 'connected') void live.loadWorkshop(true); // already signed in: re-read the shop numbers
+    if (m === 'connected' && live.server === 'signed_in') {
+      void live.loadDiscussions(); // gather the team again if one is running
+      void live.loadUiReviews();
+    }
     setSelection(null);
   };
   const onAssign = (id: AgentId) => {
@@ -171,6 +181,12 @@ export default function App() {
         onOpenApproval={openTask}
         onResetView={() => bus.emit('camera:reset', { animate: true })}
         compact={mobile}
+        onOpenAttention={(l) => {
+          if (l.kind === 'job') openJob(l.id);
+          else if (l.kind === 'discussion') openDiscussion(l.id);
+          else if (l.kind === 'uireview') openUiReview(l.id);
+          else if (l.kind === 'systems') live.showFeedTab('systems');
+        }}
       />
 
       {showBanner && pending && (
@@ -203,9 +219,9 @@ export default function App() {
       />
 
       {connected ? (
-        <LiveFeed store={live} open={feedOpen} setOpen={(o) => engine.updateSettings({ feedOpen: o })} onOpenJob={openJob} mobile={mobile} />
+        <LiveFeed store={live} open={feedOpen} setOpen={(o) => engine.updateSettings({ feedOpen: o })} onOpenJob={openJob} onOpenDiscussion={openDiscussion} onOpenUiReview={openUiReview} mobile={mobile} />
       ) : (
-        <ActivityPanel engine={engine} open={feedOpen} setOpen={(o) => engine.updateSettings({ feedOpen: o })} onOpenTask={openTask} mobile={mobile} />
+        <ActivityPanel engine={engine} open={feedOpen} setOpen={(o) => engine.updateSettings({ feedOpen: o })} onOpenTask={openTask} onOpenDiscussion={openDiscussion} onOpenUiReview={openUiReview} mobile={mobile} />
       )}
 
       <div className="camera-controls" style={{ bottom: bottomH + 20, right: !mobile && feedOpen ? 340 : 12 }}>
@@ -230,8 +246,23 @@ export default function App() {
         setAgent={setAssignAgent}
         focusSignal={focusSignal}
         onStarted={() => undefined}
-        connectedContent={<ConnectedBar store={live} onOpenJob={openJob} agent={assignAgent} setAgent={setAssignAgent} focusSignal={focusSignal} />}
+        onDiscuss={() => setDiscussOpen(true)}
+        onUiReview={() => setUiOpen(true)}
+        connectedContent={
+          <ConnectedBar
+            store={live}
+            onOpenJob={openJob}
+            agent={assignAgent}
+            setAgent={setAssignAgent}
+            focusSignal={focusSignal}
+            onDiscuss={() => setDiscussOpen(true)}
+            onUiReview={() => setUiOpen(true)}
+          />
+        }
       />
+
+      {discussOpen && <DiscussionDialog engine={engine} live={live} onClose={() => setDiscussOpen(false)} onOpen={openDiscussion} />}
+      {uiOpen && <UiReviewDialog engine={engine} live={live} onClose={() => setUiOpen(false)} onOpen={openUiReview} />}
 
       {connected && ready && <ConnectGate store={live} onDemo={() => setMode('demo')} />}
 

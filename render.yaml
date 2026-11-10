@@ -47,6 +47,25 @@ services:
       # Live updates: seconds between the server's checks while an office is open (0 = off).
       - key: LIVE_REFRESH_SECONDS
         value: "120"
+      # Team discussions are saved here. Render's disk is wiped on every deploy and restart, so
+      # past discussions are lost then (add a Render persistent disk to keep them).
+      - key: DISCUSSIONS_FILE
+        value: data/discussions.json
+      # UI Reviews (text only; screenshots are never written to disk). Also wiped on redeploy.
+      - key: UI_REVIEWS_FILE
+        value: data/ui-reviews.json
+      # AI usage tracker: totals and limits changed in the office (wiped on redeploy without a disk).
+      - key: AI_USAGE_FILE
+        value: data/ai-usage.json
+      # Default limits (an admin can change them in the office: Systems tab > AI usage).
+      - key: AI_DAILY_REQUEST_LIMIT
+        value: "500"
+      - key: AI_MONTHLY_BUDGET_USD
+        value: ""
+      - key: AI_PRICE_INPUT_USD_PER_M
+        value: ""
+      - key: AI_PRICE_OUTPUT_USD_PER_M
+        value: ""
       # Render's disk is wiped on every deploy and restart; the task log goes to Render's logs instead.
       - key: TASK_LOG_FILE
         value: ""

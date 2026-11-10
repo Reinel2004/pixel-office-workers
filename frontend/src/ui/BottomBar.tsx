@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useRef, useState } from 'react';
 import { AGENTS } from '../agents/roster';
 import type { Engine } from '../sim/engine';
 import type { AgentId } from '../sim/types';
-import { IconDoor, IconFactory, IconMegaphone, IconSend } from './icons';
+import { IconDoor, IconFactory, IconMegaphone, IconScreen, IconSend, IconTeam } from './icons';
 import { useEngine } from './shared';
 
 interface Props {
@@ -13,6 +13,10 @@ interface Props {
   onStarted: (taskId: string) => void;
   /** Connected Mode replaces the demo controls with live report controls. */
   connectedContent?: React.ReactNode;
+  /** Opens the Team Discussion dialog. */
+  onDiscuss: () => void;
+  /** Opens the UI Review dialog. */
+  onUiReview: () => void;
 }
 
 const SUGGESTIONS: Record<AgentId, string> = {
@@ -25,11 +29,17 @@ const SUGGESTIONS: Record<AgentId, string> = {
   mika: 'Which products sell best?',
   carlo: 'Write a caption for a carved door',
   joy: 'Reply to a customer asking about their order',
+  tess: 'Make an inspection checklist for a panel door',
   dev: 'Check the order data for mistakes',
+  sam: 'Are all our systems working?',
+  ivy: 'Any suspicious sign-ins today?',
+  aya: 'How should the orders page look on a phone?',
+  rey: 'Plan a change to make the order form easier',
+  kim: 'Write test steps for adding a new order',
   chief: 'Plan the team priorities for today',
 };
 
-export const BottomBar = forwardRef<HTMLDivElement, Props>(function BottomBar({ engine, agent, setAgent, focusSignal, onStarted, connectedContent }, ref) {
+export const BottomBar = forwardRef<HTMLDivElement, Props>(function BottomBar({ engine, agent, setAgent, focusSignal, onStarted, connectedContent, onDiscuss, onUiReview }, ref) {
   useEngine(engine);
   const [text, setText] = useState('');
   const input = useRef<HTMLInputElement>(null);
@@ -103,6 +113,14 @@ export const BottomBar = forwardRef<HTMLDivElement, Props>(function BottomBar({ 
         <button className="btn primary" type="submit" disabled={!text.trim()}>
           <IconSend size={16} />
           <span>Assign</span>
+        </button>
+        <button type="button" className="btn" onClick={onDiscuss} title="Several agents discuss a topic; Chief summarises (demo sample)">
+          <IconTeam size={16} />
+          <span className="hide-narrow">Team discussion</span>
+        </button>
+        <button type="button" className="btn" onClick={onUiReview} title="Aya, Kim and Rey review a page (demo sample)">
+          <IconScreen size={16} />
+          <span className="hide-narrow">UI review</span>
         </button>
       </form>
     </div>

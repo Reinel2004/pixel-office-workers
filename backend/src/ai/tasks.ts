@@ -22,6 +22,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DateRange, LiveAgentId, Money, Permission, SessionUser, SourceInfo, SystemId } from '../../shared/live';
 import { SYSTEM_NAMES } from '../../shared/live';
+import { buildChecklist, hardwareMentions } from '../../shared/qc';
 import { manilaDate, validateRange } from '../../shared/manila';
 import type { FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
 import { IntegrationError } from '../http/errors';
@@ -48,7 +49,9 @@ type ToolName =
   | 'get_product_mix'
   | 'get_production_pipeline'
   | 'get_finance_trends'
-  | 'get_data_checks';
+  | 'get_data_checks'
+  | 'get_system_health'
+  | 'get_security_events';
 
 interface AgentProfile {
   name: string;
@@ -116,12 +119,54 @@ export const AGENT_PROFILES: Record<LiveAgentId, AgentProfile> = {
       'Drafts replies to messages from customers (Facebook Messenger, Viber, SMS or email) for a staff member to check and send: order status questions, delivery and installation timing, payments, changes, and complaints or after-sales concerns. Answers in the same language the customer used (English, Filipino or Taglish), warm and polite, with "po" when writing in Filipino.',
     tools: [],
   },
+  tess: {
+    name: 'Tess',
+    role: 'Quality Control Assistant',
+    focus:
+      'Builds inspection checklists from order specifications, so every piece is checked before delivery: dimensions (size, thickness, or length × width × height for tables), design (the ordered design, CNC work, wood), finish (varnish, colour, smoothness), jamb (hamba: included or not, its wood and size, how the door fits it) and hardware (hinges, lockset, handles). The checklist for the selected order is calculated by code from WAD Order Management and given to you; use its expected values exactly. Anything it marks "missing" must be confirmed with sales: never fill it in yourself. Hardware is not a field in the order system; it is known only when the notes mention it. Can rewrite the checklist for the carpenters (for example in Tagalog), explain what to look for, or list what to confirm before inspecting.',
+    tools: [],
+  },
   dev: {
     name: 'Dev',
     role: 'Data Quality Checker',
     focus:
       'Keeps the order system clean. Uses get_data_checks (calculated by code) to find mistakes: missing due dates, odd statuses, due dates before order dates, In Progress orders with no carpenter, carpenters with no labor entered, pieces with no price, finished orders with no downpayment, and orders that may have been entered twice. Writes a short fix list, most urgent first (open orders due soon, then money-related, then the rest), with what to correct in WAD Order Management for each. Never says data is wrong when a check is marked unavailable; says the order system does not provide it instead.',
     tools: ['get_data_checks', 'get_open_orders', 'get_orders'],
+  },
+  sam: {
+    name: 'Sam',
+    role: 'Systems Monitor',
+    focus:
+      'Watches the office\'s own systems: whether WAD Order Management, WAD Furniture Management, Gemini and the Facebook Page are set up and answering, how fast, how often calls fail and with which errors, whether the live updates are working, and how the office server itself is doing. Says plainly what is fine, what is wrong, the likely cause (for example: 401/403 = token wrong or expired, 429 = too many requests, 5xx = a problem on that system, TIMEOUT/NETWORK = cannot be reached) and the exact next step (which setting in backend/.env or Render to check). Never guesses beyond the figures; says when there is too little data yet.',
+    tools: ['get_system_health'],
+  },
+  ivy: {
+    name: 'Ivy',
+    role: 'Security Officer',
+    focus:
+      'Watches sign-ins and refused requests for the office: failed and throttled sign-ins, sign-ins for usernames that do not exist, many failures from one source, blocked cross-site requests and permission denials, plus risky settings. Explains what is normal (a few typos) and what looks like password guessing, and recommends concrete steps (change a password, remove an account, fix a setting). Never asks for or repeats passwords, tokens or keys.',
+    tools: ['get_security_events', 'get_system_health'],
+  },
+  aya: {
+    name: 'Aya',
+    role: 'UI/UX Designer',
+    focus:
+      "Plans page layouts, navigation and the mobile experience for WAD's websites: WAD Order Management and WAD Furniture Management (PHP pages styled with Tailwind CSS) and the WAD AI Office. In a UI Review she looks at the screenshots staff upload and suggests clear, practical improvements: what to fix, why it matters to the staff using the page, and how it should look on a phone. Cannot open websites or change code.",
+    tools: [],
+  },
+  rey: {
+    name: 'Rey',
+    role: 'Developer',
+    focus:
+      "Turns UI improvements into an implementation plan for WAD's websites (PHP pages with HTML, Tailwind CSS and JavaScript; the WAD AI Office in React). Breaks each change into small steps, names the kind of change (CSS, HTML, PHP, JavaScript), its effort and risk, and how to test it, so a developer can carry it out in a connected coding environment (for example Claude Code in VS Code, in the website's project folder). Cannot see or change the code, deploy, or touch the database himself, and never invents file names or functions he has not been told about.",
+    tools: [],
+  },
+  kim: {
+    name: 'Kim',
+    role: 'QA Tester / Reviewer',
+    focus:
+      'Tests workflows and reviews changes before release. In a UI Review she finds usability problems (unclear buttons, missing feedback, hard-to-tap controls, error states, mobile issues, low contrast) and writes test steps; later she compares the "before" and "after" screenshots to say which accepted changes are done, partly done or missing, what broke, and whether it is ready to release. She judges only what the screenshots show and says when something cannot be seen.',
+    tools: [],
   },
   chief: {
     name: 'Chief',
@@ -144,6 +189,8 @@ const TOOL_PERMISSIONS: Record<ToolName, Permission[]> = {
   get_finance_trends: ['finance:read'],
   // The downpayment check is included only for users who also have finance:read.
   get_data_checks: ['orders:read'],
+  get_system_health: ['system:read'],
+  get_security_events: ['system:read'],
 };
 
 const RANGE_PARAMS = {
@@ -217,6 +264,20 @@ const DECLARATIONS: Record<ToolName, FunctionDeclaration> = {
       'Income, operating expenses and net per month from WAD Furniture Management, calculated by code, with each month\'s largest expense category, and the best and worst months by net. Payroll and material purchases are not included.',
     parameters: RANGE_PARAMS,
   },
+  get_system_health: {
+    name: 'get_system_health',
+    description:
+      'Health of the office\'s systems, measured by the server itself: setup state and problems of WAD Order Management and WAD Furniture Management, Gemini and the Facebook Page; per system over the last 24 hours the number of calls, failures (by HTTP status, TIMEOUT or NETWORK), failures in a row now, average and slowest response time, last success and last failure; the live-update checks; the server (mode, uptime, memory, signed-in sessions, open offices); and task counts. No secrets.',
+  },
+  get_security_events: {
+    name: 'get_security_events',
+    description:
+      'Security events for the office over the last N hours (default 24, at most 168): successful, failed and throttled sign-ins, failed sign-ins per real account and for unknown usernames, how many sources had failures and the most failures from one source, blocked cross-site requests, permission denials by area, rate limits, and the security settings with warnings. Client addresses are never included.',
+    parameters: {
+      type: 'object',
+      properties: { hours: { type: 'number', description: 'How many hours back to look (1 to 168). Default 24.' } },
+    },
+  },
   get_data_checks: {
     name: 'get_data_checks',
     description:
@@ -248,6 +309,8 @@ export interface AiTaskDeps {
   maxRangeDays: number;
   knowledgeDir: string;
   now?: () => Date;
+  /** The Systems team's reports (server health, security events); absent in tests or when not wired. */
+  monitor?: { health: () => Record<string, unknown>; security: (hours: number) => Record<string, unknown> } | null;
 }
 
 export interface AiTaskOutcome {
@@ -303,6 +366,16 @@ Customer-service rules:
 - Write [Customer name] where the customer's name belongs; the office fills it in.
 - Answer in this format: "**Reply**" (the message, ready to send, short like a chat message), then "**Notes for staff**" (1 to 3 bullets: anything to check or confirm before sending).`;
 
+/** Added to Tess's instructions on every quality-control task. */
+const QC_RULES = `
+
+Quality-control rules:
+- The "Selected order" below is the inspection checklist built by code from WAD Order Management. Use its expected values exactly (sizes, wood, finish, jamb). Do not round, convert or "correct" them.
+- Checks marked "missing" are not recorded in the order. List them under "Confirm with sales first"; never guess them.
+- Hardware is not a field in the order system: only what "hardwareInNotes" lists is known. Otherwise say hardware must be confirmed.
+- Staff notes are not shown to you (they can contain customer details); "notesPresent" says whether the inspector should read the notes in the office.
+- Keep it practical for the shop floor: short lines, grouped by Dimensions, Design & wood, Finish, Jamb, Hardware.`;
+
 const MAX_RECORDS_TO_AI = 150;
 /** Most data lookups one task may make, across all rounds (identical repeats are free). */
 export const MAX_TOOL_CALLS = 6;
@@ -332,9 +405,13 @@ export async function runAiTask(
     recordCount += count;
   };
 
-  // The order a staff member picked (customer service): looked up once by code, before the AI starts.
+  // The order a staff member picked (customer service, quality control): looked up once by code,
+  // before the AI starts.
+  const track = { source, refs, names, lookups };
   const orderFacts = orderRef
-    ? await selectedOrder(deps, orderRef, today, user.permissions.includes('finance:read'), { source, refs, names, lookups })
+    ? agent === 'tess'
+      ? await selectedSpec(deps, orderRef, track)
+      : await selectedOrder(deps, orderRef, today, user.permissions.includes('finance:read'), track)
     : null;
 
   // A photo goes in the same first message as the request, before the text.
@@ -358,7 +435,8 @@ export async function runAiTask(
             systemPrompt(profile, today, tools, profile.tools.filter((t) => !tools.includes(t)), user, loadKnowledge(deps.knowledgeDir)) +
             (image ? PHOTO_RULES : '') +
             (agent === 'carlo' ? carloRules(deps.now?.() ?? new Date()) : '') +
-            (agent === 'joy' ? CS_RULES + (orderRef ? '' : '\nNo order was selected for this message.') : ''),
+            (agent === 'joy' ? CS_RULES + (orderRef ? '' : '\nNo order was selected for this message.') : '') +
+            (agent === 'tess' ? QC_RULES + (orderRef ? '' : "\nNo order was selected: answer generally, and say that picking the order in Tess's panel gives an exact checklist.") : ''),
         },
       ],
     },
@@ -371,7 +449,7 @@ export async function runAiTask(
   // Bounded: rounds 0..maxToolRounds, and the last round cannot ask for data.
   for (let round = 0; round <= deps.maxToolRounds; round++) {
     const last = round === deps.maxToolRounds || toolCalls >= MAX_TOOL_CALLS;
-    const { content, finishReason } = await deps.ai.generate(request(!last));
+    const { content, finishReason } = await deps.ai.generate(request(!last), { tag: { feature: 'task', agent, user: user.username }, retries: 1 });
     const calls = content.parts.filter((p): p is Extract<GeminiPart, { functionCall: unknown }> => 'functionCall' in p);
     if (!calls.length) {
       const answer = content.parts
@@ -477,8 +555,53 @@ async function selectedOrder(
   };
 }
 
+/**
+ * Tess's selected order: the inspection checklist built by code from the order's piece specs.
+ * Staff notes are left out (they can contain customer details); only the hardware words found in
+ * them are passed on.
+ */
+async function selectedSpec(
+  deps: AiTaskDeps,
+  ref: string,
+  track: { source: (s: SystemId, n: number) => void; refs: Set<string>; lookups: AiTaskOutcome['lookups'] },
+): Promise<Record<string, unknown>> {
+  if (!deps.orders.getOrderSpec) {
+    track.lookups.push({ tool: 'selected_order', detail: `${ref} — not supported`, ok: false });
+    return { ref, error: 'This server cannot read order specifications.', note: 'Do not state any specification; say it is unavailable.' };
+  }
+  try {
+    const spec = await deps.orders.getOrderSpec(ref);
+    track.source('orders', spec.pieces.length);
+    track.refs.add(spec.ref);
+    track.lookups.push({ tool: 'selected_order', detail: `${spec.ref} (${spec.pieces.length} piece(s))`, ok: true });
+    const c = buildChecklist(spec, new Date().toISOString());
+    return {
+      ref: c.ref,
+      status: c.status,
+      dueDate: c.dueDate,
+      pieces: c.pieces,
+      calculatedByCode: true,
+      groups: c.groups.map((g) => ({
+        qty: g.qty,
+        label: g.label,
+        stages: g.stages,
+        checks: g.items.map((it) => ({ area: it.area, check: it.text, expected: it.expected, ...(it.missing ? { missing: true } : {}) })),
+        hardwareInNotes: g.notes.flatMap((n) => hardwareMentions(n)),
+        notesPresent: g.notes.length > 0,
+      })),
+      warnings: c.warnings,
+    };
+  } catch (e) {
+    const msg = e instanceof IntegrationError ? e.message : 'The order could not be retrieved.';
+    track.lookups.push({ tool: 'selected_order', detail: `${ref} — failed: ${msg}`, ok: false });
+    return { ref, error: msg, note: 'The specifications are unavailable. Do not state any; say the checklist could not be built.' };
+  }
+}
+
 function describe(name: ToolName, args: Record<string, unknown>) {
   if (name === 'get_open_orders') return 'all open orders';
+  if (name === 'get_system_health') return 'server and connected systems';
+  if (name === 'get_security_events') return `last ${Math.min(168, Math.max(1, Math.round(Number(args.hours) || 24)))} hours`;
   if (name === 'get_data_checks') return args.from || args.to ? `data checks, ${String(args.from ?? '?')} to ${String(args.to ?? '?')}` : 'data checks on all open orders';
   if (name === 'get_collections') return 'balances on open orders';
   if (name === 'get_production_pipeline') return 'all open orders by stage';
@@ -602,6 +725,12 @@ async function callTool(
       notes: ['Income is every recorded income entry. Payroll and material purchases are not included in expenses.'],
     };
   }
+  if (name === 'get_system_health' || name === 'get_security_events') {
+    if (!deps.monitor) return { error: 'System monitoring is not available on this server.', note: 'Say so; do not guess.' };
+    return name === 'get_system_health'
+      ? { ...deps.monitor.health(), measuredByServer: true }
+      : { ...deps.monitor.security(Number(args.hours) || 24), measuredByServer: true };
+  }
   if (name === 'get_data_checks') {
     const ranged = args.from !== undefined || args.to !== undefined;
     const orders = ranged ? await deps.orders.listOrders(rangeArg(args, deps.maxRangeDays)) : await deps.orders.listOpenOrders();
@@ -670,7 +799,7 @@ function systemPrompt(p: AgentProfile, today: string, tools: ToolName[], missing
     `Today is ${today} (Asia/Manila). Amounts are in Philippine pesos (₱). You are answering ${user.username}, a staff member.`,
     tools.length
       ? `You can look up live company data with these read-only tools: ${tools.join(', ')}. Use them for ANY question about orders, production, deadlines, income, expenses or budgets — never answer those from memory.`
-      : 'You have no access to live company data. If the request needs live order or finance figures, say which colleague can get them (Paolo for orders and production, Bea for finance, Rosa for unpaid balances, Mika for trends and best sellers, Joy for replies to customers about their order, Dev for mistakes in the order data, Chief for all of these).',
+      : 'You have no access to live company data. If the request needs live order or finance figures, say which colleague can get them (Paolo for orders and production, Bea for finance, Rosa for unpaid balances, Mika for trends and best sellers, Joy for replies to customers about their order, Dev for mistakes in the order data, Tess for inspection checklists, Sam for system problems, Ivy for sign-in and security questions, Aya, Rey and Kim for website design, development and testing (UI Review), Chief for all of these).',
     missing.length ? `This user's account cannot use: ${missing.join(', ')}. If the request needs that data, say so plainly.` : '',
     'Rules:',
     '- Use only figures that the tools returned or that appear in the business notes. Never invent, estimate or round off numbers, order references, dates, names or prices.',

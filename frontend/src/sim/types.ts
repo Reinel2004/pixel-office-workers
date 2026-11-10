@@ -1,4 +1,4 @@
-export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'dev' | 'chief';
+export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
 
 export type RoomId =
   | 'intel'
@@ -75,4 +75,6 @@ export type Selection =
   | { kind: 'room'; id: RoomId }
   | { kind: 'task'; id: string }
   | { kind: 'job'; id: string }
+  | { kind: 'discussion'; id: string }
+  | { kind: 'uireview'; id: string }
   | null;

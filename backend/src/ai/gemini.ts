@@ -4,6 +4,7 @@
 // - Each failure becomes an IntegrationError code the office already knows how to show.
 
 import { IntegrationError } from '../http/errors';
+import type { AiUsageMeter, UsageTag } from './usage';
 
 export const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
@@ -28,7 +29,7 @@ export interface GenerateRequest {
   systemInstruction?: { parts: { text: string }[] };
   contents: GeminiContent[];
   tools?: { functionDeclarations: FunctionDeclaration[] }[];
-  generationConfig?: { temperature?: number; maxOutputTokens?: number };
+  generationConfig?: { temperature?: number; maxOutputTokens?: number; responseMimeType?: 'application/json'; responseSchema?: Record<string, unknown> };
   /** mode NONE: the model must answer in text and may not ask for more data. */
   toolConfig?: { functionCallingConfig: { mode: 'AUTO' | 'NONE' } };
 }
@@ -36,6 +37,8 @@ export interface GenerateRequest {
 export interface GenerateResult {
   content: GeminiContent;
   finishReason: string | null;
+  /** Token counts, when Gemini reports them. */
+  usage?: { promptTokens: number; outputTokens: number; totalTokens: number } | null;
 }
 
 export interface GeminiOptions {
@@ -47,6 +50,8 @@ export interface GeminiOptions {
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
+  /** AI usage tracker: checks the limits and counts every request (optional, e.g. in tests). */
+  meter?: AiUsageMeter | null;
 }
 
 export class GeminiClient {
@@ -61,59 +66,89 @@ export class GeminiClient {
     return this.opts.model;
   }
 
-  async generate(body: GenerateRequest): Promise<GenerateResult> {
+  /**
+   * `signal` cancels the request (e.g. a cancelled team discussion); it then fails with code TIMEOUT.
+   * `tag` says what the request is for, for the AI usage tracker (which may refuse it: AI_LIMIT).
+   */
+  async generate(body: GenerateRequest, opts: { signal?: AbortSignal; tag?: UsageTag; retries?: number } = {}): Promise<GenerateResult> {
     const url = new URL(`https://${GEMINI_HOST}/v1beta/models/${encodeURIComponent(this.opts.model)}:generateContent`);
-    const maxRetries = this.opts.maxRetries ?? 0;
+    // `retries` (per call) overrides the client's default: extra attempts after a 500/503 or network error only.
+    const maxRetries = Math.min(2, opts.retries ?? this.opts.maxRetries ?? 0);
     for (let attempt = 0; ; attempt++) {
-      const started = Date.now();
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), this.opts.timeoutMs);
-      let res: Response;
+      // Every attempt is a real request: the meter checks the limits and counts it first.
+      const finish = this.opts.meter?.begin({ ...(opts.tag ?? { feature: 'other' }), model: this.opts.model });
       try {
-        res = await this.fetchImpl(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': this.opts.apiKey },
-          body: JSON.stringify(body),
-          redirect: 'manual',
-          signal: ctrl.signal,
-        });
+        const result = await this.once(url, body, opts.signal);
+        finish?.({ ok: true, usage: result.usage ?? null });
+        return result;
       } catch (e) {
-        clearTimeout(timer);
-        const timedOut = (e as Error)?.name === 'AbortError';
-        this.logLine(url, timedOut ? 'timeout' : 'network-error', started);
-        if (attempt < maxRetries && !timedOut) {
-          await this.sleep(1000);
-          continue;
-        }
-        throw timedOut
-          ? new IntegrationError('TIMEOUT', `Gemini did not answer within ${Math.round(this.opts.timeoutMs / 1000)} seconds.`)
-          : new IntegrationError('NETWORK', 'Could not reach Gemini.');
+        const err = e instanceof IntegrationError ? e : new IntegrationError('INTERNAL', 'Unexpected error while calling Gemini.');
+        const cancelled = !!opts.signal?.aborted;
+        finish?.({ ok: false, code: cancelled ? 'CANCELLED' : err.code });
+        const retry = !cancelled && attempt < maxRetries && (err.code === 'NETWORK' || (err.code === 'UPSTREAM_ERROR' && (err.httpStatus === 500 || err.httpStatus === 503)));
+        if (!retry) throw err;
+        // An overloaded model (503) usually needs a few seconds; wait a little longer each time.
+        await this.sleep(err.code === 'NETWORK' ? 1000 : err.httpStatus === 503 ? 4000 * (attempt + 1) : 1500);
       }
-      clearTimeout(timer);
-      this.logLine(url, String(res.status), started);
-      const text = await res.text().catch(() => '');
-      if (res.ok) return parse(text);
-
-      const reason = errorReason(text);
-      if ((res.status === 500 || res.status === 503) && attempt < maxRetries) {
-        await this.sleep(1500);
-        continue;
-      }
-      if (res.status === 429)
-        throw new IntegrationError(
-          'RATE_LIMITED',
-          `Gemini's usage limit was reached (the free tier allows only a small number of requests per minute and per day). Try again later, or use a paid key.`,
-          undefined,
-          429,
-        );
-      if (res.status === 400 && /API_KEY_INVALID|API key not valid/i.test(reason))
-        throw new IntegrationError('AUTH_FAILED', 'Gemini rejected the API key (GEMINI_API_KEY is invalid or was revoked).', undefined, 400);
-      if (res.status === 401 || res.status === 403)
-        throw new IntegrationError('AUTH_FAILED', 'Gemini refused the API key for this model or project.', undefined, res.status);
-      if (res.status === 404)
-        throw new IntegrationError('NOT_CONFIGURED', `Gemini has no model named "${this.opts.model}" for this key. Set GEMINI_MODEL in .env (run "npm run gemini-models" to list them).`, undefined, 404);
-      throw new IntegrationError('UPSTREAM_ERROR', `Gemini returned HTTP ${res.status}${reason ? `: ${reason.slice(0, 160)}` : ''}.`, undefined, res.status);
     }
+  }
+
+  /** One HTTP request to Gemini; every failure becomes an IntegrationError. */
+  private async once(url: URL, body: GenerateRequest, signal?: AbortSignal): Promise<GenerateResult> {
+    const started = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), this.opts.timeoutMs);
+    const onCancel = () => ctrl.abort();
+    if (signal?.aborted) ctrl.abort();
+    signal?.addEventListener('abort', onCancel, { once: true });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': this.opts.apiKey },
+        body: JSON.stringify(body),
+        redirect: 'manual',
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onCancel);
+      if (signal?.aborted) throw new IntegrationError('TIMEOUT', 'The request was cancelled.');
+      const timedOut = (e as Error)?.name === 'AbortError';
+      this.logLine(url, timedOut ? 'timeout' : 'network-error', started);
+      throw timedOut
+        ? new IntegrationError('TIMEOUT', `Gemini did not answer within ${Math.round(this.opts.timeoutMs / 1000)} seconds.`)
+        : new IntegrationError('NETWORK', 'Could not reach Gemini.');
+    }
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onCancel);
+    this.logLine(url, String(res.status), started);
+    const text = await res.text().catch(() => '');
+    if (signal?.aborted) throw new IntegrationError('TIMEOUT', 'The request was cancelled.');
+    if (res.ok) return parse(text);
+
+    const reason = errorReason(text);
+    if (res.status === 429)
+      throw new IntegrationError(
+        'RATE_LIMITED',
+        `Gemini's usage limit was reached (the free tier allows only a small number of requests per minute and per day). Try again later, or use a paid key.`,
+        undefined,
+        429,
+      );
+    if (res.status === 400 && /API_KEY_INVALID|API key not valid/i.test(reason))
+      throw new IntegrationError('AUTH_FAILED', 'Gemini rejected the API key (GEMINI_API_KEY is invalid or was revoked).', undefined, 400);
+    if (res.status === 401 || res.status === 403)
+      throw new IntegrationError('AUTH_FAILED', 'Gemini refused the API key for this model or project.', undefined, res.status);
+    if (res.status === 404)
+      throw new IntegrationError('NOT_CONFIGURED', `Gemini has no model named "${this.opts.model}" for this key. Set GEMINI_MODEL in .env (run "npm run gemini-models" to list them).`, undefined, 404);
+    if (res.status === 503)
+      throw new IntegrationError(
+        'UPSTREAM_ERROR',
+        `Gemini is overloaded right now (Google's servers are busy, HTTP 503). This is temporary and not a problem in the office: try again in a minute. If it keeps happening, set GEMINI_MODEL to another model.`,
+        undefined,
+        503,
+      );
+    throw new IntegrationError('UPSTREAM_ERROR', `Gemini returned HTTP ${res.status}${reason ? `: ${reason.slice(0, 160)}` : ''}.`, undefined, res.status);
   }
 
   private logLine(url: URL, outcome: string, started: number) {
@@ -134,6 +169,7 @@ function parse(text: string): GenerateResult {
   let j: {
     candidates?: { content?: GeminiContent; finishReason?: string }[];
     promptFeedback?: { blockReason?: string };
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number; thoughtsTokenCount?: number };
   };
   try {
     j = JSON.parse(text);
@@ -146,5 +182,10 @@ function parse(text: string): GenerateResult {
   if (c.finishReason === 'SAFETY' || c.finishReason === 'PROHIBITED_CONTENT' || c.finishReason === 'BLOCKLIST')
     throw new IntegrationError('UPSTREAM_ERROR', `Gemini stopped the answer (${c.finishReason}).`);
   const content: GeminiContent = { role: 'model', parts: Array.isArray(c.content?.parts) ? c.content!.parts : [] };
-  return { content, finishReason: c.finishReason ?? null };
+  const u = j.usageMetadata;
+  const usage =
+    u && typeof u.totalTokenCount === 'number'
+      ? { promptTokens: u.promptTokenCount ?? 0, outputTokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0), totalTokens: u.totalTokenCount }
+      : null;
+  return { content, finishReason: c.finishReason ?? null, usage };
 }

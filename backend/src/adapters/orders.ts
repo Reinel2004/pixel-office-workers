@@ -9,6 +9,9 @@
 //              items, items_done, least_stage, last_progress_at, gross_price, downpayment,
 //              customer_name, carpenters[], hamba_carpenters[], products?[] (with &products=1) }
 //   data.carpenters_available, data.carpenter_roster (names, or null)
+// Piece specifications for one order (Tess's inspection checklist):
+//   {ORDERS_API_BASE_URL}ceo/office-order-spec.php?order=ORD-…  (api/ceo/office-order-spec.php)
+//   data { order_number, status, due_date, pieces[], truncated }  — no customer data or prices.
 // customer_name is kept for display only: reports show it next to the order number, and the AI
 // tools never include it (server/ai/tasks.ts builds their data from explicit fields).
 // Payments: balance = max(0, gross_price - downpayment), the rule orders.php uses; a Delivered
@@ -17,7 +20,8 @@
 // order: a Finished order that has not reached the customer by its due date still counts as
 // overdue (decided by the owner). Progress = pieces at stage "done" / all pieces.
 
-import type { DateRange, SystemStatus } from '../../shared/live';
+import type { DateRange, OrderSpec, PieceSpec, SystemStatus } from '../../shared/live';
+import { ORDER_REF_PATTERN } from '../../shared/live';
 import type { SystemConfig } from '../config';
 import type { ApiClient } from '../http/client';
 import { IntegrationError } from '../http/errors';
@@ -59,6 +63,56 @@ export class OrdersAdapter implements OrderSource {
     return (await this.fetch({ open: '1', ...(opts.products ? { products: '1' } : {}) })).filter((o) => o.isClosed !== true);
   }
 
+  /** One order's pieces. 404 = the order does not exist, or office-order-spec.php is not uploaded yet. */
+  async getOrderSpec(ref: string): Promise<OrderSpec> {
+    ensureConfigured(this.config, this.authConfigured, this.id);
+    const name = this.config.name;
+    if (!ORDER_REF_PATTERN.test(ref)) throw new IntegrationError('INVALID_RESPONSE', 'That order number is not valid.', this.id);
+    let body: unknown;
+    try {
+      ({ data: body } = await this.client.getJson<unknown>('ceo/office-order-spec.php', { query: { order: ref } }));
+    } catch (e) {
+      if (e instanceof IntegrationError && e.httpStatus === 404)
+        throw new IntegrationError(
+          'NOT_SUPPORTED',
+          `${name} did not find order ${ref}, or does not have api/ceo/office-order-spec.php yet (upload it to the server).`,
+          this.id,
+          404,
+        );
+      throw e;
+    }
+    const data = envelope(body, name, this.id);
+    if (!Array.isArray(data.pieces)) throw invalid(name, this.id, 'pieces');
+    const text = (v: unknown, max = 60) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+    const pieces: PieceSpec[] = (data.pieces as Record<string, unknown>[]).slice(0, 200).map((p) => ({
+      category: text(p.category),
+      type: text(p.type, 120),
+      size: text(p.size),
+      thickness: text(p.thickness),
+      wood: text(p.wood),
+      finish: text(p.finish),
+      jamb: text(p.hamba),
+      jambWood: text(p.hamba_wood),
+      jambSize: text(p.hamba_size),
+      cnc: typeof p.requires_cnc === 'boolean' ? p.requires_cnc : null,
+      tableShape: text(p.table_shape),
+      length: text(p.dim_length, 20),
+      width: text(p.dim_width, 20),
+      height: text(p.dim_height, 20),
+      notes: text(p.notes, 500),
+      hasDesignPhoto: p.has_image === true,
+      hasColorSample: p.has_color_image === true,
+      stage: text(p.stage, 20),
+    }));
+    return {
+      ref: typeof data.order_number === 'string' && data.order_number ? data.order_number : ref,
+      status: text(data.status),
+      dueDate: typeof data.due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.due_date) ? data.due_date : null,
+      pieces,
+      truncated: data.truncated === true,
+    };
+  }
+
   private async fetch(query: Record<string, string>): Promise<OrderRecord[]> {
     ensureConfigured(this.config, this.authConfigured, this.id);
     const name = this.config.name;
@@ -89,6 +143,7 @@ export function toOrder(r: Record<string, unknown>, name: string, system: 'order
   return {
     ref: r.order_number,
     orderId: typeof r.group_id === 'string' ? r.group_id : r.order_number,
+    recordId: typeof r.record_id === 'number' && Number.isInteger(r.record_id) && r.record_id > 0 ? r.record_id : null,
     status,
     isClosed,
     dueDate: r.due_date && r.due_date !== '0000-00-00' ? dateOf(r.due_date, name, system) : null,

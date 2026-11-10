@@ -99,6 +99,17 @@ export class JobRunner extends EventEmitter {
     super();
   }
 
+  /** For the Systems Monitor: task counts only (no prompts, users or results). */
+  stats() {
+    const since = Date.now() - 86_400_000;
+    const recent = this.jobs.filter((j) => Date.parse(j.createdAt) >= since);
+    const by = (s: Job['status']) => recent.filter((j) => j.status === s).length;
+    const failedCodes: Record<string, number> = {};
+    for (const j of recent.filter((x) => x.status === 'failed'))
+      for (const st of j.steps) if (st.error) failedCodes[st.error.code] = (failedCodes[st.error.code] ?? 0) + 1;
+    return { last24h: { total: recent.length, completed: by('completed'), failed: by('failed') }, queuedNow: by('queued'), workingNow: by('working'), failureCodes: failedCodes };
+  }
+
   list(user: SessionUser): Job[] {
     return this.jobs.filter((j) => j.requestedBy === user.username);
   }
@@ -481,6 +492,11 @@ export class JobRunner extends EventEmitter {
  */
 export function checkImage(agent: LiveAgentId, img: { mimeType: string; data: string }) {
   if (!IMAGE_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take photos.`);
+  return checkImageData(img);
+}
+
+/** Checks a base64 image: allowed type, size, and that its bytes really are that type. */
+export function checkImageData(img: { mimeType: string; data: string }) {
   if (!(IMAGE_TYPES as readonly string[]).includes(img.mimeType)) throw new SubmitError(400, 'Use a JPEG, PNG or WebP photo.');
   const data = img.data.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
   if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new SubmitError(400, 'The photo could not be read.');

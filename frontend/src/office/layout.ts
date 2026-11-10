@@ -151,7 +151,6 @@ add('whiteboard', 'intel', 1, 6, 1, 3, { wall: true, blocks: false });
 
 // --- Operations Hub (green, upper-left) ---
 add('whiteboard', 'ops', 3, 13, 3, 1, { wall: true, blocks: false });
-desk('ops', 3, 20);
 desk('ops', 7, 20);
 add('shelf', 'ops', 8, 13, 2, 1);
 add('printer', 'ops', 10, 13);
@@ -160,9 +159,7 @@ add('tallPlant', 'ops', 11, 23);
 add('cabinet', 'ops', 1, 22);
 
 // --- Development Studio (blue, upper-right) ---
-desk('dev', 20, 4);
-desk('dev', 16, 8);
-desk('dev', 20, 8);
+// Desks (from the roster): Dev, Sam, Ivy in the back row; Aya, Rey, Kim in the front row.
 add('whiteboard', 'dev', 15, 1, 3, 1, { wall: true, blocks: false });
 add('shelf', 'dev', 20, 1, 2, 1);
 add('beanbag', 'dev', 22, 10);
@@ -276,6 +273,14 @@ export const MEETING_SLOTS: { x: number; y: number }[] = [
 ];
 export const MEETING_CENTER = { x: 18, y: 18 };
 
+/** Standing spots at the Development Studio whiteboard (UI Review), facing the board. */
+export const DEV_BOARD_SLOTS: { x: number; y: number }[] = [
+  { x: 15, y: 2 },
+  { x: 16, y: 2 },
+  { x: 17, y: 2 },
+  { x: 16, y: 3 },
+];
+
 /** Named points of interest used by workflows. */
 export const SPOTS = {
   creativeEasel: { x: 29, y: 5 },
@@ -283,6 +288,8 @@ export const SPOTS = {
   photoEasel: { x: 27, y: 4 },
   opsBoard: { x: 4, y: 14 },
   pantryCounter: { x: 20, y: 26 },
+  /** In front of the Development Studio whiteboard, where Aya, Kim and Rey gather for a UI Review. */
+  devBoard: { x: 16, y: 1 },
   /** Where Paolo stands when he checks the shop floor (in the aisle, facing the benches). */
   shopInspect: { x: 30, y: 40 },
 };

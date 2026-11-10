@@ -2,7 +2,8 @@
 // holds all credentials. Live results are kept in memory here and never written to
 // localStorage, and they are never mixed with the demo engine's mock tasks.
 
-import type { FacebookStatus, OrderPick, ScheduledPost, ShopCounts } from '../../shared/live';
+import type { AiLimits, AiUsageReport, AttentionItem, AttentionReport, Discussion, DiscussionInput, FacebookStatus, InspectionChecklist, OrderPick, ScheduledPost, ShopCounts, UiReview, UiReviewInput, UiVerifyInput } from '../../shared/live';
+import { DISCUSSION_ACTIVE, UI_REVIEW_RUNNING } from '../../shared/live';
 import type { AiStatus, DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, ReportType, SessionUser, SystemStatus } from '../../shared/live';
 import { LIVE_AGENT_IDS, SYSTEM_NAMES } from '../../shared/live';
 import { AGENT_BY_ID } from '../agents/roster';
@@ -72,6 +73,408 @@ export class LiveStore {
 
   constructor(private engine: Engine) {
     engine.shopRefresh = () => void this.loadWorkshop(true);
+  }
+
+  // ---------------------------------------------------------------- team discussions
+  /** This user's discussions from the server (Connected Mode only; demo ones live in the engine). */
+  discussions: Discussion[] = [];
+  discussionsLoaded = false;
+  discussionError: string | null = null;
+  private startingDiscussion = false;
+  /** The discussion currently shown at the Command Center table, and what each agent last said. */
+  private officeMeeting: string | null = null;
+  private officeSaid = new Map<string, string>();
+
+  get discussionStarting() {
+    return this.startingDiscussion;
+  }
+
+  async loadDiscussions() {
+    try {
+      const { discussions } = await api<{ discussions: Discussion[] }>('/api/discussions');
+      this.discussions = discussions;
+      this.discussionsLoaded = true;
+      this.discussionError = null;
+      // After a reload: a discussion still running on the server gathers the agents again.
+      const active = discussions.find((d) => DISCUSSION_ACTIVE.includes(d.status));
+      if (active) this.syncOffice(active);
+    } catch (e) {
+      this.discussionsLoaded = true;
+      this.discussionError = `Could not load discussions: ${(e as Error).message}`;
+    }
+    this.emit();
+  }
+
+  /** Starts a discussion on the server. One request at a time; the key makes a resend harmless. */
+  async startDiscussion(input: DiscussionInput): Promise<Discussion | null> {
+    if (this.startingDiscussion) return null;
+    this.startingDiscussion = true;
+    this.discussionError = null;
+    this.emit();
+    try {
+      const { discussion } = await api<{ discussion: Discussion }>('/api/discussions', { method: 'POST', body: JSON.stringify(input) });
+      this.upsertDiscussion(discussion);
+      this.addLog(`Team discussion started: ${discussion.topic}`, 'info', 'chief');
+      return discussion;
+    } catch (e) {
+      this.discussionError = (e as Error).message;
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      return null;
+    } finally {
+      this.startingDiscussion = false;
+      this.emit();
+    }
+  }
+
+  async cancelDiscussion(id: string) {
+    try {
+      const { discussion } = await api<{ discussion: Discussion }>(`/api/discussions/${id}/cancel`, { method: 'POST', body: '{}' });
+      this.upsertDiscussion(discussion);
+    } catch (e) {
+      this.discussionError = `Could not cancel: ${(e as Error).message}`;
+      this.emit();
+    }
+  }
+
+  private upsertDiscussion(d: Discussion) {
+    const i = this.discussions.findIndex((x) => x.id === d.id);
+    const prev = i >= 0 ? this.discussions[i] : null;
+    if (prev && prev.updatedAt > d.updatedAt) return; // stale (a late HTTP response)
+    if (i >= 0) this.discussions[i] = d;
+    else this.discussions.unshift(d);
+    this.discussions.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (prev && DISCUSSION_ACTIVE.includes(prev.status) && !DISCUSSION_ACTIVE.includes(d.status))
+      this.addLog(
+        d.status === 'completed' ? `Team discussion finished${d.partial ? ' (some contributions missing)' : ''}: ${d.topic}` : d.status === 'cancelled' ? 'Team discussion cancelled.' : `Team discussion failed: ${d.error ?? ''}`,
+        d.status === 'completed' ? 'success' : d.status === 'cancelled' ? 'warn' : 'error',
+        'chief',
+      );
+    if (prev && DISCUSSION_ACTIVE.includes(prev.status) && !DISCUSSION_ACTIVE.includes(d.status)) this.refreshAttentionSoon();
+    this.syncOffice(d);
+    this.emit();
+  }
+
+  /** Moves the participants to the Command Center table and shows short statuses from the real state. */
+  private syncOffice(d: Discussion) {
+    const e = this.engine;
+    if (!e.connected) return;
+    if (!DISCUSSION_ACTIVE.includes(d.status)) {
+      if (this.officeMeeting === d.id) {
+        e.endMeeting(d.id);
+        this.officeMeeting = null;
+      }
+      return;
+    }
+    if (this.officeMeeting !== d.id || e.meeting?.id !== d.id) {
+      e.startMeeting(d.id, ['chief', ...d.participants]);
+      this.officeMeeting = d.id;
+      this.officeSaid.clear();
+    }
+    const label = (agent: LiveAgentId) => {
+      if (d.status === 'queued') return 'Waiting for the discussion to start';
+      if (d.status === 'gathering') return 'Reviewing data';
+      const m = d.messages.find((x) => x.agent === agent && x.status === 'working');
+      if (m) return m.round === 'proposal' ? 'Proposing' : m.round === 'review' ? 'Reviewing ideas' : 'Writing the summary';
+      return agent === 'chief' ? 'Moderating' : 'Listening';
+    };
+    for (const a of ['chief', ...d.participants] as LiveAgentId[]) {
+      const text = label(a);
+      const key = `${d.id}|${a}`;
+      const changed = this.officeSaid.get(key) !== text;
+      this.officeSaid.set(key, text);
+      // A short bubble only when that agent starts something new.
+      e.meetingStatus(d.id, a, text, changed && text !== 'Listening' && text !== 'Moderating' ? text : undefined);
+    }
+  }
+
+  // ---------------------------------------------------------------- UI Review (Aya, Kim, Rey)
+  /** This user's UI Reviews from the server (Connected Mode only; demo ones live in the engine). */
+  uiReviews: UiReview[] = [];
+  uiReviewsLoaded = false;
+  uiReviewError: string | null = null;
+  uiReviewBusy = false;
+  /** Screenshots shown in this browser only (data URLs), per review: never stored. */
+  uiShots = new Map<string, { before: string[]; after: string[][] }>();
+  private officeHuddle: string | null = null;
+
+  canUiReview(): { ok: boolean; reason?: string } {
+    if (this.server !== 'signed_in' || !this.user) return { ok: false, reason: 'Sign in first.' };
+    if (!this.user.permissions.includes('ui:review')) return { ok: false, reason: 'Your account cannot use UI Review (admin and manager accounts can).' };
+    if (!this.ai?.ready) return { ok: false, reason: 'AI is not set up on the server (GEMINI_API_KEY).' };
+    return { ok: true };
+  }
+
+  async loadUiReviews() {
+    if (!this.user?.permissions.includes('ui:review')) {
+      this.uiReviewsLoaded = true;
+      return this.emit();
+    }
+    try {
+      const { reviews } = await api<{ reviews: UiReview[] }>('/api/ui-reviews');
+      this.uiReviews = reviews;
+      this.uiReviewError = null;
+      const active = reviews.find((r) => UI_REVIEW_RUNNING.includes(r.status));
+      if (active) this.syncHuddle(active);
+    } catch (e) {
+      this.uiReviewError = `Could not load UI Reviews: ${(e as Error).message}`;
+    }
+    this.uiReviewsLoaded = true;
+    this.emit();
+  }
+
+  private async uiCall(path: string, body: unknown): Promise<UiReview | null> {
+    if (this.uiReviewBusy) return null;
+    this.uiReviewBusy = true;
+    this.uiReviewError = null;
+    this.emit();
+    try {
+      const { review } = await api<{ review: UiReview }>(path, { method: 'POST', body: JSON.stringify(body) });
+      this.upsertUiReview(review);
+      return review;
+    } catch (e) {
+      this.uiReviewError = (e as Error).message;
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      return null;
+    } finally {
+      this.uiReviewBusy = false;
+      this.emit();
+    }
+  }
+
+  async startUiReview(input: UiReviewInput): Promise<UiReview | null> {
+    const r = await this.uiCall('/api/ui-reviews', input);
+    if (r) {
+      this.uiShots.set(r.id, { before: input.shots.map((x) => x.data), after: [] });
+      this.addLog(`UI Review started: ${r.page}`, 'info', 'aya');
+    }
+    return r;
+  }
+
+  acceptUiChanges(id: string, changes: string[]) {
+    return this.uiCall(`/api/ui-reviews/${id}/accept`, { changes });
+  }
+
+  async verifyUiReview(id: string, input: UiVerifyInput): Promise<UiReview | null> {
+    const r = await this.uiCall(`/api/ui-reviews/${id}/verify`, input);
+    if (r) {
+      const shots = this.uiShots.get(id) ?? { before: [], after: [] };
+      shots.after[r.verifications.length - 1] = input.shots.map((x) => x.data);
+      this.uiShots.set(id, shots);
+      this.addLog(`Kim is re-checking: ${r.page}`, 'info', 'kim');
+    }
+    return r;
+  }
+
+  cancelUiReview(id: string) {
+    return this.uiCall(`/api/ui-reviews/${id}/cancel`, {});
+  }
+
+  private upsertUiReview(r: UiReview) {
+    const i = this.uiReviews.findIndex((x) => x.id === r.id);
+    const prev = i >= 0 ? this.uiReviews[i] : null;
+    if (prev && prev.updatedAt > r.updatedAt) return; // stale (a late HTTP response)
+    if (i >= 0) this.uiReviews[i] = r;
+    else this.uiReviews.unshift(r);
+    this.uiReviews.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const was = prev ? UI_REVIEW_RUNNING.includes(prev.status) : false;
+    if (was && !UI_REVIEW_RUNNING.includes(r.status)) {
+      if (r.status === 'proposed' && prev?.status !== 'verifying') this.addLog(`UI Review plan ready: ${r.page}. Open it to choose changes.`, 'success', 'rey');
+      else if (r.status === 'verified') this.addLog(`Kim's re-check: ${r.verifications[r.verifications.length - 1]?.verdict === 'ready' ? 'ready to release' : 'needs fixes'} (${r.page})`, 'success', 'kim');
+      else if (r.status === 'failed' || r.error) this.addLog(`UI Review problem: ${r.error ?? 'failed'}`, 'error', 'aya');
+      else if (r.status === 'cancelled') this.addLog('UI Review cancelled.', 'warn', 'aya');
+    }
+    if (was && !UI_REVIEW_RUNNING.includes(r.status)) this.refreshAttentionSoon();
+    this.syncHuddle(r);
+    this.emit();
+  }
+
+  /** Aya, Kim and Rey gather at the Development Studio whiteboard while a step runs. */
+  private syncHuddle(r: UiReview) {
+    const e = this.engine;
+    if (!e.connected) return;
+    if (!UI_REVIEW_RUNNING.includes(r.status)) {
+      if (this.officeHuddle === r.id) {
+        e.endMeeting(r.id);
+        this.officeHuddle = null;
+      }
+      return;
+    }
+    const team: LiveAgentId[] = r.status === 'verifying' ? ['kim'] : ['aya', 'kim', 'rey'];
+    if (this.officeHuddle !== r.id || !e.hasMeeting(r.id)) {
+      if (this.officeHuddle && this.officeHuddle !== r.id) e.endMeeting(this.officeHuddle);
+      e.startMeeting(r.id, team, 'devboard');
+      this.officeHuddle = r.id;
+    }
+    const steps = r.status === 'verifying' ? [r.verifications[r.verifications.length - 1]?.step].filter(Boolean) : r.steps;
+    for (const a of team) {
+      const st = steps.find((x) => x!.agent === a && x!.status === 'working');
+      const label = r.status === 'queued' ? 'Waiting for the review to start' : st ? (st.kind === 'design' ? 'Reviewing the design' : st.kind === 'usability' ? 'Testing the workflow' : st.kind === 'plan' ? 'Writing the change plan' : 'Comparing before and after') : 'Listening';
+      const key = `${r.id}|${a}`;
+      const changed = this.officeSaid.get(key) !== label;
+      this.officeSaid.set(key, label);
+      e.meetingStatus(r.id, a, label, changed && label !== 'Listening' ? label : undefined);
+    }
+  }
+
+  // ---------------------------------------------------------------- Attention needed
+  /** Failed connections, blocked work, AI limits and overdue orders for this account (from the server). */
+  attention: AttentionReport | null = null;
+  attentionError: string | null = null;
+  attentionLoading = false;
+  /** Items this browser dismissed: id -> the version dismissed (a changed item comes back). */
+  private dismissed: Record<string, string> = {};
+  private attentionAt = 0;
+  private attentionTimer: ReturnType<typeof setInterval> | null = null;
+  private attentionSoon: ReturnType<typeof setTimeout> | null = null;
+  /** Asks the live feed to open a tab (e.g. Systems from an Attention link). */
+  feedTabRequest: { tab: 'systems'; n: number } | null = null;
+
+  private dismissedKey() {
+    return `wad-ai-office:attention-dismissed:v1:${this.user?.username ?? ''}`;
+  }
+  private loadDismissed() {
+    try {
+      const v = JSON.parse(window.localStorage.getItem(this.dismissedKey()) ?? '{}') as unknown;
+      this.dismissed = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, string>) : {};
+    } catch {
+      this.dismissed = {};
+    }
+  }
+  private saveDismissed() {
+    try {
+      window.localStorage.setItem(this.dismissedKey(), JSON.stringify(this.dismissed));
+    } catch {
+      /* private window or storage off: dismissals last until reload */
+    }
+  }
+
+  /** Items still to look at (not dismissed, or changed since). */
+  get attentionItems(): AttentionItem[] {
+    return (this.attention?.items ?? []).filter((i) => this.dismissed[i.id] !== i.version);
+  }
+  get attentionDismissedCount() {
+    return (this.attention?.items.length ?? 0) - this.attentionItems.length;
+  }
+
+  async loadAttention(force = false) {
+    if (this.server !== 'signed_in' || this.attentionLoading) return;
+    if (!force && Date.now() - this.attentionAt < 10_000) return;
+    this.attentionLoading = true;
+    this.emit();
+    try {
+      this.attention = (await api<{ attention: AttentionReport }>('/api/attention')).attention;
+      this.attentionAt = Date.now();
+      this.attentionError = null;
+      // Forget dismissals of things that are gone, so the list in storage stays small.
+      const ids = new Set(this.attention.items.map((i) => i.id));
+      for (const id of Object.keys(this.dismissed)) if (!ids.has(id)) delete this.dismissed[id];
+      this.saveDismissed();
+    } catch (e) {
+      this.attentionError = `Could not check for problems: ${(e as Error).message}`;
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+    } finally {
+      this.attentionLoading = false;
+      this.emit();
+    }
+  }
+
+  /** Re-checks shortly after something finished or failed (several events = one request). */
+  private refreshAttentionSoon() {
+    if (this.server !== 'signed_in' || this.attentionSoon) return;
+    this.attentionSoon = setTimeout(() => {
+      this.attentionSoon = null;
+      void this.loadAttention(true);
+    }, 2000);
+  }
+
+  dismissAttention(item: AttentionItem) {
+    this.dismissed[item.id] = item.version;
+    this.saveDismissed();
+    this.emit();
+  }
+  restoreAttention() {
+    this.dismissed = {};
+    this.saveDismissed();
+    this.emit();
+  }
+  showFeedTab(tab: 'systems') {
+    this.feedTabRequest = { tab, n: (this.feedTabRequest?.n ?? 0) + 1 };
+    this.emit();
+  }
+
+  // ---------------------------------------------------------------- AI usage tracker
+  /** Requests, tokens and limits from the server (admin and manager accounts). */
+  aiUsage: AiUsageReport | null = null;
+  aiUsageError: string | null = null;
+  aiUsageSaving = false;
+  private loadingUsage = false;
+
+  canSeeAiUsage() {
+    return this.server === 'signed_in' && !!this.user?.permissions.includes('ai:usage');
+  }
+
+  async loadAiUsage() {
+    if (!this.canSeeAiUsage() || this.loadingUsage) return;
+    this.loadingUsage = true;
+    try {
+      this.aiUsage = (await api<{ usage: AiUsageReport }>('/api/ai/usage')).usage;
+      this.aiUsageError = null;
+    } catch (e) {
+      this.aiUsageError = `Could not load AI usage: ${(e as Error).message}`;
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+    } finally {
+      this.loadingUsage = false;
+      this.emit();
+    }
+  }
+
+  /** Saves new limits (admin only); null = back to the server's defaults. Returns an error message or null. */
+  async saveAiLimits(limits: AiLimits | null): Promise<string | null> {
+    if (this.aiUsageSaving) return 'Already saving.';
+    this.aiUsageSaving = true;
+    this.emit();
+    try {
+      const { usage } = await api<{ usage: AiUsageReport }>('/api/ai/usage/limits', { method: 'POST', body: JSON.stringify(limits ? { limits } : { reset: true }) });
+      this.aiUsage = usage;
+      this.addLog(limits ? 'AI usage limits changed.' : 'AI usage limits reset to the server defaults.', 'info', 'sam');
+      this.refreshAttentionSoon();
+      return null;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      return (e as Error).message;
+    } finally {
+      this.aiUsageSaving = false;
+      this.emit();
+    }
+  }
+
+  // ---------------------------------------------------------------- Tess (inspection checklists)
+  checklists = new Map<string, InspectionChecklist>();
+  checklistError: string | null = null;
+  checklistLoading: string | null = null;
+
+  /** Builds (on the server, by code) the inspection checklist for one order. */
+  async loadChecklist(ref: string): Promise<InspectionChecklist | null> {
+    if (this.checklistLoading) return null;
+    this.checklistLoading = ref;
+    this.checklistError = null;
+    this.emit();
+    try {
+      const { checklist } = await api<{ checklist: InspectionChecklist }>(`/api/orders/checklist?order=${encodeURIComponent(ref)}`);
+      this.checklists.set(ref, checklist);
+      this.addLog(`Inspection checklist ready: ${ref} (${checklist.pieces} piece(s))`, 'success', 'tess');
+      if (this.engine.connected) {
+        this.engine.visitShop('tess');
+        this.engine.leaveShop('tess');
+      }
+      return checklist;
+    } catch (e) {
+      this.checklistError = (e as Error).message;
+      return null;
+    } finally {
+      this.checklistLoading = null;
+      this.emit();
+    }
   }
 
   // ---------------------------------------------------------------- Workshop
@@ -174,6 +577,25 @@ export class LiveStore {
     this.scheduledPosts = null;
     this.fbError = null;
     this.orderPicks = null;
+    this.discussions = [];
+    this.discussionsLoaded = false;
+    if (this.officeMeeting) this.engine.endMeeting(this.officeMeeting);
+    this.officeMeeting = null;
+    this.uiReviews = [];
+    this.uiReviewsLoaded = false;
+    this.uiShots.clear();
+    this.checklists.clear();
+    this.aiUsage = null;
+    this.aiUsageError = null;
+    this.attention = null;
+    this.attentionError = null;
+    this.dismissed = {};
+    if (this.attentionTimer) clearInterval(this.attentionTimer);
+    this.attentionTimer = null;
+    if (this.attentionSoon) clearTimeout(this.attentionSoon);
+    this.attentionSoon = null;
+    if (this.officeHuddle) this.engine.endMeeting(this.officeHuddle);
+    this.officeHuddle = null;
     this.orderPicksError = null;
     this.shopLoadedAt = 0;
     if (this.engine.connected) this.engine.setShopLoad(null, 'loading');
@@ -201,6 +623,16 @@ export class LiveStore {
     this.ai = types.ai ?? null;
     void this.loadFacebook();
     void this.loadWorkshop(true);
+    void this.loadDiscussions();
+    void this.loadUiReviews();
+    this.loadDismissed();
+    void this.loadAttention(true);
+    // Every 2 minutes while this tab is visible (one small request; overdue orders come from the
+    // server's shared, cached read of the order system).
+    if (this.attentionTimer) clearInterval(this.attentionTimer);
+    this.attentionTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') void this.loadAttention();
+    }, 120_000);
     this.addLog(`Signed in as ${user.username} (${user.role}).`, 'info');
     this.openStream();
     this.emit();
@@ -232,6 +664,14 @@ export class LiveStore {
       const { shop } = JSON.parse((ev as MessageEvent).data) as { shop: ShopCounts };
       this.shopLoadedAt = Date.now();
       if (this.engine.connected) this.engine.setShopLoad({ ...shop, source: 'live' });
+    });
+    // Team discussion progress, pushed by the server as each step finishes (owner only).
+    es.addEventListener('discussion', (ev) => {
+      this.upsertDiscussion(JSON.parse((ev as MessageEvent).data) as Discussion);
+    });
+    // UI Review progress (owner only; never the screenshots).
+    es.addEventListener('uireview', (ev) => {
+      this.upsertUiReview(JSON.parse((ev as MessageEvent).data) as UiReview);
     });
     es.addEventListener('fb-scheduled', (ev) => {
       const { posts } = JSON.parse((ev as MessageEvent).data) as { posts: ScheduledPost[] };
@@ -435,6 +875,7 @@ export class LiveStore {
         if (job.status === 'completed') this.addLog(`${what} completed: ${job.title}.`, 'success', who, job.id);
         if (job.status === 'failed') this.addLog(`${what} failed: ${job.title} — ${job.error?.message ?? 'see details.'}`, 'error', who, job.id);
         if (job.type === 'ai.task' && (job.status === 'completed' || job.status === 'failed')) this.aiFinished(job);
+        if (job.status === 'failed' || job.status === 'completed') this.refreshAttentionSoon();
       }
     }
     if (job.type === 'ai.task') this.updateAiThinking();
@@ -473,6 +914,7 @@ export class LiveStore {
     const code = job.error?.code ?? job.steps[0]?.error?.code;
     if (job.status === 'completed') this.engine.setAiActivity('done', `Answer ready · ${who}`, 5000);
     else if (code === 'RATE_LIMITED') this.engine.setAiActivity('limited', 'AI usage limit reached', 30000);
+    else if (code === 'AI_LIMIT') this.engine.setAiActivity('limited', 'Office AI limit reached', 30000);
     else this.engine.setAiActivity('error', 'AI request failed', 8000);
   }
 

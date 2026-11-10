@@ -93,7 +93,13 @@ function customTemplate(agentId: AgentId, prompt: string): TaskOutput {
     mika: `Trend check (mock figures):\n• Orders this quarter: up 12% on last quarter\n• Best seller: narra panel doors with varnish\n• Slowest stage: finishing (avg 6 days)\nDemo figures only — live trends come from Connected Mode.`,
     carlo: `Caption idea:\n"Crafted with care, built to last. Another custom WAD door is ready for its new home. Message us for a quotation!"\nNot published — for review only.`,
     joy: `Reply draft (not sent):\n"Hi po [Customer name]! Thank you for your message. Your door is now in finishing, and we will update you as soon as it is ready for delivery."\n\nNotes for staff:\n• Demo only: live replies use the order you pick in Connected Mode.`,
+    tess: `Inspection checklist (sample order):\n• Dimensions: measure 36 x 84, thickness 1 3/4"\n• Design: panel door, compare with the design photo\n• Finish: with varnish, even coat, no drips\n• Jamb: with hamba, mahogany 2 x 6, even gap all around\n• Hardware: not recorded, confirm with sales\nDemo only: live checklists come from WAD Order Management.`,
     dev: `Data check (mock records):\n• 1 open order with no due date\n• 1 In Progress order with no carpenter\n• 1 piece with no price\nFix list: add the due date, assign a carpenter, enter the price. Demo only: live checks run in Connected Mode.`,
+    sam: `System check (demo):\n• Order system: answering, average 420 ms\n• Finance system: answering\n• Gemini: ready\n• Facebook: not set up\nDemo only: live checks run in Connected Mode.`,
+    ivy: `Security check (demo):\n• Sign-ins today: 6 ok, 1 failed (a typo)\n• No blocked cross-site requests\n• Settings: no warnings\nDemo only: live checks run in Connected Mode.`,
+    aya: `Design notes (demo):\n• The orders table is too wide on a phone: show each order as a card\n• Put "Add order" at the top right where staff look first\n• Increase text size to 14 px\nDemo only: start a UI Review with real screenshots in Connected Mode.`,
+    rey: `Change plan (demo):\n1. CSS: stack the table into cards below 640 px (effort M, low risk)\n2. HTML: move the "Add order" button into the header (effort S)\nCopy the brief into your coding tool; Rey does not change code himself.`,
+    kim: `Test plan (demo):\n• Open the page on a phone: no sideways scrolling\n• Tap every button: at least 44 px tall\n• Add an order with a missing field: a clear error appears\nDemo only: Kim re-checks your "after" screenshots in Connected Mode.`,
     chief: `Coordination plan:\n1. Break the request into owner tasks\n2. Assign to the right agent\n3. Review outputs before anything goes out\n4. Approve or send back with notes`,
   };
   return {
