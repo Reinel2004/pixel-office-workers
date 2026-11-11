@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
-import type { CatalogAddResult, CatalogProductInput, CatalogStatus } from '../../shared/live';
+import type { CatalogAddResult, CatalogBatchResult, CatalogProductInput, CatalogStatus } from '../../shared/live';
 import type { FinanceSource, OrderSource } from '../adapters/types';
 import { createApp } from '../app';
 import { Auth, hashPassword } from '../auth';
@@ -23,7 +23,7 @@ import {
   renderProduct,
 } from '../catalog/catalog';
 import { catalogConfig, loadConfig } from '../config';
-import { checkImage, checkVideo, JobRunner } from '../jobs/runner';
+import { checkImage, checkPhotos, checkVideo, JobRunner, SubmitError } from '../jobs/runner';
 
 const SAMPLE = [
   '// ─── PRODUCT DATA ───',
@@ -275,19 +275,86 @@ test('HTTP: only allowed accounts add products, same-site only, and one approval
 
     const first = await req('POST', '/api/catalog/products', body, mk);
     assert.equal(first.status, 200);
-    const added = ((await first.json()) as { product: CatalogAddResult }).product;
+    const added = ((await first.json()) as { result: CatalogAddResult }).result;
     assert.equal(added.productId, 10);
-    const again = (await (await req('POST', '/api/catalog/products', body, mk)).json()) as { product: CatalogAddResult; repeated: boolean };
+    const again = (await (await req('POST', '/api/catalog/products', body, mk)).json()) as { result: CatalogAddResult; repeated: boolean };
     assert.equal(again.repeated, true);
-    assert.equal(again.product.commitSha, added.commitSha);
+    assert.equal(again.result.commitSha, added.commitSha);
     assert.equal(gh.state.patches, 1, 'the same approval never adds a second product');
     assert.equal(countProducts(gh.files()['products.js']), 3);
     const log = audit.find((e) => e.event === 'catalog.added')!;
     assert.equal(log.user, 'mk');
     assert.ok(!JSON.stringify(audit).includes(JPEG), 'the photo is never logged');
+
+    // Several products: photos first (one request each), then ONE commit for all of them.
+    const photo = async (cookie: string) => ((await (await req('POST', '/api/catalog/photos', { image: { mimeType: 'image/jpeg', data: JPEG } }, cookie)).json()) as { photoId: string }).photoId;
+    const p1 = await photo(mk);
+    const p2 = await photo(mk);
+    const pOwn = await photo(own);
+    const items = [
+      { product: { ...DOOR, name: 'Batch Door' }, photoId: p1 },
+      { product: { ...DOOR, category: 'Cabinets', doorType: null, name: 'Batch Cabinet' }, photoId: p2 },
+    ];
+    // Someone else's photo, or the same photo twice, is refused before anything is sent.
+    assert.equal((await req('POST', '/api/catalog/batch', { key: 'kat-batch-x1', items: [{ ...items[0], photoId: pOwn }] }, mk)).status, 400);
+    assert.equal((await req('POST', '/api/catalog/batch', { key: 'kat-batch-x2', items: [items[0], { ...items[1], photoId: p1 }] }, mk)).status, 400);
+    assert.equal((await req('POST', '/api/catalog/batch', { key: 'kat-batch-x3', items: [items[0], { ...items[1], product: { ...DOOR, category: 'Chairs' } }] }, mk)).status, 400);
+    assert.equal(gh.state.patches, 1);
+    const batch = await req('POST', '/api/catalog/batch', { key: 'kat-batch-ok1', items }, mk);
+    assert.equal(batch.status, 200);
+    const br = ((await batch.json()) as { result: CatalogBatchResult }).result;
+    assert.deepEqual(br.products.map((p) => [p.productId, p.name, p.imagePath]), [
+      [11, 'Batch Door', 'assets/doors/wad-11.jpg'],
+      [12, 'Batch Cabinet', 'assets/cabinet/wad-12.jpg'],
+    ]);
+    assert.equal(gh.state.patches, 2, 'two products, one commit');
+    const again2 = (await (await req('POST', '/api/catalog/batch', { key: 'kat-batch-ok1', items }, mk)).json()) as { repeated: boolean };
+    assert.equal(again2.repeated, true);
+    assert.equal(gh.state.patches, 2);
+    assert.equal(countProducts(gh.files()['products.js']), 5);
+    assert.match(gh.commits.get(br.commitSha)!.message, /Add 2 products \(11–12\)[\s\S]*- 11: Batch Door[\s\S]*- 12: Batch Cabinet/);
+    // Used photos are gone: a new approval must upload them again.
+    assert.equal((await req('POST', '/api/catalog/batch', { key: 'kat-batch-ok2', items }, mk)).status, 400);
   } finally {
     app.close();
     server.closeAllConnections();
     server.close();
   }
+});
+
+test('several photos: only Kat, 2 to 10, each a real small photo; Kat gets them numbered with one entry per photo', async () => {
+  const two = [{ mimeType: 'image/jpeg', data: JPEG }, { mimeType: 'image/jpeg', data: JPEG }];
+  const ok = checkPhotos('kat', two);
+  assert.equal(ok.meta.count, 2);
+  const bad = (agent: 'kat' | 'carlo', v: unknown) => assert.throws(() => checkPhotos(agent, v), (e: SubmitError) => e instanceof SubmitError);
+  bad('carlo', two);
+  bad('kat', [two[0]]);
+  bad('kat', Array(11).fill(two[0]));
+  bad('kat', [two[0], { mimeType: 'image/png', data: JPEG }]);
+  bad('kat', [two[0], { mimeType: 'image/jpeg', data: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(310 * 1024)]).toString('base64') }]);
+
+  const sent: Record<string, unknown>[] = [];
+  const fetchImpl = (async (_u: string, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: '**Catalog entry 1**\n**Category:** Doors' }] }, finishReason: 'STOP' }] }), { status: 200 });
+  }) as typeof fetch;
+  const { runAiTask } = await import('../ai/tasks');
+  const { GeminiClient } = await import('../ai/gemini');
+  await runAiTask(
+    { ai: new GeminiClient({ apiKey: 'k', model: 'm', timeoutMs: 1000, fetchImpl }), finance: {} as FinanceSource, orders: {} as OrderSource, maxToolRounds: 1, maxRangeDays: 31, knowledgeDir: 'does-not-exist' },
+    { username: 'mk', role: 'marketing', permissions: ['catalog:write'] },
+    'kat',
+    'Draft catalog entries',
+    undefined,
+    undefined,
+    { photos: ok.list },
+  );
+  const body = sent[0] as { contents: { parts: { text?: string; inlineData?: unknown }[] }[]; systemInstruction: { parts: { text: string }[] } };
+  const parts = body.contents.at(-1)!.parts;
+  assert.deepEqual(parts.filter((p) => p.text?.startsWith('Photo')).map((p) => p.text), ['Photo 1 of 2:', 'Photo 2 of 2:']);
+  assert.equal(parts.filter((p) => p.inlineData).length, 2);
+  const sys = body.systemInstruction.parts[0].text;
+  assert.match(sys, /\*\*Catalog entry 1\*\*.*\*\*Catalog entry 2\*\*/s);
+  assert.match(sys, /\*\*Skip:\*\*/);
+  assert.doesNotMatch(sys, /Hashtags/, "Carlo's caption rules are not given to Kat");
 });

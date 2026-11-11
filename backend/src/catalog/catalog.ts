@@ -18,7 +18,7 @@
 // - The products.js file is never run here; it is edited as text, and checked before and after.
 // - A person approves every product in the office; the AI never calls this.
 
-import type { CatalogAddResult, CatalogCategory, CatalogDoorType, CatalogProductInput } from '../../shared/live';
+import type { CatalogAddResult, CatalogBatchResult, CatalogCategory, CatalogDoorType, CatalogProductInput } from '../../shared/live';
 import { CATALOG_CATEGORIES, CATALOG_DOOR_TYPES, CATALOG_LIMITS, CATALOG_MAX_IMAGE_BYTES } from '../../shared/live';
 
 export const GITHUB_HOST = 'api.github.com';
@@ -281,37 +281,73 @@ export class CatalogClient {
     return count;
   }
 
-  /** Adds one product (photo + entry) in one commit. At most 2 attempts if the branch moved meanwhile. */
+  /** Uploads a photo to the repository's storage (not yet part of any commit) and returns its id. */
+  async uploadPhoto(image: { data: string }): Promise<string> {
+    return (await this.call<{ sha: string }>('POST', 'git/blobs', { content: image.data, encoding: 'base64' })).sha;
+  }
+
+  /** Adds one product (photo + entry) in one commit. */
   async add(product: CatalogProductInput, image: { ext: string; data: string }, by: string): Promise<CatalogAddResult> {
-    const blob = await this.call<{ sha: string }>('POST', 'git/blobs', { content: image.data, encoding: 'base64' });
+    const blobSha = await this.uploadPhoto(image);
+    const r = await this.addMany([{ product, blobSha, ext: image.ext }], by);
+    return { productId: r.products[0].productId, imagePath: r.products[0].imagePath, commitSha: r.commitSha, commitUrl: r.commitUrl, siteUrl: r.siteUrl };
+  }
+
+  /**
+   * Adds several products (each with its uploaded photo) in ONE commit, with consecutive ids, so the
+   * site rebuilds once. At most 2 attempts if the branch moved meanwhile.
+   */
+  async addMany(items: { product: CatalogProductInput; blobSha: string; ext: string }[], by: string): Promise<CatalogBatchResult> {
+    if (!items.length) throw new CatalogError('INVALID', 'Choose at least one product.', 400);
     for (let attempt = 1; ; attempt++) {
       const snap = await this.snapshot();
-      const id = nextProductId(snap.text);
-      const folder = folderFor(snap.text, product.category);
-      const taken = new Set<string>();
-      try {
-        const list = await this.call<{ name: string }[]>('GET', `contents/${encodeURI(this.inRepo(`assets/${folder}`))}?ref=${snap.commitSha}`);
-        if (Array.isArray(list)) for (const f of list) taken.add(f.name.toLowerCase());
-      } catch (e) {
-        if (!(e instanceof CatalogError && e.code === 'NOT_FOUND')) throw e; // a new folder is fine
-      }
-      let fileName = `wad-${id}.${image.ext}`;
-      for (let n = 2; taken.has(fileName); n++) fileName = `wad-${id}-${n}.${image.ext}`;
-      const imagePath = `assets/${folder}/${fileName}`;
+      const first = nextProductId(snap.text);
       const eol = snap.text.includes('\r\n') ? '\r\n' : '\n';
-      const text = insertProduct(snap.text, renderProduct(id, product, imagePath, eol));
-      if (nextProductId(text) !== id + 1 || countProducts(text) !== countProducts(snap.text) + 1)
-        throw new CatalogError('FILE_CHANGED', `The office could not add the product to ${PRODUCTS_FILE} safely; nothing was changed.`, 409);
+      // File names already used in each photo folder (read once per folder).
+      const taken = new Map<string, Set<string>>();
+      const namesIn = async (folder: string) => {
+        if (!taken.has(folder)) {
+          const set = new Set<string>();
+          try {
+            const list = await this.call<{ name: string }[]>('GET', `contents/${encodeURI(this.inRepo(`assets/${folder}`))}?ref=${snap.commitSha}`);
+            if (Array.isArray(list)) for (const f of list) set.add(f.name.toLowerCase());
+          } catch (e) {
+            if (!(e instanceof CatalogError && e.code === 'NOT_FOUND')) throw e; // a new folder is fine
+          }
+          taken.set(folder, set);
+        }
+        return taken.get(folder)!;
+      };
+      let text = snap.text;
+      const added: CatalogBatchResult['products'] = [];
+      const files: { path: string; sha: string }[] = [];
+      for (const [i, it] of items.entries()) {
+        const id = first + i;
+        const folder = folderFor(snap.text, it.product.category);
+        const used = await namesIn(folder);
+        let fileName = `wad-${id}.${it.ext}`;
+        for (let n = 2; used.has(fileName); n++) fileName = `wad-${id}-${n}.${it.ext}`;
+        used.add(fileName);
+        const imagePath = `assets/${folder}/${fileName}`;
+        text = insertProduct(text, renderProduct(id, it.product, imagePath, eol));
+        added.push({ productId: id, imagePath, name: it.product.name });
+        files.push({ path: this.inRepo(imagePath), sha: it.blobSha });
+      }
+      if (nextProductId(text) !== first + items.length || countProducts(text) !== countProducts(snap.text) + items.length)
+        throw new CatalogError('FILE_CHANGED', `The office could not add the products to ${PRODUCTS_FILE} safely; nothing was changed.`, 409);
 
       const tree = await this.call<{ sha: string }>('POST', 'git/trees', {
         base_tree: snap.treeSha,
         tree: [
-          { path: this.inRepo(imagePath), mode: '100644', type: 'blob', sha: blob.sha },
+          ...files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', sha: f.sha })),
           { path: this.inRepo(PRODUCTS_FILE), mode: '100644', type: 'blob', content: text },
         ],
       });
+      const title =
+        items.length === 1 ? `Add product ${first}: ${items[0].product.name}` : `Add ${items.length} products (${first}–${first + items.length - 1})`;
+      const list = items.length === 1 ? '' : `\n\n${added.map((a) => `- ${a.productId}: ${a.name}`).join('\n')}`;
       const commit = await this.call<{ sha: string; html_url?: string }>('POST', 'git/commits', {
-        message: `Add product ${id}: ${product.name}\n\nAdded from WAD AI Office (Kat) by ${by}.`,
+        message: `${title}${list}\n\nAdded from WAD AI Office (Kat) by ${by}.`,
         tree: tree.sha,
         parents: [snap.commitSha],
       });
@@ -324,8 +360,7 @@ export class CatalogClient {
       }
       this.countCache = null;
       return {
-        productId: id,
-        imagePath,
+        products: added,
         commitSha: commit.sha,
         commitUrl: typeof commit.html_url === 'string' && commit.html_url.startsWith('https://github.com/') ? commit.html_url : null,
         siteUrl: this.o.siteUrl,

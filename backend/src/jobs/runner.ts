@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId, TaskTurn } from '../../shared/live';
-import { FB_VIDEO_MAX_BYTES, IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_FOLLOW_UPS, MAX_FRAME_BYTES, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, MAX_VIDEO_FRAMES, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES, VIDEO_AGENTS, VIDEO_TYPES } from '../../shared/live';
+import { CATALOG_AI_PHOTO_MAX_BYTES, CATALOG_MAX_BATCH, FB_VIDEO_MAX_BYTES, IMAGE_AGENTS, MULTI_PHOTO_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_FOLLOW_UPS, MAX_FRAME_BYTES, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, MAX_VIDEO_FRAMES, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES, VIDEO_AGENTS, VIDEO_TYPES } from '../../shared/live';
 import { redactContacts } from '../ai/redact';
 import { manilaDate } from '../../shared/manila';
 import type { FinanceRecord, FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
@@ -242,6 +242,7 @@ export class JobRunner extends EventEmitter {
     rawOrderRef?: string,
     key?: string,
     rawVideo?: unknown,
+    rawPhotos?: unknown,
   ): { job: Job; deduplicated: boolean } {
     if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
     const again = this.fromKey(user, key);
@@ -249,7 +250,8 @@ export class JobRunner extends EventEmitter {
     if (!LIVE_AGENT_IDS.includes(agent)) throw new SubmitError(400, 'Unknown agent.');
     const image = rawImage ? checkImage(agent, rawImage) : null;
     const video = rawVideo !== undefined && rawVideo !== null ? checkVideo(agent, rawVideo) : null;
-    if (image && video) throw new SubmitError(400, 'Send a photo or a video, not both.');
+    const photos = rawPhotos !== undefined && rawPhotos !== null ? checkPhotos(agent, rawPhotos) : null;
+    if ([image, video, photos].filter(Boolean).length > 1) throw new SubmitError(400, 'Send one photo, several photos or a video, not a mix.');
     const orderRef = rawOrderRef?.trim() || undefined;
     if (orderRef) {
       if (!ORDER_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take a selected order.`);
@@ -259,7 +261,8 @@ export class JobRunner extends EventEmitter {
     // Phone numbers and emails never reach the AI (or the stored task).
     const { text: cleaned, count: redacted } = redactContacts(rawPrompt);
     let prompt = cleaned.replace(/\s+/g, ' ').trim();
-    if (!prompt && image) prompt = 'Write a Facebook caption for this photo.';
+    if (!prompt && photos) prompt = `Draft catalog entries for these ${photos.list.length} product photos.`;
+    if (!prompt && image) prompt = agent === 'kat' ? 'Draft a catalog entry for this product photo.' : 'Write a Facebook caption for this photo.';
     if (!prompt && video) prompt = 'Write a Facebook caption for this video.';
     if (!prompt) throw new SubmitError(400, 'Type a task first.');
     const maxChars = ORDER_AGENTS.includes(agent) ? MAX_CS_PROMPT_CHARS : MAX_PROMPT_CHARS;
@@ -271,6 +274,7 @@ export class JobRunner extends EventEmitter {
         j.agent === agent &&
         j.prompt === prompt &&
         j.image?.sha256 === image?.meta.sha256 &&
+        j.photos?.sha256 === photos?.meta.sha256 &&
         j.video?.sha256 === video?.meta.sha256 &&
         j.orderRef === orderRef &&
         (j.status === 'queued' || j.status === 'working'),
@@ -289,6 +293,7 @@ export class JobRunner extends EventEmitter {
       prompt,
       agent,
       ...(image ? { image: image.meta } : {}),
+      ...(photos ? { photos: photos.meta } : {}),
       ...(video ? { video: video.meta } : {}),
       ...(orderRef ? { orderRef } : {}),
       ...(redacted ? { redacted } : {}),
@@ -303,6 +308,7 @@ export class JobRunner extends EventEmitter {
     this.users.set(job.id, user);
     if (image) this.images.set(job.id, { mimeType: image.meta.mimeType, data: image.data });
     if (video) this.frames.set(job.id, { durationSec: video.meta.durationSec, frames: video.frames });
+    if (photos) this.photos.set(job.id, photos.list);
     this.enqueue(job);
     return { job, deduplicated: false };
   }
@@ -313,6 +319,8 @@ export class JobRunner extends EventEmitter {
   private images = new Map<string, { mimeType: string; data: string }>();
   /** Still frames of a video sent with a pending task, in memory only; removed when the task ends. */
   private frames = new Map<string, { durationSec: number; frames: { mimeType: string; data: string }[] }>();
+  /** Several photos sent with a pending task (Kat), in memory only; removed when the task ends. */
+  private photos = new Map<string, { mimeType: string; data: string }[]>();
 
   /**
    * A follow-up message on an AI task (an answer to the agent's question, or a further request):
@@ -378,6 +386,7 @@ export class JobRunner extends EventEmitter {
     this.users.delete(job.id);
     this.images.delete(job.id);
     this.frames.delete(job.id);
+    this.photos.delete(job.id);
     this.audit(job, 'cancelled');
     this.emitJob(job);
     return job;
@@ -505,6 +514,7 @@ export class JobRunner extends EventEmitter {
     this.users.delete(job.id);
     this.images.delete(job.id);
     this.frames.delete(job.id);
+    this.photos.delete(job.id);
     this.audit(job, 'finished', {
       durationMs: Date.parse(job.finishedAt) - Date.parse(job.startedAt!),
       errorCode: job.error?.code,
@@ -558,10 +568,12 @@ export class JobRunner extends EventEmitter {
       { ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now },
       user,
       job.agent,
-      followUp && (job.image || job.video) ? `${current}\n(A ${job.video ? 'video' : 'photo'} came with the first message; it is no longer available, so use what you said about it before.)` : current,
+      followUp && (job.image || job.video || job.photos)
+        ? `${current}\n(${job.photos ? `${job.photos.count} photos` : job.video ? 'A video' : 'A photo'} came with the first message; ${job.photos ? 'they are' : 'it is'} no longer available, so use what you said about ${job.photos ? 'them' : 'it'} before.)`
+        : current,
       followUp ? undefined : this.images.get(job.id),
       job.orderRef,
-      { signal, history, video: followUp ? undefined : this.frames.get(job.id) },
+      { signal, history, video: followUp ? undefined : this.frames.get(job.id), photos: followUp ? undefined : this.photos.get(job.id) },
     );
     const ok = out.lookups.filter((l) => l.ok).length;
     return {
@@ -767,6 +779,28 @@ export function checkVideo(agent: LiveAgentId, raw: unknown) {
     frames,
     meta: { mimeType: v.mimeType, bytes, durationSec: Math.round(durationSec * 10) / 10, frames: frames.length, sha256: hash.digest('hex').slice(0, 16) },
   };
+}
+
+/**
+ * Checks several photos sent with one task (Kat: one catalog entry each): 2 to CATALOG_MAX_BATCH
+ * photos, each a real JPEG/PNG/WebP of at most CATALOG_AI_PHOTO_MAX_BYTES (the browser sends
+ * smaller copies for the AI; the full-size photos go to the catalog only when a person approves).
+ */
+export function checkPhotos(agent: LiveAgentId, raw: unknown) {
+  if (!(MULTI_PHOTO_AGENTS as readonly string[]).includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} takes one photo at a time.`);
+  if (!Array.isArray(raw) || raw.length < 2 || raw.length > CATALOG_MAX_BATCH) throw new SubmitError(400, `Send 2 to ${CATALOG_MAX_BATCH} photos.`);
+  const hash = createHash('sha256');
+  let bytes = 0;
+  const list = raw.map((x) => {
+    const p = x as { mimeType?: unknown; data?: unknown };
+    if (!p || typeof p !== 'object' || typeof p.mimeType !== 'string' || typeof p.data !== 'string') throw new SubmitError(400, 'A photo could not be read.');
+    const checked = checkImageData({ mimeType: p.mimeType, data: p.data });
+    if (checked.meta.bytes > CATALOG_AI_PHOTO_MAX_BYTES) throw new SubmitError(413, 'A photo is too large; the office sends smaller copies, so reload the page and try again.');
+    bytes += checked.meta.bytes;
+    hash.update(checked.meta.sha256);
+    return { mimeType: checked.meta.mimeType, data: checked.data };
+  });
+  return { list, meta: { count: list.length, bytes, sha256: hash.digest('hex').slice(0, 16) } };
 }
 
 /** Checks a base64 image: allowed type, size, and that its bytes really are that type. */

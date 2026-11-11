@@ -2,11 +2,11 @@
 
 import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { ErrorCode, Job, JobStep, LiveAgentId, Money, ReportPayload, ReportType, StepResult, SystemStatus } from '../../../shared/live';
-import { CATALOG_MAX_IMAGE_BYTES, IMAGE_AGENTS, LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES, VIDEO_AGENTS } from '../../../shared/live';
+import { CATALOG_AI_PHOTO_MAX_BYTES, CATALOG_MAX_BATCH, CATALOG_MAX_IMAGE_BYTES, IMAGE_AGENTS, MULTI_PHOTO_AGENTS, LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES, VIDEO_AGENTS } from '../../../shared/live';
 import { formatManila, isIsoDate, type RangePreset } from '../../../shared/manila';
 import { AGENT_BY_ID } from '../../agents/roster';
 import type { AgentId } from '../../sim/types';
-import type { LiveStore } from '../../live/store';
+import type { CatalogPhoto, LiveStore } from '../../live/store';
 import { Empty } from '../ActivityPanel';
 import { IconAlert, IconCamera, IconChevron, IconClose, IconRetry, IconScreen, IconSend, IconTeam } from '../icons';
 import { DiscussionList } from '../Discussions';
@@ -85,7 +85,7 @@ const TASK_EXAMPLES: Record<LiveAgentId, string> = {
   rosa: 'Which finished orders still have a balance? Draft a reminder for the biggest one',
   mika: 'What sold best in the last 6 months, and where does production slow down?',
   carlo: 'Short caption for this door photo, schedule it Saturday 9am',
-  kat: 'Add this door to the catalog (add a photo first), e.g. main door, 90 x 210cm',
+  kat: 'Add photos first (one, or up to 10 products), e.g. main door, 90 x 210cm',
   joy: 'Use the "Customer reply" box in Joy\'s panel to paste a message',
   tess: 'Use the "Inspection checklist" box in Tess\'s panel to pick an order',
   dev: 'Check the order data and give me a fix list',
@@ -120,6 +120,8 @@ export function ConnectedBar({
   const [text, setText] = useState('');
   const [photo, setPhoto] = useState<string | null>(null);
   const [video, setVideo] = useState<VideoPick | null>(null);
+  /** Several product photos for Kat (one catalog entry each). */
+  const [photos, setPhotos] = useState<CatalogPhoto[] | null>(null);
   const [photoNote, setPhotoNote] = useState<string | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -136,23 +138,43 @@ export function ConnectedBar({
   const takesVideo = VIDEO_AGENTS.includes(who);
   const usePhoto = takesPhoto ? photo : null;
   const useVideo = takesVideo ? video : null;
+  const takesMany = (MULTI_PHOTO_AGENTS as readonly string[]).includes(who);
+  const usePhotos = takesMany ? photos : null;
   const submitTask = async () => {
     const v = text.trim();
-    if ((!v && !usePhoto && !useVideo) || !assign.ok) return;
-    const job = await store.submitAi(who, v, usePhoto ?? undefined, undefined, useVideo ?? undefined);
+    if ((!v && !usePhoto && !useVideo && !usePhotos) || !assign.ok) return;
+    const job = await store.submitAi(who, v, usePhoto ?? undefined, undefined, useVideo ?? undefined, usePhotos ?? undefined);
     if (job) {
       setText('');
       setPhoto(null);
+      setPhotos(null);
       setVideo(null); // the store keeps it for this task (preview and posting)
       setPhotoNote(null);
       onOpenJob(job.id);
     }
   };
-  const pickPhoto = async (file: File | undefined) => {
+  const pickPhoto = async (files: FileList | null | undefined) => {
+    const file = files?.[0];
     if (!file) return;
     setPhotoBusy(true);
     setPhotoNote(null);
     try {
+      // Several photos (Kat): one product each. Each is shrunk twice: a catalog copy (kept here
+      // until approved) and a smaller copy for the AI.
+      if (files.length > 1) {
+        if (!takesMany) throw new Error(`${AGENT_BY_ID[who].name} takes one ${takesVideo ? 'photo or video' : 'photo'} at a time.`);
+        if (files.length > CATALOG_MAX_BATCH) throw new Error(`Choose at most ${CATALOG_MAX_BATCH} photos at a time (you chose ${files.length}).`);
+        const list: CatalogPhoto[] = [];
+        for (const f of Array.from(files)) {
+          if (isVideoFile(f)) throw new Error(`${f.name} is a video; ${AGENT_BY_ID[who].name} takes photos only.`);
+          list.push({ catalog: await shrinkPhoto(f, CATALOG_MAX_IMAGE_BYTES * 0.9), ai: await shrinkPhoto(f, CATALOG_AI_PHOTO_MAX_BYTES * 0.9, 1024) });
+        }
+        setPhotos(list);
+        setPhoto(null);
+        setVideo(null);
+        return;
+      }
+      setPhotos(null);
       // A photo is shrunk; a video stays as it is and Carlo gets still frames of it.
       if (isVideoFile(file)) {
         if (!takesVideo) throw new Error(`${AGENT_BY_ID[who].name} takes photos only (JPEG, PNG or WebP).`);
@@ -167,6 +189,7 @@ export function ConnectedBar({
       }
     } catch (e) {
       setPhoto(null);
+      setPhotos(null);
       setPhotoNote((e as Error).message);
     } finally {
       setPhotoBusy(false);
@@ -247,7 +270,9 @@ export function ConnectedBar({
           placeholder={
             !assign.ok
               ? 'AI tasks are not set up on the server'
-              : usePhoto && who === 'kat'
+              : usePhotos
+                ? `Optional: details, e.g. all main doors, photo 3 is a flush door`
+                : usePhoto && who === 'kat'
                 ? 'Optional: details, e.g. main door, 90 x 210cm, narra'
                 : usePhoto || useVideo
                 ? 'Optional: details and when to post, e.g. narra door, schedule Saturday 9am'
@@ -263,7 +288,8 @@ export function ConnectedBar({
               type="file"
               accept={takesVideo ? 'image/jpeg,image/png,image/webp,video/mp4,video/quicktime,.mp4,.m4v,.mov' : 'image/jpeg,image/png,image/webp'}
               hidden
-              onChange={(e) => void pickPhoto(e.target.files?.[0])}
+              multiple={takesMany}
+              onChange={(e) => void pickPhoto(e.target.files)}
             />
             {useVideo ? (
               <span className="photo-chip video-chip" title={`This video's still frames go to Carlo; the video is posted only when you approve (${Math.round(useVideo.file.size / 1048576)} MB)`}>
@@ -278,6 +304,14 @@ export function ConnectedBar({
                     setVideo(null);
                   }}
                 >
+                  <IconClose size={12} />
+                </button>
+              </span>
+            ) : usePhotos ? (
+              <span className="photo-chip" title={`${usePhotos.length} product photos: ${AGENT_BY_ID[who].name} drafts one catalog entry for each`}>
+                <img src={usePhotos[0].catalog} alt={`${usePhotos.length} selected photos`} />
+                <i className="photo-count">×{usePhotos.length}</i>
+                <button type="button" className="icon-btn" aria-label="Remove photos" onClick={() => setPhotos(null)}>
                   <IconClose size={12} />
                 </button>
               </span>
@@ -297,7 +331,7 @@ export function ConnectedBar({
                 title={
                   takesVideo
                     ? `Add a photo (JPEG, PNG, WebP) or a video (MP4, MOV) for ${AGENT_BY_ID[who].name} to look at. A photo, or a few still frames of the video, go to Google Gemini for analysis.`
-                    : `Add a product photo (JPEG, PNG, WebP) for ${AGENT_BY_ID[who].name}. It goes to Google Gemini for analysis, and to the catalog only if you approve it.`
+                    : `Add a product photo (JPEG, PNG, WebP), or up to ${CATALOG_MAX_BATCH} photos of different products at once, for ${AGENT_BY_ID[who].name}. Smaller copies go to Google Gemini for analysis; the photos go to the catalog only if you approve them.`
                 }
               >
                 <IconCamera size={16} />
@@ -306,7 +340,7 @@ export function ConnectedBar({
             )}
           </>
         )}
-        <button className="btn primary" type="submit" disabled={!assign.ok || photoBusy || (!text.trim() && !usePhoto && !useVideo)} title={assign.reason}>
+        <button className="btn primary" type="submit" disabled={!assign.ok || photoBusy || (!text.trim() && !usePhoto && !useVideo && !usePhotos)} title={assign.reason}>
           <IconSend size={16} />
           <span>Assign</span>
         </button>
@@ -567,6 +601,20 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
         <p className="muted small">
           {job.redacted} phone number(s) or email(s) were removed before the AI saw the message.
         </p>
+      )}
+      {isAi && job.photos && (
+        store.catalogPhotos.get(job.id) ? (
+          <div className="task-photos">
+            {store.catalogPhotos.get(job.id)!.map((src, i) => (
+              <figure key={i}>
+                <img src={src} alt={`Photo ${i + 1} sent with this task`} />
+                <figcaption>{i + 1}</figcaption>
+              </figure>
+            ))}
+          </div>
+        ) : (
+          <p className="muted small">{job.photos.count} photos were sent with this task (not kept after a reload).</p>
+        )
       )}
       {isAi && job.image && (
         store.images.get(job.id) ? (
@@ -985,7 +1033,7 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
  * JPEG. This keeps uploads small and fast, and drops the camera's hidden data (EXIF, such as GPS
  * location) because only the pixels are redrawn.
  */
-export async function shrinkPhoto(file: File, maxBytes = 2.5 * 1024 * 1024): Promise<string> {
+export async function shrinkPhoto(file: File, maxBytes = 2.5 * 1024 * 1024, max = 1600): Promise<string> {
   if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Choose a JPEG, PNG or WebP photo.');
   if (file.size > 25 * 1024 * 1024) throw new Error('That photo is too large (over 25 MB).');
   const url = URL.createObjectURL(file);
@@ -996,7 +1044,6 @@ export async function shrinkPhoto(file: File, maxBytes = 2.5 * 1024 * 1024): Pro
       i.onerror = () => reject(new Error('That file could not be opened as a photo.'));
       i.src = url;
     });
-    const max = 1600;
     const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
     const w = Math.max(1, Math.round(img.naturalWidth * scale));
     const h = Math.max(1, Math.round(img.naturalHeight * scale));

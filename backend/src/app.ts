@@ -1,6 +1,7 @@
 // HTTP layer: auth, permission checks, JSON API, server-sent events, and static files.
 // Built on node:http only, so there is no framework to keep patched.
 
+import { randomUUID } from 'node:crypto';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
@@ -12,7 +13,7 @@ import { shopCounts } from './reports/calc';
 import { LiveRefresher } from './live/refresher';
 import { HealthLog, SecurityLog } from './monitor/monitor';
 import { DiscussionError, type DiscussionService } from './discuss/discussions';
-import { FB_MAX_SCHEDULE_DAYS, FB_MIN_SCHEDULE_MINUTES, MAX_IMAGE_BYTES, MAX_POST_CHARS, VIDEO_CHUNK_BYTES, type FacebookStatus, CATALOG_MAX_IMAGE_BYTES, type CatalogAddResult, type CatalogProductInput, type CatalogStatus } from '../shared/live';
+import { FB_MAX_SCHEDULE_DAYS, FB_MIN_SCHEDULE_MINUTES, MAX_IMAGE_BYTES, MAX_POST_CHARS, VIDEO_CHUNK_BYTES, type FacebookStatus, CATALOG_AI_PHOTO_MAX_BYTES, CATALOG_MAX_BATCH, CATALOG_MAX_IMAGE_BYTES, type CatalogBatchResult, type CatalogAddResult, type CatalogProductInput, type CatalogStatus } from '../shared/live';
 import { FacebookClient, FacebookError, type PostResult } from './social/facebook';
 import { readRaw, VideoUploadError, type VideoUploads } from './social/videos';
 import { manilaDate, validateRange } from '../shared/manila';
@@ -356,8 +357,8 @@ export function createApp(deps: AppDeps) {
       if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
       let body: Record<string, unknown>;
       try {
-        // Room for one photo (base64 is about 4/3 of the photo's size).
-        body = await readJson(req, Math.ceil((MAX_IMAGE_BYTES * 4) / 3) + 64 * 1024);
+        // Room for one photo, or Kat's several smaller photos (base64 is about 4/3 of the size).
+        body = await readJson(req, Math.ceil((Math.max(MAX_IMAGE_BYTES, CATALOG_MAX_BATCH * CATALOG_AI_PHOTO_MAX_BYTES) * 4) / 3) + 64 * 1024);
       } catch {
         // The rest of the upload is never read, so this connection cannot be reused: close it.
         return send(res, 413, { error: 'The request is too large. Use a smaller photo.' }, { Connection: 'close' });
@@ -376,6 +377,7 @@ export function createApp(deps: AppDeps) {
           body.orderRef as string | undefined,
           typeof body.key === 'string' ? body.key.slice(0, 64) : undefined,
           body.video,
+          body.photos,
         );
         return send(res, deduplicated ? 200 : 202, { job: structuredClone(job), deduplicated });
       } catch (e) {
@@ -561,9 +563,17 @@ export function createApp(deps: AppDeps) {
 
   // ---------------------------------------------------------------- Catalog (Kat)
   // A person approves every product in the office; the AI never calls these. One approval (key)
-  // adds at most one product, even if the button is pressed twice or the request is resent.
-  const catKeys = new Map<string, { at: number; pending: boolean; result?: CatalogAddResult }>();
+  // adds its products at most once, even if the button is pressed twice or the request is resent.
+  //   POST /api/catalog/products {key, product, image}        one product, one commit
+  //   POST /api/catalog/photos   {image}                       -> photoId (several products:
+  //   POST /api/catalog/batch    {key, items:[{product, photoId}]}  photos first, then ONE commit)
+  const catKeys = new Map<string, { at: number; pending: boolean; result?: CatalogAddResult | CatalogBatchResult }>();
+  /** When each user added products (for the hourly limit), one entry per product. */
   const catRecent = new Map<string, number[]>();
+  /** Photos uploaded for a batch (stored on GitHub, not yet in a commit), per user, for 2 hours. */
+  const catPhotos = new Map<string, { user: string; blobSha: string; ext: string; bytes: number; at: number }>();
+  const CAT_PER_HOUR = 30;
+  const CAT_PHOTO_TTL = 2 * 3_600_000;
 
   async function catalogStatus(): Promise<CatalogStatus> {
     const c = deps.catalog;
@@ -575,54 +585,125 @@ export function createApp(deps: AppDeps) {
     }
   }
 
+  function catFail(res: ServerResponse, e: unknown, adding = false) {
+    if (!(e instanceof CatalogError)) throw e;
+    return send(res, e.httpStatus, { error: adding && e.code === 'TIMEOUT' ? `${e.message} It may still have been added: check the catalog before trying again.` : e.message, code: e.code });
+  }
+
+  /** Runs one approval at most once (same key = same result) and counts it toward the hourly limit. */
+  async function catOnce<T extends CatalogAddResult | CatalogBatchResult>(res: ServerResponse, user: SessionUser, rawKey: unknown, count: number, run: () => Promise<T>, logged: (r: T) => Record<string, unknown>) {
+    const key = typeof rawKey === 'string' && /^[\w-]{8,64}$/.test(rawKey) ? `${user.username}|${rawKey}` : null;
+    if (!key) return send(res, 400, { error: 'Missing request key.' });
+    const seen = catKeys.get(key);
+    if (seen?.pending) return send(res, 409, { error: 'These products are already being added.' });
+    if (seen?.result) return send(res, 200, { result: seen.result, repeated: true });
+    const now = Date.now();
+    const recent = (catRecent.get(user.username) ?? []).filter((t) => now - t < 3_600_000);
+    if (recent.length + count > CAT_PER_HOUR)
+      return send(res, 429, { error: `That would be more than ${CAT_PER_HOUR} products in an hour (${recent.length} added so far). Please wait before adding more.` });
+    catRecent.set(user.username, [...recent, ...Array(count).fill(now)]);
+    catKeys.set(key, { at: now, pending: true });
+    for (const [k, v] of catKeys) if (now - v.at > 86_400_000) catKeys.delete(k);
+    try {
+      const result = await run();
+      catKeys.set(key, { at: now, pending: false, result });
+      deps.audit?.({ event: 'catalog.added', user: user.username, ...logged(result), at: new Date().toISOString() });
+      return send(res, 200, { result, repeated: false });
+    } catch (e) {
+      // A timeout may still have gone through: keep the key blocked so a re-press can't add it twice.
+      if (e instanceof CatalogError && e.code === 'TIMEOUT') catKeys.set(key, { at: now, pending: true });
+      else {
+        catKeys.delete(key);
+        catRecent.set(user.username, recent); // nothing was added: it does not count
+      }
+      deps.audit?.({ event: 'catalog.failed', user: user.username, code: e instanceof CatalogError ? e.code : 'ERROR', at: new Date().toISOString() });
+      return catFail(res, e, true);
+    }
+  }
+
   async function handleCatalog(req: IncomingMessage, res: ServerResponse, path: string, method: string, user: SessionUser) {
     if (!user.permissions.includes('catalog:write')) return send(res, 403, { error: 'Your account cannot add products to the catalog.' });
     if (path === '/api/catalog/status' && method === 'GET') return send(res, 200, { catalog: await catalogStatus() });
-    if (path !== '/api/catalog/products' || method !== 'POST') return send(res, 404, { error: 'Not found.' });
+    const route = method === 'POST' ? path.match(/^\/api\/catalog\/(products|photos|batch)$/)?.[1] : undefined;
+    if (!route) return send(res, 404, { error: 'Not found.' });
     if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
     const c = deps.catalog;
     if (!c) return send(res, 503, { error: 'The catalog is not set up on the server (CATALOG_GITHUB_TOKEN).' });
     let body: Record<string, unknown>;
     try {
-      body = await readJson(req, Math.ceil((CATALOG_MAX_IMAGE_BYTES * 4) / 3) + 32 * 1024);
+      body = await readJson(req, route === 'batch' ? 64 * 1024 : Math.ceil((CATALOG_MAX_IMAGE_BYTES * 4) / 3) + 32 * 1024);
     } catch {
       return send(res, 413, { error: 'The request is too large. Use a smaller photo.' }, { Connection: 'close' });
     }
-    const key = typeof body.key === 'string' && /^[\w-]{8,64}$/.test(body.key) ? `${user.username}|${body.key}` : null;
-    if (!key) return send(res, 400, { error: 'Missing request key.' });
-    const seen = catKeys.get(key);
-    if (seen?.pending) return send(res, 409, { error: 'This product is already being added.' });
-    if (seen?.result) return send(res, 200, { product: seen.result, repeated: true });
-    let product: CatalogProductInput;
-    let image: ReturnType<typeof checkCatalogImage>;
-    try {
-      product = checkProduct(body.product);
-      image = checkCatalogImage(body.image);
-    } catch (e) {
-      if (e instanceof CatalogError) return send(res, e.httpStatus, { error: e.message, code: e.code });
-      throw e;
-    }
     const now = Date.now();
-    const recent = (catRecent.get(user.username) ?? []).filter((t) => now - t < 3_600_000);
-    if (recent.length >= 20) return send(res, 429, { error: 'That is 20 products in the last hour. Please wait before adding more.' });
-    catRecent.set(user.username, [...recent, now]);
-    catKeys.set(key, { at: now, pending: true });
-    for (const [k, v] of catKeys) if (now - v.at > 86_400_000) catKeys.delete(k);
-    try {
-      const result = await c.add(product, image, user.username);
-      catKeys.set(key, { at: now, pending: false, result });
-      deps.audit?.({ event: 'catalog.added', user: user.username, productId: result.productId, commit: result.commitSha, category: product.category, imageBytes: image.bytes, at: new Date().toISOString() });
-      deps.log?.(`[catalog] product ${result.productId} added by ${user.username}`);
-      return send(res, 200, { product: result, repeated: false });
-    } catch (e) {
-      // A timeout may still have gone through: keep the key blocked so a re-press can't add it twice.
-      if (e instanceof CatalogError && e.code === 'TIMEOUT') catKeys.set(key, { at: now, pending: true });
-      else catKeys.delete(key);
-      deps.audit?.({ event: 'catalog.failed', user: user.username, code: e instanceof CatalogError ? e.code : 'ERROR', at: new Date().toISOString() });
-      if (e instanceof CatalogError)
-        return send(res, e.httpStatus, { error: e.code === 'TIMEOUT' ? `${e.message} It may still have been added: check the catalog before trying again.` : e.message, code: e.code });
-      throw e;
+    for (const [id, p] of catPhotos) if (now - p.at > CAT_PHOTO_TTL) catPhotos.delete(id);
+
+    if (route === 'products') {
+      let product: CatalogProductInput;
+      let image: ReturnType<typeof checkCatalogImage>;
+      try {
+        product = checkProduct(body.product);
+        image = checkCatalogImage(body.image);
+      } catch (e) {
+        return catFail(res, e);
+      }
+      return catOnce(res, user, body.key, 1, () => c.add(product, image, user.username), (r) => ({ productId: r.productId, commit: r.commitSha, category: product.category, imageBytes: image.bytes }));
     }
+
+    if (route === 'photos') {
+      let image: ReturnType<typeof checkCatalogImage>;
+      try {
+        image = checkCatalogImage(body.image);
+      } catch (e) {
+        return catFail(res, e);
+      }
+      const mine = [...catPhotos.values()].filter((p) => p.user === user.username).length;
+      if (mine >= CATALOG_MAX_BATCH * 4) return send(res, 429, { error: 'Too many photos are waiting to be added. Add or discard the current products first.' });
+      try {
+        const blobSha = await c.uploadPhoto(image);
+        const photoId = randomUUID();
+        catPhotos.set(photoId, { user: user.username, blobSha, ext: image.ext, bytes: image.bytes, at: now });
+        return send(res, 200, { photoId });
+      } catch (e) {
+        return catFail(res, e);
+      }
+    }
+
+    // route === 'batch': several products, each with a photo uploaded before, in one commit.
+    // A repeated approval answers with the first result before its (used, deleted) photos are checked.
+    const seen = typeof body.key === 'string' ? catKeys.get(`${user.username}|${body.key}`) : undefined;
+    if (seen?.result) return send(res, 200, { result: seen.result, repeated: true });
+    if (seen?.pending) return send(res, 409, { error: 'These products are already being added.' });
+    const raw = body.items;
+    if (!Array.isArray(raw) || raw.length < 1 || raw.length > CATALOG_MAX_BATCH) return send(res, 400, { error: `Add 1 to ${CATALOG_MAX_BATCH} products at a time.` });
+    const items: { product: CatalogProductInput; blobSha: string; ext: string; bytes: number }[] = [];
+    const ids = new Set<string>();
+    for (const [i, x] of raw.entries()) {
+      const it = (x ?? {}) as { product?: unknown; photoId?: unknown };
+      const photo = typeof it.photoId === 'string' ? catPhotos.get(it.photoId) : undefined;
+      if (!photo || photo.user !== user.username || ids.has(it.photoId as string))
+        return send(res, 400, { error: `The photo for product ${i + 1} is no longer on the server (photos are kept for 2 hours). Click Add again to upload it.`, code: 'PHOTO_GONE' });
+      ids.add(it.photoId as string);
+      try {
+        items.push({ product: checkProduct(it.product), blobSha: photo.blobSha, ext: photo.ext, bytes: photo.bytes });
+      } catch (e) {
+        if (e instanceof CatalogError) return send(res, e.httpStatus, { error: `Product ${i + 1}: ${e.message}`, code: e.code });
+        throw e;
+      }
+    }
+    return catOnce(
+      res,
+      user,
+      body.key,
+      items.length,
+      async () => {
+        const r = await c.addMany(items, user.username);
+        for (const id of ids) catPhotos.delete(id);
+        deps.log?.(`[catalog] ${r.products.length} product(s) added by ${user.username}`);
+        return r;
+      },
+      (r) => ({ productIds: r.products.map((p) => p.productId), commit: r.commitSha, imageBytes: items.reduce((n, it) => n + it.bytes, 0) }),
+    );
   }
 
   /**

@@ -67,6 +67,12 @@ export type CatalogDoorType = (typeof CATALOG_DOOR_TYPES)[number];
 export const CATALOG_LIMITS = { name: 80, material: 80, dimensions: 40, finish: 30, finishes: 6, description: 300 } as const;
 /** Largest product photo sent to the catalog (the office shrinks it first, so pages load fast). */
 export const CATALOG_MAX_IMAGE_BYTES = 1024 * 1024;
+/** Most products (photos) Kat takes in one task and the office adds in one change. */
+export const CATALOG_MAX_BATCH = 10;
+/** With several photos, Kat sees smaller copies (the full-size ones go to the catalog only when approved). */
+export const CATALOG_AI_PHOTO_MAX_BYTES = 300 * 1024;
+/** Agents that take several photos in one task (one catalog entry per photo). */
+export const MULTI_PHOTO_AGENTS = ['kat'] as const;
 
 /** A new catalog product, as a person approved it. */
 export interface CatalogProductInput {
@@ -90,6 +96,14 @@ export interface CatalogStatus {
   /** Products in the catalog now (read from GitHub), or null when it could not be read. */
   products: number | null;
   problems: string[];
+}
+
+/** Several products the office added to the catalog in one change. */
+export interface CatalogBatchResult {
+  products: { productId: number; imagePath: string; name: string }[];
+  commitSha: string;
+  commitUrl: string | null;
+  siteUrl: string | null;
 }
 
 /** A product the office added to the catalog. */
@@ -295,6 +309,11 @@ export interface Job {
    * in server memory just while the task runs and is never stored, logged or sent back.
    */
   image?: { mimeType: string; bytes: number; sha256: string };
+  /**
+   * Several photos sent with the task (Kat: one catalog entry per photo): how many, their total
+   * size and a fingerprint. Like a single photo, they are never stored, logged or sent back.
+   */
+  photos?: { count: number; bytes: number; sha256: string };
   /**
    * A video sent with the task: type, size, length, and how many still frames of it the AI saw.
    * The video stays in the browser; only the frames reach the server (in memory, while the task runs).

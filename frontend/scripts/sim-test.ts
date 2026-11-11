@@ -4,7 +4,7 @@
 import { TemplateBrain } from '../src/agents/brain';
 import { AGENTS, seatOf } from '../src/agents/roster';
 import { captionFrom, replyFrom, scheduleFrom } from '../src/live/caption';
-import { catalogDraftFrom, draftProblems, toProduct } from '../src/live/catalogDraft';
+import { catalogDraftFrom, catalogDraftsFrom, draftProblems, toProduct } from '../src/live/catalogDraft';
 import { Engine, MAX_ON_BREAK, type Chat, type StorageLike } from '../src/sim/engine';
 import { buildChecklist } from '../shared/qc';
 import { DEV_BOARD_SLOTS, FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt, SHOP_BENCHES, SHOP_ENTRANCE, SHOP_LUMBER, SHOP_SWEEP } from '../src/office/layout';
@@ -314,6 +314,35 @@ async function main() {
     const odd = catalogDraftFrom('**Category:** Chairs\n**Name:** Chair');
     check(!!odd && odd.category === '' && draftProblems(odd).includes('Choose a category.'), 'a category the catalog does not have must be chosen by a person');
     check(catalogDraftFrom('Which category is this, a cabinet or a door?') === null, 'a question is not an entry');
+
+    const many = [
+      '**Catalog entry 1**',
+      '- A carved door',
+      '**Category:** Doors',
+      '**Door type:** Main Door',
+      '**Name:** Carved Main Door',
+      '**Material:** Solid Kiln Dried Wood',
+      '**Finishes:** Varnished',
+      '**Description:** Carved door.',
+      '',
+      '**Catalog entry 3**',
+      '**Category:** Cabinets',
+      '**Door type:** none',
+      '**Name:** Kitchen Cabinet',
+      '**Material:** Solid Kiln Dried Wood',
+      '**Finishes:** Sand Beige',
+      '**Description:** A kitchen cabinet.',
+      '',
+      '**Catalog entry 2**',
+      '**Skip:** Too dark to see the product.',
+    ].join('\n');
+    const rows = catalogDraftsFrom(many, 4);
+    check(rows.length === 4, 'one row per photo, even when Kat wrote fewer entries');
+    check(rows[0].draft.name === 'Carved Main Door' && rows[0].draft.category === 'Doors' && !rows[0].skip, 'entry 1 goes with photo 1');
+    check(rows[2].draft.name === 'Kitchen Cabinet' && rows[2].draft.doorType === '', 'entries are matched by number, not by order in the answer');
+    check(rows[1].skip === 'Too dark to see the product.' && rows[1].draft.name === '', 'a skipped photo keeps Kat\'s reason');
+    check(rows[3].draft.name === '' && draftProblems(rows[3].draft).length > 0 && !rows[3].skip, 'a photo with no entry gets an empty form to fill in');
+    check(!rows[0].draft.description.includes('Kitchen'), "one entry's lines never leak into another");
   }
 
   console.log('Carlo: caption + schedule from one request');

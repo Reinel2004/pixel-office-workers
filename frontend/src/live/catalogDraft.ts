@@ -45,6 +45,31 @@ export function catalogDraftFrom(answer: string): CatalogDraft | null {
   };
 }
 
+/** One photo's part of Kat's answer for several photos: her draft, or why she skipped it. */
+export interface BatchEntry {
+  draft: CatalogDraft;
+  /** Kat's reason for leaving this photo out ("**Skip:** …"), or null. */
+  skip: string | null;
+}
+
+/**
+ * Kat's entries for several photos, matched to the photos by number ("**Catalog entry 2**" is
+ * photo 2). Always returns `count` entries: a photo she wrote nothing for gets an empty draft for
+ * the person to fill in.
+ */
+export function catalogDraftsFrom(answer: string, count: number): BatchEntry[] {
+  const out: BatchEntry[] = Array.from({ length: count }, () => ({ draft: { ...EMPTY_DRAFT }, skip: null }));
+  const heads = [...answer.matchAll(/^[ \t>#*-]*\*\*Catalog entry\s*(\d{1,2})\s*:?\*\*:?.*$/gim)];
+  heads.forEach((h, i) => {
+    const n = Number(h[1]);
+    if (n < 1 || n > count) return;
+    const part = answer.slice(h.index! + h[0].length, i + 1 < heads.length ? heads[i + 1].index : undefined);
+    const skip = line(part, 'Skip');
+    out[n - 1] = { draft: catalogDraftFrom(part) ?? { ...EMPTY_DRAFT }, skip: skip || null };
+  });
+  return out;
+}
+
 /** What is still missing before the product can be added (empty = ready). */
 export function draftProblems(d: CatalogDraft): string[] {
   const out: string[] = [];

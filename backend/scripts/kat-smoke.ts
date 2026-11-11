@@ -1,7 +1,7 @@
-// One real Gemini request: Kat gets a drawn SAMPLE photo (a brown panel door) and drafts a catalog
-// entry. Checks that her answer has the labelled lines the office reads into the approval form.
+// Real Gemini requests: Kat gets a drawn SAMPLE photo (a brown panel door) and drafts a catalog
+// entry; with --batch she gets 2 photos (the door and an empty wall with no product, which she should skip). Checks that her answer has the labelled lines the office reads into the approval form.
 // Nothing is sent to the catalog or GitHub. Prints the answer's entry, never the key. 1 Gemini request.
-// Run from backend/:  npx tsx scripts/kat-smoke.ts
+// Run from backend/:  npx tsx scripts/kat-smoke.ts   (or: npx tsx scripts/kat-smoke.ts --batch)
 
 import { deflateSync } from 'node:zlib';
 import type { SessionUser } from '../shared/live';
@@ -9,7 +9,7 @@ import type { FinanceSource, OrderSource } from '../src/adapters/types';
 import { GeminiClient } from '../src/ai/gemini';
 import { runAiTask } from '../src/ai/tasks';
 import { loadEnvFile } from '../src/env';
-import { catalogDraftFrom, draftProblems } from '../../frontend/src/live/catalogDraft';
+import { catalogDraftFrom, catalogDraftsFrom, draftProblems } from '../../frontend/src/live/catalogDraft';
 
 loadEnvFile();
 const key = process.env.GEMINI_API_KEY;
@@ -62,6 +62,7 @@ function frame(zoom: number): string {
 }
 
 const user: SessionUser = { username: 'smoke', role: 'marketing', permissions: ['catalog:write'] };
+const batch = process.argv.includes('--batch');
 const out = await runAiTask(
   {
     ai: new GeminiClient({ apiKey: key, model: process.env.GEMINI_MODEL || 'gemini-flash-lite-latest', timeoutMs: 90_000 }),
@@ -73,11 +74,18 @@ const out = await runAiTask(
   },
   user,
   'kat',
-  'Add this to the catalog: main door, 90 x 210cm',
-  { mimeType: 'image/png', data: frame(0.9) },
+  batch ? 'Add these to the catalog, all 90 x 210cm' : 'Add this to the catalog: main door, 90 x 210cm',
+  batch ? undefined : { mimeType: 'image/png', data: frame(0.9) },
+  undefined,
+  batch ? { photos: [{ mimeType: 'image/png', data: frame(0.9) }, { mimeType: 'image/png', data: frame(0) }] } : {},
 );
 console.log('model:', out.model, '| needs info:', out.needsInfo);
 console.log(out.answer);
-const d = catalogDraftFrom(out.answer);
-console.log('draft read by the office:', d);
-console.log('ready to add:', !!d && draftProblems(d).length === 0, d ? draftProblems(d) : '');
+if (batch) {
+  const rows = catalogDraftsFrom(out.answer, 2);
+  rows.forEach((r, i) => console.log(`photo ${i + 1}:`, r.skip ? `skipped (${r.skip})` : r.draft, '| ready:', !r.skip && draftProblems(r.draft).length === 0));
+} else {
+  const d = catalogDraftFrom(out.answer);
+  console.log('draft read by the office:', d);
+  console.log('ready to add:', !!d && draftProblems(d).length === 0, d ? draftProblems(d) : '');
+}

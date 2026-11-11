@@ -647,3 +647,15 @@ video.task-photo { background: #000; }
 .cat-grid input, .cat-grid select, .cat-grid textarea { width: 100%; min-width: 0; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25); color: var(--text); font: inherit; font-size: 13px; font-weight: 400; }
 .cat-grid textarea { resize: vertical; line-height: 1.45; }
 @media (max-width: 420px) { .cat-grid { grid-template-columns: 1fr; } }
+
+/* Several catalog products in one task (Kat) */
+.photo-count { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; border-radius: 5px; background: rgba(0, 0, 0, 0.7); color: #fff; font-size: 10px; font-style: normal; font-weight: 700; line-height: 1.5; }
+.task-photos { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.task-photos figure { position: relative; margin: 0; }
+.task-photos img { width: 76px; height: 76px; object-fit: cover; border-radius: 7px; border: 1px solid var(--line); display: block; }
+.task-photos figcaption { position: absolute; left: 3px; top: 3px; padding: 0 5px; border-radius: 5px; background: rgba(0, 0, 0, 0.7); color: #fff; font-size: 10px; font-weight: 700; }
+.cat-item { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.cat-item.off { opacity: 0.6; }
+.cat-item-head { display: flex; align-items: center; gap: 10px; }
+.cat-item-head img { width: 64px; height: 64px; object-fit: cover; border-radius: 7px; border: 1px solid var(--line); flex: none; }
+.cat-added { margin: 0; padding-left: 18px; font-size: 13px; }

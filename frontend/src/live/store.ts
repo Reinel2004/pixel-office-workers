@@ -2,7 +2,7 @@
 // holds all credentials. Live results are kept in memory here and never written to
 // localStorage, and they are never mixed with the demo engine's mock tasks.
 
-import type { CatalogAddResult, CatalogProductInput, CatalogStatus, VideoUploadStatus } from '../../shared/live';
+import type { CatalogAddResult, CatalogBatchResult, CatalogProductInput, CatalogStatus, VideoUploadStatus } from '../../shared/live';
 import type { AiLimits, AiUsageReport, AttentionItem, AttentionReport, Discussion, DiscussionInput, FacebookStatus, InspectionChecklist, OrderPick, ScheduledPost, ShopCounts, UiReview, UiReviewInput, UiVerifyInput } from '../../shared/live';
 import { DISCUSSION_ACTIVE, UI_REVIEW_RUNNING, VIDEO_CHUNK_BYTES } from '../../shared/live';
 import type { AiStatus, DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, ReportType, SessionUser, SystemStatus } from '../../shared/live';
@@ -26,6 +26,17 @@ export interface LiveLogEntry {
 }
 
 /** A one-time key for a submission, so a resent request is not run twice. */
+/** A product photo picked for Kat: the full-size catalog copy and a smaller copy for the AI. */
+export interface CatalogPhoto {
+  catalog: string;
+  ai: string;
+}
+
+/** "data:image/jpeg;base64,…" -> { mimeType, data }. */
+function dataUrlPart(url: string) {
+  return { mimeType: url.slice(5, url.indexOf(';')), data: url.slice(url.indexOf(',') + 1) };
+}
+
 function newKey() {
   try {
     return crypto.randomUUID();
@@ -584,6 +595,8 @@ export class LiveStore {
     this.user = null;
     this.jobs = [];
     this.images.clear();
+    this.catalogPhotos.clear();
+    this.catalogUploads.clear();
     for (const v of this.videos.values()) URL.revokeObjectURL(v.url);
     this.videos.clear();
     this.facebook = null;
@@ -769,17 +782,63 @@ export class LiveStore {
     this.emit();
   }
 
+  /** Full-size catalog photos sent with a Kat task (job id -> data URLs, in order); this tab only. */
+  catalogPhotos = new Map<string, string[]>();
+  /** Photos already uploaded for a batch (data URL -> photo id), so "try again" does not upload twice. */
+  private catalogUploads = new Map<string, string>();
+
   /** Adds one approved product with its photo. `key` makes a repeated click or resend add it only once. */
   async addToCatalog(p: { key: string; product: CatalogProductInput; photo: string }): Promise<CatalogAddResult> {
-    const image = { mimeType: p.photo.slice(5, p.photo.indexOf(';')), data: p.photo.slice(p.photo.indexOf(',') + 1) };
     try {
-      const { product } = await api<{ product: CatalogAddResult }>('/api/catalog/products', { method: 'POST', body: JSON.stringify({ key: p.key, product: p.product, image }) });
-      this.addLog(`Product ${product.productId} added to the catalog: ${p.product.name}.`, 'success', 'kat');
+      const { result } = await api<{ result: CatalogAddResult }>('/api/catalog/products', { method: 'POST', body: JSON.stringify({ key: p.key, product: p.product, image: dataUrlPart(p.photo) }) });
+      this.addLog(`Product ${result.productId} added to the catalog: ${p.product.name}.`, 'success', 'kat');
       void this.loadCatalog();
-      return product;
+      return result;
     } catch (e) {
       if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
       throw e;
+    }
+  }
+
+  /**
+   * Adds several approved products in one change: uploads each photo (one small request each,
+   * skipping ones already uploaded), then asks the server to add them all in one commit.
+   */
+  async addManyToCatalog(p: { key: string; items: { product: CatalogProductInput; photo: string }[] }, onProgress?: (text: string) => void): Promise<CatalogBatchResult> {
+    try {
+      const send = async (retry: boolean): Promise<CatalogBatchResult> => {
+        const items: { product: CatalogProductInput; photoId: string }[] = [];
+        for (const [i, it] of p.items.entries()) {
+          let photoId = this.catalogUploads.get(it.photo);
+          if (!photoId) {
+            onProgress?.(`Uploading photo ${i + 1} of ${p.items.length}…`);
+            photoId = (await api<{ photoId: string }>('/api/catalog/photos', { method: 'POST', body: JSON.stringify({ image: dataUrlPart(it.photo) }) })).photoId;
+            this.catalogUploads.set(it.photo, photoId);
+          }
+          items.push({ product: it.product, photoId });
+        }
+        onProgress?.(`Adding ${items.length} products…`);
+        try {
+          return (await api<{ result: CatalogBatchResult }>('/api/catalog/batch', { method: 'POST', body: JSON.stringify({ key: p.key, items }) })).result;
+        } catch (e) {
+          // The server let go of the photos (restart, or more than 2 hours): upload them again once.
+          if (!retry && e instanceof HttpError && e.status === 400 && /no longer on the server/.test(e.message)) {
+            for (const it of p.items) this.catalogUploads.delete(it.photo);
+            return send(true);
+          }
+          throw e;
+        }
+      };
+      const result = await send(false);
+      for (const it of p.items) this.catalogUploads.delete(it.photo);
+      this.addLog(`${result.products.length} products added to the catalog (${result.products.map((x) => x.productId).join(', ')}).`, 'success', 'kat');
+      void this.loadCatalog();
+      return result;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      throw e;
+    } finally {
+      onProgress?.('');
     }
   }
 
@@ -925,8 +984,8 @@ export class LiveStore {
   videos = new Map<string, VideoPick>();
 
   /** Assigns a free-text task to one agent, optionally with a photo (JPEG data URL) or a video (Carlo). */
-  async submitAi(agent: LiveAgentId, prompt: string, photo?: string, orderRef?: string, video?: VideoPick): Promise<Job | null> {
-    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}|${orderRef ?? ''}|${video ? video.file.size : 0}`;
+  async submitAi(agent: LiveAgentId, prompt: string, photo?: string, orderRef?: string, video?: VideoPick, photos?: CatalogPhoto[]): Promise<Job | null> {
+    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}|${orderRef ?? ''}|${video ? video.file.size : 0}|${photos ? photos.map((p) => p.catalog.length).join('.') : ''}`;
     if (this.submitting.has(key)) return null;
     this.submitting.add(key);
     this.lastError = null;
@@ -940,9 +999,19 @@ export class LiveStore {
         : undefined;
       const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', {
         method: 'POST',
-        body: JSON.stringify({ agent, prompt, key: newKey(), ...(image ? { image } : {}), ...(vid ? { video: vid } : {}), ...(orderRef ? { orderRef } : {}) }),
+        body: JSON.stringify({
+          agent,
+          prompt,
+          key: newKey(),
+          ...(image ? { image } : {}),
+          ...(vid ? { video: vid } : {}),
+          // Several photos: Kat sees the small copies; the full-size ones stay here until approved.
+          ...(photos ? { photos: photos.map((p) => dataUrlPart(p.ai)) } : {}),
+          ...(orderRef ? { orderRef } : {}),
+        }),
       });
       if (photo) this.images.set(job.id, photo);
+      if (photos) this.catalogPhotos.set(job.id, photos.map((p) => p.catalog));
       if (video) this.videos.set(job.id, video);
       this.applyJob(job, false);
       return job;

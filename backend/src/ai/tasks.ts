@@ -428,6 +428,17 @@ Catalog entry rules:
 - If the photo is not furniture, is too dark or blurry, or you cannot tell which category it belongs to, do not write the entry: say what is wrong or ask which category, and end with the Needs information line.
 - You cannot add the product yourself. End with: "Check the details and click Add to catalog."`;
 
+/** Added to Kat's rules when several photos come with one task: one numbered entry per photo. */
+function katBatchRules(n: number) {
+  return `
+
+Several photos (${n}) are attached, labelled "Photo 1 of ${n}" and so on. Each photo is a different product.
+- Write one entry per photo, in the same order, each starting with its own heading line "**Catalog entry 1**", "**Catalog entry 2**" … up to "**Catalog entry ${n}**", followed by that product's lines (Category, Door type, Name, Material, Dimensions, Finishes, Description). Put that photo's "What I see" bullets under its heading, before its lines, instead of one list at the top.
+- Details in the request apply to the photos they name ("photo 2 is a flush door"); otherwise to all of them.
+- If one photo is not furniture, is unclear, or shows the same product as an earlier photo, write its heading and then one line "**Skip:** <reason>" instead of the entry lines. Do not ask a question for that: the other entries are still useful. Use the Needs information line only if none of the photos can be used.
+- Give similar products distinct names where the photos show a difference (for example "Carved Main Door" and "Plain Panel Main Door").`;
+}
+
 /** Added to Joy's instructions on every customer-service task. */
 const CS_RULES = `
 
@@ -470,6 +481,8 @@ export async function runAiTask(
     history?: TaskTurn[];
     /** Still frames of a video (in order, evenly spaced), and its length. */
     video?: { durationSec: number; frames: { mimeType: string; data: string }[] };
+    /** Several photos (Kat: one catalog entry per photo, in this order). */
+    photos?: { mimeType: string; data: string }[];
   } = {},
 ): Promise<AiTaskOutcome> {
   const today = manilaDate(deps.now?.());
@@ -529,6 +542,7 @@ export async function runAiTask(
       parts: [
         ...(image ? [{ inlineData: image }] : []),
         ...(opts.video ? videoParts(opts.video) : []),
+        ...(opts.photos ?? []).flatMap((p, i, all): GeminiPart[] => [{ text: `Photo ${i + 1} of ${all.length}:` }, { inlineData: p }]),
         { text: history.length ? `Follow-up from ${user.username}: ${prompt}` : prompt },
         ...(orderFacts ? [{ text: `Selected order (from WAD Order Management, exact):\n${JSON.stringify(orderFacts)}` }] : []),
         ...(autoFacts ? [{ text: `Live data the office retrieved for this question before you answer (exact, calculated by code; retrieved ${new Date().toISOString()}):\n${JSON.stringify(autoFacts)}` }] : []),
@@ -546,7 +560,7 @@ export async function runAiTask(
             (image && agent !== 'kat' ? PHOTO_RULES : '') + // Kat's rules say how she reads a photo
             (opts.video ? videoRules(opts.video.durationSec, opts.video.frames.length) : '') +
             (agent === 'carlo' ? carloRules(deps.now?.() ?? new Date()) : '') +
-            (agent === 'kat' ? KAT_RULES : '') +
+            (agent === 'kat' ? KAT_RULES + (opts.photos?.length ? katBatchRules(opts.photos.length) : '') : '') +
             (agent === 'joy' ? CS_RULES + (orderRef ? '' : '\nNo order was selected for this message.') : '') +
             (agent === 'tess' ? QC_RULES + (orderRef ? '' : "\nNo order was selected: answer generally, and say that picking the order in Tess's panel gives an exact checklist.") : '') +
             (autoFacts ? AUTO_RULES : '') +

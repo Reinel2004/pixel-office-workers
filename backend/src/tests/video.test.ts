@@ -67,7 +67,7 @@ test("Carlo's video task: the frames reach Gemini labelled in order, with the vi
   assert.equal(parts.filter((p) => 'inlineData' in p).length, 3);
   assert.deepEqual(parts.filter((p) => 'text' in p).slice(0, 3).map((p) => p.text), ['Video frame 1 of 3, at about 10 s:', 'Video frame 2 of 3, at about 30 s:', 'Video frame 3 of 3, at about 50 s:']);
   assert.match(JSON.stringify(bodies[0].systemInstruction), /3 still frames taken evenly from it \(it is 1 min 0 s long\)/);
-  assert.throws(() => runner.submitAi(admin, 'carlo', 'x', { mimeType: 'image/jpeg', data: JPEG }, undefined, undefined, { mimeType: 'video/mp4', bytes: 1, durationSec: 1, frames: frames(1) }), /photo or a video/);
+  assert.throws(() => runner.submitAi(admin, 'carlo', 'x', { mimeType: 'image/jpeg', data: JPEG }, undefined, undefined, { mimeType: 'video/mp4', bytes: 1, durationSec: 1, frames: frames(1) }), /one photo, several photos or a video/);
 });
 
 /** A fake Graph API for the resumable video upload; records each call's fields. */
