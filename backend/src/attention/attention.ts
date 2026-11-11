@@ -65,7 +65,7 @@ export async function buildAttention(user: SessionUser, deps: AttentionDeps): Pr
   const systemsLink = { kind: 'systems' as const, label: 'Open the Systems tab' };
 
   // ---------------------------------------------------------------- connections
-  const NAMES: Record<HealthSystem, string> = { orders: 'WAD Order Management', finance: 'WAD Furniture Management', gemini: 'Gemini (AI)', facebook: 'Facebook Page' };
+  const NAMES: Record<HealthSystem, string> = { orders: 'WAD Order Management', finance: 'WAD Furniture Management', gemini: 'Gemini (AI)', facebook: 'Facebook Page', github: 'Catalog (GitHub)' };
   const failing = (sys: HealthSystem) => {
     const h = deps.health?.summary(sys);
     if (!h || !h.failuresInARowNow || !h.lastFailure) return;
@@ -108,6 +108,8 @@ export async function buildAttention(user: SessionUser, deps: AttentionDeps): Pr
       items.push({ id: 'conn-setup:facebook', version: fb.join('|'), kind: 'connection', severity: 'info', title: 'Facebook posting is not set up', detail: fb[0], at: null, link: null });
     else failing('facebook');
   }
+  // The catalog only shows here when its GitHub calls fail (not being set up is shown in Kat's panel).
+  if (can('catalog:write')) failing('github');
 
   // ---------------------------------------------------------------- AI limits
   if (deps.aiUsage) {

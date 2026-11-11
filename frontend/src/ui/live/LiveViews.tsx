@@ -2,7 +2,7 @@
 
 import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { ErrorCode, Job, JobStep, LiveAgentId, Money, ReportPayload, ReportType, StepResult, SystemStatus } from '../../../shared/live';
-import { IMAGE_AGENTS, LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES } from '../../../shared/live';
+import { CATALOG_MAX_IMAGE_BYTES, IMAGE_AGENTS, LIVE_AGENT_IDS, MAX_PROMPT_CHARS, SYSTEM_NAMES, VIDEO_AGENTS } from '../../../shared/live';
 import { formatManila, isIsoDate, type RangePreset } from '../../../shared/manila';
 import { AGENT_BY_ID } from '../../agents/roster';
 import type { AgentId } from '../../sim/types';
@@ -13,7 +13,9 @@ import { DiscussionList } from '../Discussions';
 import { Avatar } from '../shared';
 import { captionFrom, scheduleFrom } from '../../live/caption';
 import { CarloReadyPost, FacebookComposer, FacebookPanel } from './Facebook';
+import { CatalogFromTask, CatalogPanel } from './Catalog';
 import { CopyReply, CustomerReplyPanel } from './CustomerService';
+import { formatDuration, isVideoFile, prepareVideo, type VideoPick } from '../../live/video';
 import { ChecklistPanel } from './Checklist';
 import { UiReviewList } from '../UiReview';
 import { LookupList, TASK_STATUS_CLASS, TASK_STATUS_LABEL, TaskActions, TaskBoard, TaskConversation, TaskInstructions, TaskProgress } from './TaskBoard';
@@ -83,6 +85,7 @@ const TASK_EXAMPLES: Record<LiveAgentId, string> = {
   rosa: 'Which finished orders still have a balance? Draft a reminder for the biggest one',
   mika: 'What sold best in the last 6 months, and where does production slow down?',
   carlo: 'Short caption for this door photo, schedule it Saturday 9am',
+  kat: 'Add this door to the catalog (add a photo first), e.g. main door, 90 x 210cm',
   joy: 'Use the "Customer reply" box in Joy\'s panel to paste a message',
   tess: 'Use the "Inspection checklist" box in Tess\'s panel to pick an order',
   dev: 'Check the order data and give me a fix list',
@@ -116,6 +119,7 @@ export function ConnectedBar({
   useLive(store);
   const [text, setText] = useState('');
   const [photo, setPhoto] = useState<string | null>(null);
+  const [video, setVideo] = useState<VideoPick | null>(null);
   const [photoNote, setPhotoNote] = useState<string | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -129,14 +133,17 @@ export function ConnectedBar({
   const assign = store.canAssign();
   const who = agent as LiveAgentId;
   const takesPhoto = IMAGE_AGENTS.includes(who);
+  const takesVideo = VIDEO_AGENTS.includes(who);
   const usePhoto = takesPhoto ? photo : null;
+  const useVideo = takesVideo ? video : null;
   const submitTask = async () => {
     const v = text.trim();
-    if ((!v && !usePhoto) || !assign.ok) return;
-    const job = await store.submitAi(who, v, usePhoto ?? undefined);
+    if ((!v && !usePhoto && !useVideo) || !assign.ok) return;
+    const job = await store.submitAi(who, v, usePhoto ?? undefined, undefined, useVideo ?? undefined);
     if (job) {
       setText('');
       setPhoto(null);
+      setVideo(null); // the store keeps it for this task (preview and posting)
       setPhotoNote(null);
       onOpenJob(job.id);
     }
@@ -146,7 +153,18 @@ export function ConnectedBar({
     setPhotoBusy(true);
     setPhotoNote(null);
     try {
-      setPhoto(await shrinkPhoto(file));
+      // A photo is shrunk; a video stays as it is and Carlo gets still frames of it.
+      if (isVideoFile(file)) {
+        if (!takesVideo) throw new Error(`${AGENT_BY_ID[who].name} takes photos only (JPEG, PNG or WebP).`);
+        const v = await prepareVideo(file);
+        if (video) URL.revokeObjectURL(video.url);
+        setVideo(v);
+        setPhoto(null);
+      } else {
+        // Kat's photo goes on the catalog website as it is: kept smaller so the page loads fast.
+        setPhoto(await shrinkPhoto(file, who === 'kat' ? CATALOG_MAX_IMAGE_BYTES * 0.9 : undefined));
+        setVideo(null);
+      }
     } catch (e) {
       setPhoto(null);
       setPhotoNote((e as Error).message);
@@ -227,7 +245,13 @@ export function ConnectedBar({
           maxLength={MAX_PROMPT_CHARS}
           onChange={(e) => setText(e.target.value)}
           placeholder={
-            !assign.ok ? 'AI tasks are not set up on the server' : usePhoto ? 'Optional: details, e.g. narra, for a Batangas client' : `e.g. ${TASK_EXAMPLES[who]}`
+            !assign.ok
+              ? 'AI tasks are not set up on the server'
+              : usePhoto && who === 'kat'
+                ? 'Optional: details, e.g. main door, 90 x 210cm, narra'
+                : usePhoto || useVideo
+                ? 'Optional: details and when to post, e.g. narra door, schedule Saturday 9am'
+                : `e.g. ${TASK_EXAMPLES[who]}`
           }
           disabled={!assign.ok}
           autoComplete="off"
@@ -237,11 +261,27 @@ export function ConnectedBar({
             <input
               ref={fileInput}
               type="file"
-              accept="image/jpeg,image/png,image/webp"
+              accept={takesVideo ? 'image/jpeg,image/png,image/webp,video/mp4,video/quicktime,.mp4,.m4v,.mov' : 'image/jpeg,image/png,image/webp'}
               hidden
               onChange={(e) => void pickPhoto(e.target.files?.[0])}
             />
-            {usePhoto ? (
+            {useVideo ? (
+              <span className="photo-chip video-chip" title={`This video's still frames go to Carlo; the video is posted only when you approve (${Math.round(useVideo.file.size / 1048576)} MB)`}>
+                <img src={useVideo.frames[0]} alt="Selected video" />
+                <i className="video-len">▶ {formatDuration(useVideo.durationSec)}</i>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="Remove video"
+                  onClick={() => {
+                    URL.revokeObjectURL(useVideo.url);
+                    setVideo(null);
+                  }}
+                >
+                  <IconClose size={12} />
+                </button>
+              </span>
+            ) : usePhoto ? (
               <span className="photo-chip" title="This photo will be sent with the task">
                 <img src={usePhoto} alt="Selected photo" />
                 <button type="button" className="icon-btn" aria-label="Remove photo" onClick={() => setPhoto(null)}>
@@ -254,15 +294,19 @@ export function ConnectedBar({
                 className="btn"
                 disabled={!assign.ok || photoBusy}
                 onClick={() => fileInput.current?.click()}
-                title={`Add a photo for ${AGENT_BY_ID[who].name} to look at (JPEG, PNG or WebP). It is sent to Google Gemini for analysis.`}
+                title={
+                  takesVideo
+                    ? `Add a photo (JPEG, PNG, WebP) or a video (MP4, MOV) for ${AGENT_BY_ID[who].name} to look at. A photo, or a few still frames of the video, go to Google Gemini for analysis.`
+                    : `Add a product photo (JPEG, PNG, WebP) for ${AGENT_BY_ID[who].name}. It goes to Google Gemini for analysis, and to the catalog only if you approve it.`
+                }
               >
                 <IconCamera size={16} />
-                <span className="hide-narrow">{photoBusy ? 'Reading…' : 'Photo'}</span>
+                <span className="hide-narrow">{photoBusy ? 'Reading…' : takesVideo ? 'Photo / video' : 'Photo'}</span>
               </button>
             )}
           </>
         )}
-        <button className="btn primary" type="submit" disabled={!assign.ok || (!text.trim() && !usePhoto)} title={assign.reason}>
+        <button className="btn primary" type="submit" disabled={!assign.ok || photoBusy || (!text.trim() && !usePhoto && !useVideo)} title={assign.reason}>
           <IconSend size={16} />
           <span>Assign</span>
         </button>
@@ -531,12 +575,22 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
           <p className="muted small">A photo was sent with this task (not kept after a reload).</p>
         )
       )}
+      {isAi && job.video && (
+        store.videos.get(job.id) ? (
+          <video className="task-photo" src={store.videos.get(job.id)!.url} controls preload="metadata" aria-label="Video sent with this task" />
+        ) : (
+          <p className="muted small">
+            A {formatDuration(job.video.durationSec)} video was sent with this task; Carlo saw {job.video.frames} still frames of it. The video stays in the browser that sent it and is gone after a reload.
+          </p>
+        )
+      )}
       <TaskProgress job={job} />
       <TaskConversation job={job} render={(t) => <Markdownish text={t} names={names} employees={employees} />} />
       {job.steps.map((s) => (
         <StepCard key={s.id} step={s} onOpenAgent={onOpenAgent} />
       ))}
       {isAi && job.agent === 'carlo' && answered && <PostFromTask store={store} job={job} />}
+      {isAi && job.agent === 'kat' && answered && <CatalogFromTask key={`${job.id}-${job.thread?.length ?? 0}`} store={store} job={job} />}
       {isAi && job.agent === 'joy' && answered && <CopyReply job={job} />}
       <TaskActions store={store} job={job} />
       {(job.status === 'failed' || job.status === 'cancelled') && (
@@ -849,13 +903,13 @@ function PostFromTask({ store, job }: { store: LiveStore; job: Job }) {
     return (
       <section>
         <h3>{when.kind === 'now' ? 'Post to Facebook' : 'Scheduled post'}</h3>
-        <CarloReadyPost store={store} jobId={job.id} message={captionFrom(answer)} photo={store.images.get(job.id) ?? null} when={when} />
+        <CarloReadyPost store={store} jobId={job.id} message={captionFrom(answer)} photo={store.images.get(job.id) ?? null} video={store.videos.get(job.id) ?? null} hadVideo={!!job.video} when={when} />
       </section>
     );
   return open ? (
     <section>
       <h3>Post to Facebook</h3>
-      <FacebookComposer store={store} initialMessage={captionFrom(answer)} initialPhoto={store.images.get(job.id) ?? null} onClose={() => setOpen(false)} />
+      <FacebookComposer store={store} initialMessage={captionFrom(answer)} initialPhoto={store.images.get(job.id) ?? null} initialVideo={store.videos.get(job.id) ?? null} onClose={() => setOpen(false)} />
     </section>
   ) : (
     <button className="btn primary" onClick={() => setOpen(true)}>
@@ -874,6 +928,7 @@ const LIVE_ROLE: Record<LiveAgentId, string> = {
   rosa: 'Collections — reads order prices, downpayments and balances from WAD Order Management; drafts payment reminders (never sends them).',
   mika: 'Data Analyst — trends over time: orders by month, best-selling products, production bottlenecks, and monthly income vs. expenses. Order values only for accounts with finance access.',
   carlo: 'Marketing — writes captions and posts (no live data).',
+  kat: 'Catalog — drafts a product entry from a photo (category, name, material, size, finishes, description). You check it and click Add to catalog; the photo and entry are then saved to the catalog website on GitHub and it updates in about a minute. She never adds anything herself or changes existing products.',
   joy: 'Customer Service — drafts replies to customer messages. Reads only the one order you pick; phone numbers and emails are removed before the AI sees the message. You copy and send the reply yourself.',
   tess: 'Quality Control — builds an inspection checklist by code from the order\'s specifications in WAD Order Management (dimensions, design, wood, finish, jamb, and hardware from the notes). Anything the order does not record is marked "confirm with sales". The AI sees the checklist, never the staff notes.',
   dev: 'Data quality — checks WAD Order Management by code for missing due dates, odd statuses, In Progress orders with no carpenter, missing labor, pieces with no price, finished orders with no downpayment (finance accounts) and possible double entries, then writes a fix list. He reads only; you correct the records in the order system.',
@@ -915,6 +970,7 @@ export function LiveAgentSection({ store, agent, onOpenJob }: { store: LiveStore
         </p>
       )}
       {agent === 'carlo' && <FacebookPanel store={store} />}
+      {agent === 'kat' && <CatalogPanel store={store} />}
       {agent === 'joy' && <CustomerReplyPanel store={store} onOpenJob={onOpenJob} />}
       {agent === 'tess' && <ChecklistPanel store={store} onOpenJob={onOpenJob} />}
       {(agent === 'aya' || agent === 'rey' || agent === 'kim') && (

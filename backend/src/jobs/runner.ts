@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId, TaskTurn } from '../../shared/live';
-import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_FOLLOW_UPS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES } from '../../shared/live';
+import { FB_VIDEO_MAX_BYTES, IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_FOLLOW_UPS, MAX_FRAME_BYTES, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, MAX_VIDEO_FRAMES, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES, VIDEO_AGENTS, VIDEO_TYPES } from '../../shared/live';
 import { redactContacts } from '../ai/redact';
 import { manilaDate } from '../../shared/manila';
 import type { FinanceRecord, FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
@@ -241,12 +241,15 @@ export class JobRunner extends EventEmitter {
     rawImage?: { mimeType: string; data: string },
     rawOrderRef?: string,
     key?: string,
+    rawVideo?: unknown,
   ): { job: Job; deduplicated: boolean } {
     if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
     const again = this.fromKey(user, key);
     if (again) return { job: again, deduplicated: true };
     if (!LIVE_AGENT_IDS.includes(agent)) throw new SubmitError(400, 'Unknown agent.');
     const image = rawImage ? checkImage(agent, rawImage) : null;
+    const video = rawVideo !== undefined && rawVideo !== null ? checkVideo(agent, rawVideo) : null;
+    if (image && video) throw new SubmitError(400, 'Send a photo or a video, not both.');
     const orderRef = rawOrderRef?.trim() || undefined;
     if (orderRef) {
       if (!ORDER_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take a selected order.`);
@@ -257,6 +260,7 @@ export class JobRunner extends EventEmitter {
     const { text: cleaned, count: redacted } = redactContacts(rawPrompt);
     let prompt = cleaned.replace(/\s+/g, ' ').trim();
     if (!prompt && image) prompt = 'Write a Facebook caption for this photo.';
+    if (!prompt && video) prompt = 'Write a Facebook caption for this video.';
     if (!prompt) throw new SubmitError(400, 'Type a task first.');
     const maxChars = ORDER_AGENTS.includes(agent) ? MAX_CS_PROMPT_CHARS : MAX_PROMPT_CHARS;
     if (prompt.length > maxChars) throw new SubmitError(400, `Keep the task under ${maxChars} characters.`);
@@ -267,6 +271,7 @@ export class JobRunner extends EventEmitter {
         j.agent === agent &&
         j.prompt === prompt &&
         j.image?.sha256 === image?.meta.sha256 &&
+        j.video?.sha256 === video?.meta.sha256 &&
         j.orderRef === orderRef &&
         (j.status === 'queued' || j.status === 'working'),
     );
@@ -284,6 +289,7 @@ export class JobRunner extends EventEmitter {
       prompt,
       agent,
       ...(image ? { image: image.meta } : {}),
+      ...(video ? { video: video.meta } : {}),
       ...(orderRef ? { orderRef } : {}),
       ...(redacted ? { redacted } : {}),
       requestedBy: user.username,
@@ -296,6 +302,7 @@ export class JobRunner extends EventEmitter {
     this.rememberKey(user, key, job);
     this.users.set(job.id, user);
     if (image) this.images.set(job.id, { mimeType: image.meta.mimeType, data: image.data });
+    if (video) this.frames.set(job.id, { durationSec: video.meta.durationSec, frames: video.frames });
     this.enqueue(job);
     return { job, deduplicated: false };
   }
@@ -304,6 +311,8 @@ export class JobRunner extends EventEmitter {
   private users = new Map<string, SessionUser>();
   /** Photos for pending AI tasks, in memory only; removed as soon as the task ends. */
   private images = new Map<string, { mimeType: string; data: string }>();
+  /** Still frames of a video sent with a pending task, in memory only; removed when the task ends. */
+  private frames = new Map<string, { durationSec: number; frames: { mimeType: string; data: string }[] }>();
 
   /**
    * A follow-up message on an AI task (an answer to the agent's question, or a further request):
@@ -368,6 +377,7 @@ export class JobRunner extends EventEmitter {
     if (job.type === 'ai.task' && wasRunning) job.thread = [...(job.thread ?? []), { role: 'agent', text: `Cancelled by ${user.username}.`, at, outcome: 'cancelled' }];
     this.users.delete(job.id);
     this.images.delete(job.id);
+    this.frames.delete(job.id);
     this.audit(job, 'cancelled');
     this.emitJob(job);
     return job;
@@ -429,7 +439,12 @@ export class JobRunner extends EventEmitter {
     // and for AI tasks only the agent and the prompt's length, never its text.
     const what =
       job.type === 'ai.task'
-        ? { agent: job.agent, promptChars: job.prompt?.length ?? 0, ...(job.image ? { imageBytes: job.image.bytes, imageType: job.image.mimeType } : {}) }
+        ? {
+            agent: job.agent,
+            promptChars: job.prompt?.length ?? 0,
+            ...(job.image ? { imageBytes: job.image.bytes, imageType: job.image.mimeType } : {}),
+            ...(job.video ? { videoBytes: job.video.bytes, videoSeconds: job.video.durationSec, videoFrames: job.video.frames } : {}),
+          }
         : { range: job.range };
     this.deps.log?.({ at: new Date().toISOString(), event, jobId: job.id, type: job.type, user: job.requestedBy, ...what, status: job.status, ...extra });
   }
@@ -489,6 +504,7 @@ export class JobRunner extends EventEmitter {
     job.finishedAt = at;
     this.users.delete(job.id);
     this.images.delete(job.id);
+    this.frames.delete(job.id);
     this.audit(job, 'finished', {
       durationMs: Date.parse(job.finishedAt) - Date.parse(job.startedAt!),
       errorCode: job.error?.code,
@@ -542,10 +558,10 @@ export class JobRunner extends EventEmitter {
       { ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now },
       user,
       job.agent,
-      followUp && job.image ? `${current}\n(A photo came with the first message; it is no longer available.)` : current,
+      followUp && (job.image || job.video) ? `${current}\n(A ${job.video ? 'video' : 'photo'} came with the first message; it is no longer available, so use what you said about it before.)` : current,
       followUp ? undefined : this.images.get(job.id),
       job.orderRef,
-      { signal, history },
+      { signal, history, video: followUp ? undefined : this.frames.get(job.id) },
     );
     const ok = out.lookups.filter((l) => l.ok).length;
     return {
@@ -720,6 +736,37 @@ export class JobRunner extends EventEmitter {
 export function checkImage(agent: LiveAgentId, img: { mimeType: string; data: string }) {
   if (!IMAGE_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take photos.`);
   return checkImageData(img);
+}
+
+/**
+ * Checks a video sent with an AI task. Only its still frames come to the server (JPEGs the
+ * browser took from the video, each checked like a photo); the type, size and length describe the
+ * video that stays in the browser until a person posts it.
+ */
+export function checkVideo(agent: LiveAgentId, raw: unknown) {
+  if (!VIDEO_AGENTS.includes(agent)) throw new SubmitError(400, `${AGENT_PROFILES[agent].name} does not take videos.`);
+  const v = raw as { mimeType?: unknown; bytes?: unknown; durationSec?: unknown; frames?: unknown };
+  if (!v || typeof v !== 'object') throw new SubmitError(400, 'The video could not be read.');
+  if (typeof v.mimeType !== 'string' || !(VIDEO_TYPES as readonly string[]).includes(v.mimeType)) throw new SubmitError(400, 'Use an MP4 or MOV video.');
+  const bytes = Number(v.bytes);
+  if (!Number.isInteger(bytes) || bytes <= 0) throw new SubmitError(400, 'The video could not be read.');
+  if (bytes > FB_VIDEO_MAX_BYTES) throw new SubmitError(413, `The video is too large (max ${Math.round(FB_VIDEO_MAX_BYTES / 1024 / 1024)} MB).`);
+  const durationSec = Number(v.durationSec);
+  if (!Number.isFinite(durationSec) || durationSec <= 0 || durationSec > 4 * 3600) throw new SubmitError(400, 'The video length could not be read.');
+  if (!Array.isArray(v.frames) || v.frames.length < 1 || v.frames.length > MAX_VIDEO_FRAMES) throw new SubmitError(400, `Send 1 to ${MAX_VIDEO_FRAMES} frames of the video.`);
+  const hash = createHash('sha256');
+  const frames = (v.frames as unknown[]).map((f) => {
+    const x = f as { mimeType?: unknown; data?: unknown };
+    if (!x || typeof x !== 'object' || x.mimeType !== 'image/jpeg' || typeof x.data !== 'string') throw new SubmitError(400, 'A video frame could not be read.');
+    const checked = checkImageData({ mimeType: 'image/jpeg', data: x.data });
+    if (checked.meta.bytes > MAX_FRAME_BYTES) throw new SubmitError(413, 'A video frame is too large.');
+    hash.update(checked.meta.sha256);
+    return { mimeType: 'image/jpeg', data: checked.data };
+  });
+  return {
+    frames,
+    meta: { mimeType: v.mimeType, bytes, durationSec: Math.round(durationSec * 10) / 10, frames: frames.length, sha256: hash.digest('hex').slice(0, 16) },
+  };
 }
 
 /** Checks a base64 image: allowed type, size, and that its bytes really are that type. */

@@ -11,8 +11,12 @@
 //   post with attached_media and unpublished_content_type=SCHEDULED.
 // - "Pending posts" are read back from the Page's scheduled_posts edge: Facebook is the record,
 //   so posts scheduled in Meta Business Suite show up too, and nothing is stored here.
+// - Videos use the Page videos edge's resumable upload (upload_phase start -> transfer chunks
+//   at the offsets Facebook asks for -> finish with the description and the schedule), read from
+//   a temporary file so a large video never sits in memory whole.
 
 import { createHmac } from 'node:crypto';
+import { open } from 'node:fs/promises';
 import type { ScheduledPost } from '../../shared/live';
 
 export const GRAPH_HOST = 'graph.facebook.com';
@@ -44,6 +48,18 @@ export interface PostRequest {
   image?: { mimeType: string; data: string };
   /** Unix seconds; omitted = publish now. */
   at?: number;
+}
+
+export interface VideoPostRequest {
+  /** Temporary file holding the whole video. */
+  path: string;
+  bytes: number;
+  mimeType: string;
+  message: string;
+  /** Unix seconds; omitted = publish now. */
+  at?: number;
+  /** Called with the bytes sent to Facebook so far. */
+  onProgress?: (sent: number) => void;
 }
 
 export interface PostResult {
@@ -119,30 +135,106 @@ export class FacebookClient {
     return { postId, link, scheduledAt: scheduled ? new Date(req.at! * 1000).toISOString() : null };
   }
 
-  /** Posts waiting in the Page's schedule, soonest first. */
+  /**
+   * Uploads a video to the Page in Facebook's resumable steps and publishes or schedules it.
+   * Facebook says which byte range to send next; the file is read piece by piece.
+   */
+  async publishVideo(req: VideoPostRequest): Promise<PostResult> {
+    const form = (fields: Record<string, string>) => {
+      const f = new FormData();
+      for (const [k, v] of Object.entries(fields)) f.set(k, v);
+      return f;
+    };
+    const start = await this.call('POST', `${this.o.pageId}/videos`, { form: form({ upload_phase: 'start', file_size: String(req.bytes) }) });
+    const session = String(start.upload_session_id ?? '');
+    const videoId = String(start.video_id ?? '');
+    if (!session || !/^\d+$/.test(videoId)) throw new FacebookError('UPSTREAM_ERROR', 'Facebook did not start the video upload.');
+    let from = Number(start.start_offset);
+    let to = Number(start.end_offset);
+    const file = await open(req.path, 'r');
+    try {
+      for (let round = 0; from < to; round++) {
+        if (round > 5000 || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to > req.bytes)
+          throw new FacebookError('UPSTREAM_ERROR', 'Facebook asked for an unexpected part of the video. Try again.');
+        const chunk = Buffer.alloc(to - from);
+        const { bytesRead } = await file.read(chunk, 0, chunk.length, from);
+        if (bytesRead !== chunk.length) throw new FacebookError('UPSTREAM_ERROR', 'The uploaded video file is incomplete. Upload it again.');
+        const f = form({ upload_phase: 'transfer', upload_session_id: session, start_offset: String(from) });
+        f.set('video_file_chunk', new Blob([chunk], { type: 'application/octet-stream' }), req.mimeType === 'video/quicktime' ? 'wad-video.mov' : 'wad-video.mp4');
+        const r = await this.call('POST', `${this.o.pageId}/videos`, { form: f });
+        const next = Number(r.start_offset);
+        if (!(next > from)) throw new FacebookError('UPSTREAM_ERROR', 'Facebook did not accept part of the video. Try again.');
+        from = next;
+        to = Number(r.end_offset);
+        req.onProgress?.(Math.min(from, req.bytes));
+      }
+    } finally {
+      await file.close();
+    }
+    const scheduled = req.at !== undefined;
+    const done = await this.call('POST', `${this.o.pageId}/videos`, {
+      form: form({
+        upload_phase: 'finish',
+        upload_session_id: session,
+        description: req.message,
+        published: scheduled ? 'false' : 'true',
+        ...(scheduled ? { scheduled_publish_time: String(req.at) } : {}),
+      }),
+    });
+    if (done.success === false) throw new FacebookError('UPSTREAM_ERROR', 'Facebook did not finish the video post. Check the Page before trying again.');
+    let link: string | null = null;
+    try {
+      const r = await this.call('GET', videoId, { query: { fields: 'permalink_url' } });
+      const u = typeof r.permalink_url === 'string' ? r.permalink_url : '';
+      link = u.startsWith('https://') ? u : u.startsWith('/') ? `https://www.facebook.com${u}` : null;
+    } catch {
+      link = null;
+    }
+    return { postId: videoId, link, scheduledAt: scheduled ? new Date(req.at! * 1000).toISOString() : null };
+  }
+
+  /** Posts waiting in the Page's schedule, soonest first (scheduled videos included). */
   async scheduled(): Promise<ScheduledPost[]> {
     const r = await this.call('GET', `${this.o.pageId}/scheduled_posts`, {
       query: { fields: 'id,message,scheduled_publish_time,full_picture,permalink_url', limit: '50' },
     });
     const list = Array.isArray(r.data) ? (r.data as Record<string, unknown>[]) : [];
-    return list
-      .map((p) => {
-        const t = p.scheduled_publish_time;
-        const secs = typeof t === 'number' ? t : typeof t === 'string' && /^\d+$/.test(t) ? Number(t) : typeof t === 'string' ? Date.parse(t) / 1000 : NaN;
-        return {
-          id: String(p.id ?? ''),
-          message: typeof p.message === 'string' ? p.message.slice(0, 2000) : '',
-          scheduledAt: Number.isFinite(secs) ? new Date(secs * 1000).toISOString() : null,
-          hasPicture: typeof p.full_picture === 'string' && p.full_picture.length > 0,
-          link: typeof p.permalink_url === 'string' && p.permalink_url.startsWith('https://') ? p.permalink_url : null,
-        };
-      })
-      .filter((p) => p.id)
-      .sort((a, b) => (a.scheduledAt ?? '').localeCompare(b.scheduledAt ?? ''));
+    const posts: ScheduledPost[] = list
+      .map((p) => ({
+        id: String(p.id ?? ''),
+        message: typeof p.message === 'string' ? p.message.slice(0, 2000) : '',
+        scheduledAt: toIso(p.scheduled_publish_time),
+        hasPicture: typeof p.full_picture === 'string' && p.full_picture.length > 0,
+        link: typeof p.permalink_url === 'string' && p.permalink_url.startsWith('https://') ? p.permalink_url : null,
+      }))
+      .filter((p) => p.id);
+    // Scheduled videos live on the videos edge; added unless the same post is already listed.
+    try {
+      const v = await this.call('GET', `${this.o.pageId}/videos`, { query: { fields: 'id,description,scheduled_publish_time,published,permalink_url', limit: '25' } });
+      for (const x of Array.isArray(v.data) ? (v.data as Record<string, unknown>[]) : []) {
+        const at = toIso(x.scheduled_publish_time);
+        if (x.published !== false || !at || Date.parse(at) < Date.now()) continue;
+        const message = typeof x.description === 'string' ? x.description.slice(0, 2000) : '';
+        if (posts.some((p) => p.scheduledAt === at && p.message === message)) continue;
+        const u = typeof x.permalink_url === 'string' ? x.permalink_url : '';
+        posts.push({ id: String(x.id ?? ''), message, scheduledAt: at, hasPicture: false, link: u.startsWith('https://') ? u : u.startsWith('/') ? `https://www.facebook.com${u}` : null, isVideo: true });
+      }
+    } catch {
+      /* the videos list is extra: posts still show */
+    }
+    return posts.filter((p) => p.id).sort((a, b) => (a.scheduledAt ?? '').localeCompare(b.scheduledAt ?? ''));
   }
 
-  /** Deletes one of this Page's posts (used to cancel a scheduled post). */
+  /** Deletes one of this Page's posts or videos (used to cancel a scheduled post). */
   async cancel(postId: string): Promise<void> {
+    if (/^\d{5,30}$/.test(postId)) {
+      // A video id: delete it only if it belongs to this Page.
+      const v = await this.call('GET', postId, { query: { fields: 'from' } });
+      const from = v.from as { id?: unknown } | undefined;
+      if (String(from?.id ?? '') !== this.o.pageId) throw new FacebookError('INVALID', 'That is not a video on this Page.', 400);
+      await this.call('DELETE', postId, {});
+      return;
+    }
     if (!new RegExp(`^${this.o.pageId}_\\d+$`).test(postId)) throw new FacebookError('INVALID', 'That is not a post on this Page.', 400);
     await this.call('DELETE', postId, {});
   }
@@ -201,6 +293,12 @@ export class FacebookClient {
     // Host and path only: no query string (appsecret_proof) and never the token.
     this.o.log?.(`[facebook] ${method} ${url.host}${url.pathname} -> ${outcome} (${Date.now() - started} ms)`);
   }
+}
+
+/** Facebook's scheduled_publish_time (unix seconds, as a number or text, or an ISO date) -> ISO, or null. */
+function toIso(t: unknown): string | null {
+  const secs = typeof t === 'number' ? t : typeof t === 'string' && /^\d+$/.test(t) ? Number(t) : typeof t === 'string' ? Date.parse(t) / 1000 : NaN;
+  return Number.isFinite(secs) ? new Date(secs * 1000).toISOString() : null;
 }
 
 /** Turns a Graph API error into a clear message. Facebook's own text is shortened, never echoed in full. */

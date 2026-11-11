@@ -92,6 +92,12 @@ function customTemplate(agentId: AgentId, prompt: string): TaskOutput {
     rosa: `Collections check (mock figures):\n• Finished orders with a balance: 2\n• Orders with no downpayment yet: 1\n• Reminder drafts are for review only — nothing is sent in demo mode.`,
     mika: `Trend check (mock figures):\n• Orders this quarter: up 12% on last quarter\n• Best seller: narra panel doors with varnish\n• Slowest stage: finishing (avg 6 days)\nDemo figures only — live trends come from Connected Mode.`,
     carlo: `Caption idea:\n"Crafted with care, built to last. Another custom WAD door is ready for its new home. Message us for a quotation!"\nNot published — for review only.`,
+    kat: `Catalog entry draft (demo):
+• Category: Doors — Main Door
+• Name: Solid Kiln Dried Wood Door
+• Material: Solid Kiln Dried Wood · 80-90 x 210cm
+• Finishes: Mahogany Wood, Varnished, Sand Beige
+Not added — in Connected Mode you approve it and it goes to the online catalog.`,
     joy: `Reply draft (not sent):\n"Hi po [Customer name]! Thank you for your message. Your door is now in finishing, and we will update you as soon as it is ready for delivery."\n\nNotes for staff:\n• Demo only: live replies use the order you pick in Connected Mode.`,
     tess: `Inspection checklist (sample order):\n• Dimensions: measure 36 x 84, thickness 1 3/4"\n• Design: panel door, compare with the design photo\n• Finish: with varnish, even coat, no drips\n• Jamb: with hamba, mahogany 2 x 6, even gap all around\n• Hardware: not recorded, confirm with sales\nDemo only: live checklists come from WAD Order Management.`,
     dev: `Data check (mock records):\n• 1 open order with no due date\n• 1 In Progress order with no carpenter\n• 1 piece with no price\nFix list: add the due date, assign a carpenter, enter the price. Demo only: live checks run in Connected Mode.`,

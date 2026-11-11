@@ -8,7 +8,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 
-export type HealthSystem = 'orders' | 'finance' | 'gemini' | 'facebook';
+export type HealthSystem = 'orders' | 'finance' | 'gemini' | 'facebook' | 'github';
 type Status = number | 'TIMEOUT' | 'NETWORK';
 interface Sample {
   at: number;

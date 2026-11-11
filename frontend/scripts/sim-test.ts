@@ -4,6 +4,7 @@
 import { TemplateBrain } from '../src/agents/brain';
 import { AGENTS, seatOf } from '../src/agents/roster';
 import { captionFrom, replyFrom, scheduleFrom } from '../src/live/caption';
+import { catalogDraftFrom, draftProblems, toProduct } from '../src/live/catalogDraft';
 import { Engine, MAX_ON_BREAK, type Chat, type StorageLike } from '../src/sim/engine';
 import { buildChecklist } from '../shared/qc';
 import { DEV_BOARD_SLOTS, FURNITURE, MEETING_SLOTS, SPOTS, buildWalkGrid, DOORS, ROOMS, LEISURE_SPOTS, STROLL_POINTS, CHAT_SPOTS, CHAT_SCRIPTS, roomAt, SHOP_BENCHES, SHOP_ENTRANCE, SHOP_LUMBER, SHOP_SWEEP } from '../src/office/layout';
@@ -286,6 +287,34 @@ async function main() {
   );
   check(captionFrom('Just a caption.') === 'Just a caption.', 'plain answers are used as they are');
   check(!captionFrom('**What I see**\n- a door\n**Post**\nHello').includes('a door'), '"What I see" never goes into the post');
+
+  console.log("Kat: catalog entry from her answer");
+  {
+    const ans = [
+      '**What I see**',
+      '- A carved main door',
+      '',
+      '**Catalog entry**',
+      '**Category:** Doors',
+      '**Door type:** main door',
+      '**Name:** Carved Kiln Dried Wood Door',
+      '**Material:** Solid Kiln Dried Wood',
+      '**Dimensions:** 80-90 x 210cm',
+      '**Finishes:** Mahogany Wood, Varnished, Sand Beige',
+      '**Description:** Carved high quality kiln dried wood door.',
+      '',
+      'Check the details and click Add to catalog.',
+    ].join('\n');
+    const d = catalogDraftFrom(ans);
+    check(!!d && d.category === 'Doors' && d.doorType === 'Main Door' && d.name === 'Carved Kiln Dried Wood Door', 'category, door type and name are read (door type matched to the list)');
+    check(!!d && draftProblems(d).length === 0, 'a complete entry is ready to add');
+    check(!!d && JSON.stringify(toProduct(d).finishes) === '["Mahogany Wood","Varnished","Sand Beige"]', 'finishes become a list');
+    const cab = catalogDraftFrom('**Category:** Cabinets\n**Door type:** none\n**Name:** Wall Cabinet\n**Material:** Wood\n**Dimensions:** none\n**Finishes:** Varnished\n**Description:** A cabinet.');
+    check(!!cab && cab.doorType === '' && cab.dimensions === '' && toProduct(cab).doorType === null, '"none" is left empty; no door type for other categories');
+    const odd = catalogDraftFrom('**Category:** Chairs\n**Name:** Chair');
+    check(!!odd && odd.category === '' && draftProblems(odd).includes('Choose a category.'), 'a category the catalog does not have must be chosen by a person');
+    check(catalogDraftFrom('Which category is this, a cabinet or a door?') === null, 'a question is not an entry');
+  }
 
   console.log('Carlo: caption + schedule from one request');
   {

@@ -11,6 +11,8 @@ import { createApp } from './app';
 import { Auth } from './auth';
 import { loadConfig } from './config';
 import { FacebookClient } from './social/facebook';
+import { VideoUploads } from './social/videos';
+import { CatalogClient } from './catalog/catalog';
 import { loadEnvFile } from './env';
 import { ApiClient } from './http/client';
 import { createTaskLog } from './jobs/log';
@@ -73,10 +75,15 @@ const discussions = new DiscussionService({
 });
 // UI Review (Aya, Kim, Rey): screenshots only, never opens a website; same Gemini client.
 const uiReviews = new UiReviewService({ ai: ai?.ai ?? null, store: new UiReviewStore(config.uiReviewsFile), log });
-const app = createApp({ config, auth, runner, finance, orders, aiStatus, facebook, audit: taskLog, log, health, discussions, uiReviews, aiUsage });
+// The online catalog (Kat): adds approved products to the catalog's GitHub repository.
+const cat = config.catalog;
+const catalog =
+  cat.repo && cat.token ? new CatalogClient({ repo: cat.repo, branch: cat.branch, folder: cat.folder, token: cat.token, siteUrl: cat.siteUrl, timeoutMs: 30_000, log, fetchImpl: health.instrument('github') }) : null;
+const app = createApp({ config, auth, runner, finance, orders, aiStatus, facebook, audit: taskLog, log, health, discussions, uiReviews, aiUsage, videos: facebook ? new VideoUploads({ log }) : null, catalog });
 
 for (const p of problems) log(`[config] ${p}`);
 log(`[config] Facebook posting: ${facebook ? `ready (Page ${fb.pageId}, Graph ${fb.version})` : `off — ${fb.problems.join(' ')}`}`);
+log(`[config] Catalog (Kat): ${catalog ? `ready (${cat.repo}, branch ${cat.branch}${cat.folder ? `, folder ${cat.folder}` : ''})` : `off — ${cat.problems.join(' ')}`}`);
 for (const s of [finance.status(), orders.status()]) log(`[config] ${s.name}: ${s.state}${s.problems.length ? ` — ${s.problems.join(' ')}` : ''}`);
 log(`[config] AI tasks: ${ai ? `ready (Gemini, model ${config.ai.model})` : 'off — set GEMINI_API_KEY to enable'}`);
 

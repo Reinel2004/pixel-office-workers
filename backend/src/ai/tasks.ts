@@ -21,7 +21,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DataLookup, DateRange, LiveAgentId, Money, Permission, SessionUser, SourceInfo, SystemId, TaskTurn } from '../../shared/live';
-import { SYSTEM_NAMES } from '../../shared/live';
+import { CATALOG_CATEGORIES, CATALOG_DOOR_TYPES, CATALOG_LIMITS, SYSTEM_NAMES } from '../../shared/live';
 import { buildChecklist, hardwareMentions } from '../../shared/qc';
 import { manilaDate, validateRange } from '../../shared/manila';
 import type { FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
@@ -113,6 +113,13 @@ export const AGENT_PROFILES: Record<LiveAgentId, AgentProfile> = {
       'Writes captions and posts for finished projects (doors and furniture). Never invents customer names, prices or promises. When given a photo, looks carefully at it first and writes the caption from what is actually visible.',
     tools: [],
   },
+  kat: {
+    name: 'Kat',
+    role: 'Catalog Manager',
+    focus:
+      "Keeps WAD's online product catalog (wadfurniture-catalog.vercel.app) up to date. From a product photo she drafts the catalog entry: category, door type, name, material, dimensions, finishes and a short description, in the same plain style as the products already in the catalog. A staff member checks and approves every entry before it goes online; she cannot add anything herself. Never invents prices, sizes or wood the photo and request do not support.",
+    tools: [],
+  },
   joy: {
     name: 'Joy',
     role: 'Customer Service',
@@ -138,7 +145,7 @@ export const AGENT_PROFILES: Record<LiveAgentId, AgentProfile> = {
     name: 'Sam',
     role: 'Systems Monitor',
     focus:
-      'Watches the office\'s own systems: whether WAD Order Management, WAD Furniture Management, Gemini and the Facebook Page are set up and answering, how fast, how often calls fail and with which errors, whether the live updates are working, and how the office server itself is doing. Says plainly what is fine, what is wrong, the likely cause (for example: 401/403 = token wrong or expired, 429 = too many requests, 5xx = a problem on that system, TIMEOUT/NETWORK = cannot be reached) and the exact next step (which setting in backend/.env or Render to check). Never guesses beyond the figures; says when there is too little data yet.',
+      'Watches the office\'s own systems: whether WAD Order Management, WAD Furniture Management, Gemini, the Facebook Page and the online catalog (GitHub, used by Kat) are set up and answering, how fast, how often calls fail and with which errors, whether the live updates are working, and how the office server itself is doing. Says plainly what is fine, what is wrong, the likely cause (for example: 401/403 = token wrong or expired, 429 = too many requests, 5xx = a problem on that system, TIMEOUT/NETWORK = cannot be reached) and the exact next step (which setting in backend/.env or Render to check). Never guesses beyond the figures; says when there is too little data yet.',
     tools: ['get_system_health'],
   },
   ivy: {
@@ -357,6 +364,26 @@ A photo is attached to this request.
 - Then write the post: "**Caption**" (2 to 4 sentences, or the length the request asks for, e.g. "small" or "short" = 1 to 2 sentences; warm and proud, ends with a call to message WAD for a quotation), "**Short version**" (one line), and "**Hashtags**" (5 to 8, including #WADFurniture).
 - Do not mention people, faces, house numbers, addresses or plate numbers that appear in the photo. Never invent a customer name, price or delivery promise.`;
 
+/** A video's frames, each labelled with its place in the video. */
+function videoParts(v: { durationSec: number; frames: { mimeType: string; data: string }[] }): GeminiPart[] {
+  const n = v.frames.length;
+  return v.frames.flatMap((f, i) => [{ text: `Video frame ${i + 1} of ${n}, at about ${Math.round(((i + 0.5) / n) * v.durationSec)} s:` }, { inlineData: f }]);
+}
+
+/** Added to the instructions when a video comes with the task (Carlo sees still frames of it). */
+function videoRules(seconds: number, frames: number) {
+  const len = seconds >= 60 ? `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s` : `${Math.round(seconds)} s`;
+  return `
+
+A video is attached to this request, shown to you as ${frames} still frames taken evenly from it (it is ${len} long).
+- You cannot hear it and you do not see what happens between the frames: describe only what the frames show, and never claim sounds, speech or movements you cannot see.
+- First, under "**What I see**", list in 3 to 6 short bullets what is visible: the product (door, cabinet, table…), design, colour and finish, hardware, the setting, and what the video seems to show (for example a walk-around of a finished door, or the carving up close).
+- Wood species cannot be confirmed from a video: write "looks like narra" or similar, unless the request or the business notes name the wood.
+- If the frames are not furniture, are too dark or blurry, or you are unsure, say so plainly instead of guessing.
+- Then write the post for a video: "**Caption**" (2 to 4 sentences, or the length the request asks for; warm and proud, ends with a call to message WAD for a quotation), "**Short version**" (one line), and "**Hashtags**" (5 to 8, including #WADFurniture).
+- Do not mention people, faces, house numbers, addresses or plate numbers that appear in the video. Never invent a customer name, price or delivery promise.`;
+}
+
 /**
  * Added to Carlo's instructions: when the request asks for a posting time, he ends with one
  * machine-readable "Schedule" line. The office checks it by code and prepares the post; a staff
@@ -376,6 +403,30 @@ Facebook scheduling:
 - If no time is asked for, leave the line out. If the time is unclear, leave it out and say in one sentence which time to pick.
 - You cannot post or schedule yourself. A staff member checks the post in the office and approves it with one click; say "Ready for your approval" instead of "scheduled".`;
 }
+
+/**
+ * Added to Kat's instructions: the catalog entry as labelled lines the office reads by code (and
+ * checks again on the server) to fill in the approval form.
+ */
+const KAT_RULES = `
+
+Catalog entry rules:
+- The catalog has these categories only: ${CATALOG_CATEGORIES.join(', ')}. Doors also need a door type: ${CATALOG_DOOR_TYPES.join(', ')} ("Main Door" = a solid front or entrance door, often carved or with panels; "Ordinary" = a plain interior or bedroom door; "Double Door" = two leaves; "Flush Door" = a flat, smooth face).
+- Write like the catalog does. Typical entries: name "Solid Kiln Dried Wood Door", material "Solid Kiln Dried Wood", dimensions "80-90 x 210cm" (doors), finishes "Mahogany Wood, Varnished, Sand Beige", description "Modern high quality kiln dried wood door." Use those defaults unless the request or the photo says otherwise.
+- Dimensions: use the size in the request. With no size given, use "80-90 x 210cm" for a single door and leave it empty for other products. Never guess a size from the photo.
+- Wood species cannot be confirmed from a photo: only name a wood the request names.
+- Keep it short: name at most ${CATALOG_LIMITS.name} characters, description one or two plain sentences (at most ${CATALOG_LIMITS.description} characters), at most ${CATALOG_LIMITS.finishes} finishes. No prices, no customer names, no emojis or hashtags.
+- First, under "**What I see**", list in 2 to 5 short bullets what is visible (product, design, colour and finish).
+- Then write "**Catalog entry**" followed by exactly these lines, one per line:
+**Category:** <one category>
+**Door type:** <one door type, or "none" if it is not a door>
+**Name:** <name>
+**Material:** <material>
+**Dimensions:** <dimensions, or empty>
+**Finishes:** <finishes, separated by commas>
+**Description:** <description>
+- If the photo is not furniture, is too dark or blurry, or you cannot tell which category it belongs to, do not write the entry: say what is wrong or ask which category, and end with the Needs information line.
+- You cannot add the product yourself. End with: "Check the details and click Add to catalog."`;
 
 /** Added to Joy's instructions on every customer-service task. */
 const CS_RULES = `
@@ -417,6 +468,8 @@ export async function runAiTask(
     signal?: AbortSignal;
     /** Earlier messages of this task (follow-ups); the current `prompt` is not included. */
     history?: TaskTurn[];
+    /** Still frames of a video (in order, evenly spaced), and its length. */
+    video?: { durationSec: number; frames: { mimeType: string; data: string }[] };
   } = {},
 ): Promise<AiTaskOutcome> {
   const today = manilaDate(deps.now?.());
@@ -475,6 +528,7 @@ export async function runAiTask(
       role: 'user',
       parts: [
         ...(image ? [{ inlineData: image }] : []),
+        ...(opts.video ? videoParts(opts.video) : []),
         { text: history.length ? `Follow-up from ${user.username}: ${prompt}` : prompt },
         ...(orderFacts ? [{ text: `Selected order (from WAD Order Management, exact):\n${JSON.stringify(orderFacts)}` }] : []),
         ...(autoFacts ? [{ text: `Live data the office retrieved for this question before you answer (exact, calculated by code; retrieved ${new Date().toISOString()}):\n${JSON.stringify(autoFacts)}` }] : []),
@@ -489,8 +543,10 @@ export async function runAiTask(
         {
           text:
             systemPrompt(profile, today, tools, profile.tools.filter((t) => !tools.includes(t)), user, loadKnowledge(deps.knowledgeDir)) +
-            (image ? PHOTO_RULES : '') +
+            (image && agent !== 'kat' ? PHOTO_RULES : '') + // Kat's rules say how she reads a photo
+            (opts.video ? videoRules(opts.video.durationSec, opts.video.frames.length) : '') +
             (agent === 'carlo' ? carloRules(deps.now?.() ?? new Date()) : '') +
+            (agent === 'kat' ? KAT_RULES : '') +
             (agent === 'joy' ? CS_RULES + (orderRef ? '' : '\nNo order was selected for this message.') : '') +
             (agent === 'tess' ? QC_RULES + (orderRef ? '' : "\nNo order was selected: answer generally, and say that picking the order in Tess's panel gives an exact checklist.") : '') +
             (autoFacts ? AUTO_RULES : '') +

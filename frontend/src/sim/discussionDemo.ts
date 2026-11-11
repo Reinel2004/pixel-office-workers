@@ -23,6 +23,7 @@ const SAMPLE: Partial<Record<LiveAgentId, { finding: string; action: string; con
   bea: { finding: 'Sample expenses rise with rush work.', action: 'Track overtime and rush costs per month.', concern: 'Rush work cuts the margin.' },
   rosa: { finding: 'A few sample finished orders still have a balance.', action: 'Collect the balance before delivery.', concern: 'Delivering before payment slows cash flow.' },
   mika: { finding: 'The sample trend shows more orders in the last two months.', action: 'Compare orders per month against finishing capacity.', concern: 'Two months is too short to call it a trend.' },
+  kat: { finding: 'The sample catalog has few cabinets and dining tables compared with doors.', action: 'Photograph finished furniture and add it to the catalog.', concern: 'Catalog photos must match what the shop can really make.' },
   carlo: { finding: 'Sample customers ask about delivery dates on social media.', action: 'Post realistic lead times on the Page.', concern: 'Advertised dates must match the shop floor.' },
   joy: { finding: 'Sample customer messages mostly ask "kailan ma-deliver?".', action: 'Send a status update when an order changes stage.', concern: 'Silence makes customers worry more than a delay.' },
   tess: { finding: 'Some sample orders reach finishing with the jamb size still blank.', action: 'Check every order has size, finish and jamb before production starts.', concern: 'Rework costs more than checking the specs first.' },

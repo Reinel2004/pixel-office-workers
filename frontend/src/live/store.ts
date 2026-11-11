@@ -2,14 +2,16 @@
 // holds all credentials. Live results are kept in memory here and never written to
 // localStorage, and they are never mixed with the demo engine's mock tasks.
 
+import type { CatalogAddResult, CatalogProductInput, CatalogStatus, VideoUploadStatus } from '../../shared/live';
 import type { AiLimits, AiUsageReport, AttentionItem, AttentionReport, Discussion, DiscussionInput, FacebookStatus, InspectionChecklist, OrderPick, ScheduledPost, ShopCounts, UiReview, UiReviewInput, UiVerifyInput } from '../../shared/live';
-import { DISCUSSION_ACTIVE, UI_REVIEW_RUNNING } from '../../shared/live';
+import { DISCUSSION_ACTIVE, UI_REVIEW_RUNNING, VIDEO_CHUNK_BYTES } from '../../shared/live';
 import type { AiStatus, DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, ReportType, SessionUser, SystemStatus } from '../../shared/live';
 import { LIVE_AGENT_IDS, SYSTEM_NAMES } from '../../shared/live';
 import { AGENT_BY_ID } from '../agents/roster';
 import { SPOTS } from '../office/layout';
 import { presetRange, type RangePreset } from '../../shared/manila';
 import type { Engine } from '../sim/engine';
+import type { VideoPick } from './video';
 
 export type ServerState = 'unknown' | 'checking' | 'unreachable' | 'signed_out' | 'signed_in';
 export type StreamState = 'idle' | 'connecting' | 'open' | 'reconnecting';
@@ -582,7 +584,10 @@ export class LiveStore {
     this.user = null;
     this.jobs = [];
     this.images.clear();
+    for (const v of this.videos.values()) URL.revokeObjectURL(v.url);
+    this.videos.clear();
     this.facebook = null;
+    this.catalog = null;
     this.scheduledPosts = null;
     this.fbError = null;
     this.orderPicks = null;
@@ -631,6 +636,7 @@ export class LiveStore {
     this.maxRangeDays = types.maxRangeDays;
     this.ai = types.ai ?? null;
     void this.loadFacebook();
+    void this.loadCatalog();
     void this.loadWorkshop(true);
     void this.loadDiscussions();
     void this.loadUiReviews();
@@ -742,6 +748,41 @@ export class LiveStore {
     return { ok: true };
   }
 
+  // ---------------------------------------------------------------- Catalog (Kat)
+  catalog: CatalogStatus | null = null;
+
+  canAddToCatalog(): { ok: boolean; reason?: string } {
+    if (this.server !== 'signed_in' || !this.user) return { ok: false, reason: 'Sign in first.' };
+    if (!this.user.permissions.includes('catalog:write')) return { ok: false, reason: 'Your account cannot add products to the catalog.' };
+    if (!this.catalog) return { ok: false, reason: 'Checking the catalog…' };
+    if (!this.catalog.configured) return { ok: false, reason: `The catalog is not set up on the server. ${this.catalog.problems.join(' ')} See README, "Catalog (Kat)".` };
+    return { ok: true };
+  }
+
+  async loadCatalog() {
+    if (!this.user?.permissions.includes('catalog:write')) return;
+    try {
+      this.catalog = (await api<{ catalog: CatalogStatus }>('/api/catalog/status')).catalog;
+    } catch (e) {
+      this.catalog = { configured: false, repo: null, branch: null, siteUrl: null, products: null, problems: [(e as Error).message] };
+    }
+    this.emit();
+  }
+
+  /** Adds one approved product with its photo. `key` makes a repeated click or resend add it only once. */
+  async addToCatalog(p: { key: string; product: CatalogProductInput; photo: string }): Promise<CatalogAddResult> {
+    const image = { mimeType: p.photo.slice(5, p.photo.indexOf(';')), data: p.photo.slice(p.photo.indexOf(',') + 1) };
+    try {
+      const { product } = await api<{ product: CatalogAddResult }>('/api/catalog/products', { method: 'POST', body: JSON.stringify({ key: p.key, product: p.product, image }) });
+      this.addLog(`Product ${product.productId} added to the catalog: ${p.product.name}.`, 'success', 'kat');
+      void this.loadCatalog();
+      return product;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      throw e;
+    }
+  }
+
   // ---------------------------------------------------------------- Facebook (Carlo)
   facebook: FacebookStatus | null = null;
   scheduledPosts: ScheduledPost[] | null = null;
@@ -814,6 +855,52 @@ export class LiveStore {
     }
   }
 
+  /**
+   * Posts (or schedules) a video: uploads it to the office server in pieces, asks the server to
+   * send it to Facebook, then follows its progress until Facebook has it. An upload posts at most
+   * once; after a failure, "try again" reuses the upload when the server still has it.
+   */
+  async postVideo(p: { video: VideoPick; message: string; scheduleAt?: string }, onProgress?: (text: string) => void): Promise<{ postId: string; link: string | null; scheduledAt: string | null }> {
+    const v = p.video;
+    const pct = (a: number, b: number) => `${Math.floor((100 * a) / Math.max(1, b))}%`;
+    try {
+      const existing: VideoUploadStatus | null = v.uploadId
+        ? await api<{ upload: VideoUploadStatus }>(`/api/facebook/videos/${v.uploadId}`).then((r) => r.upload).catch(() => null)
+        : null;
+      let up: VideoUploadStatus =
+        existing && existing.state !== 'failed'
+          ? existing
+          : (await api<{ upload: VideoUploadStatus }>('/api/facebook/videos', { method: 'POST', body: JSON.stringify({ bytes: v.file.size, mimeType: v.mimeType }) })).upload;
+      v.uploadId = up.id;
+      // 1) Upload the rest of the file, piece by piece (one retry per piece for a dropped connection).
+      while (up.state === 'receiving') {
+        const id = up.id;
+        const from: number = up.received;
+        onProgress?.(`Uploading ${pct(from, up.bytes)}…`);
+        const body = v.file.slice(from, Math.min(from + VIDEO_CHUNK_BYTES, v.file.size));
+        const send = (): Promise<{ upload: VideoUploadStatus }> =>
+          api<{ upload: VideoUploadStatus }>(`/api/facebook/videos/${id}?offset=${from}`, { method: 'PUT', body, headers: { 'Content-Type': 'application/octet-stream' } });
+        up = (await send().catch((e: unknown) => (e instanceof HttpError && e.status === 0 ? send() : Promise.reject(e)))).upload;
+      }
+      // 2) Send it on to Facebook (once), then 3) follow it until Facebook has it.
+      if (up.state === 'received') up = (await api<{ upload: VideoUploadStatus }>(`/api/facebook/videos/${up.id}/post`, { method: 'POST', body: JSON.stringify({ message: p.message, scheduleAt: p.scheduleAt ?? null }) })).upload;
+      while (up.state === 'posting') {
+        onProgress?.(`Sending to Facebook ${pct(up.sentToFacebook, up.bytes)}…`);
+        await new Promise((r) => setTimeout(r, 1500));
+        up = (await api<{ upload: VideoUploadStatus }>(`/api/facebook/videos/${up.id}`)).upload;
+      }
+      if (up.state !== 'posted' || !up.post) throw new Error(up.error ?? 'Posting the video failed.');
+      this.addLog(up.post.scheduledAt ? `Facebook video scheduled for ${up.post.scheduledAt.slice(0, 16).replace('T', ' ')} UTC.` : 'Video posted to Facebook.', 'success', 'carlo');
+      if (up.post.scheduledAt) void this.loadScheduled();
+      return up.post;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      throw e;
+    } finally {
+      onProgress?.('');
+    }
+  }
+
   async cancelScheduled(id: string) {
     try {
       await api(`/api/facebook/scheduled/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -831,9 +918,15 @@ export class LiveStore {
    */
   images = new Map<string, string>();
 
-  /** Assigns a free-text task to one agent, optionally with a photo (JPEG data URL). */
-  async submitAi(agent: LiveAgentId, prompt: string, photo?: string, orderRef?: string): Promise<Job | null> {
-    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}|${orderRef ?? ''}`;
+  /**
+   * Videos sent with tasks, kept only in this tab's memory (the file and its frames), so the task
+   * can show it and Carlo's post can upload it. Never saved; gone after a reload or sign-out.
+   */
+  videos = new Map<string, VideoPick>();
+
+  /** Assigns a free-text task to one agent, optionally with a photo (JPEG data URL) or a video (Carlo). */
+  async submitAi(agent: LiveAgentId, prompt: string, photo?: string, orderRef?: string, video?: VideoPick): Promise<Job | null> {
+    const key = `ai|${agent}|${prompt}|${photo ? photo.length : 0}|${orderRef ?? ''}|${video ? video.file.size : 0}`;
     if (this.submitting.has(key)) return null;
     this.submitting.add(key);
     this.lastError = null;
@@ -841,8 +934,16 @@ export class LiveStore {
     try {
       const image = photo ? { mimeType: photo.slice(5, photo.indexOf(';')), data: photo.slice(photo.indexOf(',') + 1) } : undefined;
       // The key makes a resent request (double click, retry after a dropped connection) harmless.
-      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, key: newKey(), ...(image ? { image } : {}), ...(orderRef ? { orderRef } : {}) }) });
+      // Only the video's still frames are sent; the file stays here until a post is approved.
+      const vid = video
+        ? { mimeType: video.mimeType, bytes: video.file.size, durationSec: video.durationSec, frames: video.frames.map((f) => ({ mimeType: 'image/jpeg', data: f.slice(f.indexOf(',') + 1) })) }
+        : undefined;
+      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', {
+        method: 'POST',
+        body: JSON.stringify({ agent, prompt, key: newKey(), ...(image ? { image } : {}), ...(vid ? { video: vid } : {}), ...(orderRef ? { orderRef } : {}) }),
+      });
       if (photo) this.images.set(job.id, photo);
+      if (video) this.videos.set(job.id, video);
       this.applyJob(job, false);
       return job;
     } catch (e) {

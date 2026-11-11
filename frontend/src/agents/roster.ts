@@ -109,6 +109,16 @@ export const AGENTS: AgentDef[] = [
     blurb: 'Writes captions and posts for finished projects.',
   },
   {
+    id: 'kat',
+    tint: '#ff6b6b',
+    name: 'Kat',
+    role: 'Catalog Manager',
+    room: 'content',
+    desk: { x: 28, y: 20 },
+    look: { skin: '#e2b38f', hair: '#2a1810', hairStyle: 'long', shirt: '#b5523b', pants: '#2f3442', accessory: 'glasses' },
+    blurb: 'Adds new products to the online catalog from a photo, after you approve them.',
+  },
+  {
     id: 'joy',
     tint: '#b6e36a',
     name: 'Joy',

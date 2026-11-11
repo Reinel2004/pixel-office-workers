@@ -10,7 +10,8 @@ export const SYSTEM_NAMES: Record<SystemId, string> = {
 
 /** ui:review = UI Review in the Development Studio (Aya, Rey and Kim look at website screenshots). */
 /** ai:usage = see the AI usage tracker; ai:limits = change its limits and prices. */
-export type Permission = 'finance:read' | 'orders:read' | 'social:post' | 'system:read' | 'ui:review' | 'ai:usage' | 'ai:limits';
+/** catalog:write = add products to the online catalog (with Kat), after a person checks them. */
+export type Permission = 'finance:read' | 'orders:read' | 'social:post' | 'system:read' | 'ui:review' | 'ai:usage' | 'ai:limits' | 'catalog:write';
 
 /** Facebook Page posting status (never includes the token). */
 export interface FacebookStatus {
@@ -26,6 +27,78 @@ export interface ScheduledPost {
   scheduledAt: string | null; // ISO
   hasPicture: boolean;
   link: string | null;
+  /** A scheduled video (cancelled by deleting the video). */
+  isVideo?: boolean;
+}
+
+// ---------------------------------------------------------------- Videos (Carlo + Facebook)
+/** Video files the office accepts: MP4 and MOV (what phones record and Facebook takes). */
+export const VIDEO_TYPES = ['video/mp4', 'video/quicktime'] as const;
+/** Largest video, in bytes (it passes through the office server on its way to Facebook). */
+export const FB_VIDEO_MAX_BYTES = 200 * 1024 * 1024;
+/** The browser sends a video to the server in pieces of this size. */
+export const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024;
+/** Carlo sees a video as up to this many still frames taken from it (never the video file itself). */
+export const MAX_VIDEO_FRAMES = 6;
+export const MAX_FRAME_BYTES = 400 * 1024;
+
+/** A video upload on its way to Facebook (shown while it posts). */
+export interface VideoUploadStatus {
+  id: string;
+  state: 'receiving' | 'received' | 'posting' | 'posted' | 'failed';
+  bytes: number;
+  received: number;
+  /** Bytes already sent on to Facebook. */
+  sentToFacebook: number;
+  post: { postId: string; link: string | null; scheduledAt: string | null } | null;
+  error: string | null;
+}
+
+// ---------------------------------------------------------------- Catalog (Kat)
+/**
+ * The online catalog's categories and door types. The catalog page has a filter button for each,
+ * so a new product must use one of these (adding a category also needs a new button on the site).
+ */
+export const CATALOG_CATEGORIES = ['Doors', 'Cabinets', 'Dining Tables', 'Bed Frames'] as const;
+export const CATALOG_DOOR_TYPES = ['Main Door', 'Ordinary', 'Double Door', 'Flush Door'] as const;
+export type CatalogCategory = (typeof CATALOG_CATEGORIES)[number];
+export type CatalogDoorType = (typeof CATALOG_DOOR_TYPES)[number];
+/** Field lengths (the catalog card has little room). */
+export const CATALOG_LIMITS = { name: 80, material: 80, dimensions: 40, finish: 30, finishes: 6, description: 300 } as const;
+/** Largest product photo sent to the catalog (the office shrinks it first, so pages load fast). */
+export const CATALOG_MAX_IMAGE_BYTES = 1024 * 1024;
+
+/** A new catalog product, as a person approved it. */
+export interface CatalogProductInput {
+  category: CatalogCategory;
+  /** Doors only. */
+  doorType: CatalogDoorType | null;
+  name: string;
+  material: string;
+  dimensions: string;
+  finishes: string[];
+  description: string;
+}
+
+/** Whether the office can add to the catalog (never includes the token). */
+export interface CatalogStatus {
+  configured: boolean;
+  /** owner/name of the GitHub repository. */
+  repo: string | null;
+  branch: string | null;
+  siteUrl: string | null;
+  /** Products in the catalog now (read from GitHub), or null when it could not be read. */
+  products: number | null;
+  problems: string[];
+}
+
+/** A product the office added to the catalog. */
+export interface CatalogAddResult {
+  productId: number;
+  imagePath: string;
+  commitSha: string;
+  commitUrl: string | null;
+  siteUrl: string | null;
 }
 
 /** Facebook allows scheduling 10 minutes to 30 days ahead; the office keeps a small margin. */
@@ -48,13 +121,15 @@ export type StepStatus = 'queued' | 'working' | 'completed' | 'failed' | 'cancel
 export const JOB_ACTIVE: JobStatus[] = ['queued', 'working'];
 /** Most follow-up messages one task can take. */
 export const MAX_FOLLOW_UPS = 10;
-export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
-/** Agents that accept a photo with their task (e.g. Carlo writes a caption for a door photo). */
-export const IMAGE_AGENTS: LiveAgentId[] = ['carlo'];
+export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'kat' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
+/** Agents that accept a photo with their task (Carlo writes a caption; Kat drafts a catalog product). */
+export const IMAGE_AGENTS: LiveAgentId[] = ['carlo', 'kat'];
+/** Agents that accept a video with their task (Carlo, for Facebook video posts). */
+export const VIDEO_AGENTS: LiveAgentId[] = ['carlo'];
 export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 /** Largest photo accepted, in bytes (the office shrinks photos before sending, so this is rarely reached). */
 export const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
-export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'mika', 'carlo', 'joy', 'tess', 'dev', 'sam', 'ivy', 'aya', 'rey', 'kim', 'chief'];
+export const LIVE_AGENT_IDS: LiveAgentId[] = ['lia', 'marco', 'paolo', 'nina', 'bea', 'rosa', 'mika', 'carlo', 'kat', 'joy', 'tess', 'dev', 'sam', 'ivy', 'aya', 'rey', 'kim', 'chief'];
 /** Agents that take one order picked by a staff member (Joy answers a customer about it; Tess checks it). */
 export const ORDER_AGENTS: LiveAgentId[] = ['joy', 'tess'];
 /** The UI Review team in the Development Studio. */
@@ -220,6 +295,11 @@ export interface Job {
    * in server memory just while the task runs and is never stored, logged or sent back.
    */
   image?: { mimeType: string; bytes: number; sha256: string };
+  /**
+   * A video sent with the task: type, size, length, and how many still frames of it the AI saw.
+   * The video stays in the browser; only the frames reach the server (in memory, while the task runs).
+   */
+  video?: { mimeType: string; bytes: number; durationSec: number; frames: number; sha256: string };
   /** Customer-service tasks: the order a staff member picked for the reply. */
   orderRef?: string;
   /** How many phone numbers and email addresses were removed from the request before the AI saw it. */

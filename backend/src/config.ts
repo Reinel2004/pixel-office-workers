@@ -29,8 +29,23 @@ export interface FacebookConfig {
   problems: string[];
 }
 
+/** The online catalog (Kat): a GitHub repository whose site rebuilds on every change. */
+export interface CatalogConfig {
+  /** owner/name, or null when not set up. */
+  repo: string | null;
+  branch: string;
+  /** Folder of the catalog site inside the repository ('' = the top level). */
+  folder: string;
+  /** Never logged or sent to the browser. Null = adding to the catalog is off. */
+  token: string | null;
+  /** The live catalog, linked after a product is added. */
+  siteUrl: string | null;
+  problems: string[];
+}
+
 export interface AppConfig {
   facebook: FacebookConfig;
+  catalog: CatalogConfig;
   port: number;
   host: string;
   production: boolean;
@@ -82,12 +97,13 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
   /** system:read = the Systems team (Sam and Ivy): server health and security events. */
   /** ui:review = UI Review in the Development Studio (Aya, Kim and Rey look at page screenshots). */
   /** ai:usage = see the AI usage tracker; ai:limits = change its limits and prices. */
-  admin: ['finance:read', 'orders:read', 'social:post', 'system:read', 'ui:review', 'ai:usage', 'ai:limits'],
+  /** catalog:write = add products to the online catalog with Kat. */
+  admin: ['finance:read', 'orders:read', 'social:post', 'system:read', 'ui:review', 'ai:usage', 'ai:limits', 'catalog:write'],
   manager: ['finance:read', 'orders:read', 'ui:review', 'ai:usage'],
   finance: ['finance:read'],
   operations: ['orders:read'],
-  /** Can post to the Facebook Page (with Carlo); no business data. */
-  marketing: ['social:post'],
+  /** Can post to the Facebook Page (with Carlo) and add catalog products (with Kat); no business data. */
+  marketing: ['social:post', 'catalog:write'],
 };
 
 function int(v: string | undefined, def: number, min: number, max: number) {
@@ -183,6 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
     aiLimits: aiLimits(env, problems),
     staticDir: env.STATIC_DIR || null,
     facebook: facebookConfig(env),
+    catalog: catalogConfig(env),
     trustProxy: env.TRUST_PROXY === 'true',
     systems,
     ai: {
@@ -240,4 +257,36 @@ function facebookConfig(env: NodeJS.ProcessEnv): FacebookConfig {
   if (!token) problems.push('FACEBOOK_PAGE_TOKEN is not set.');
   if (!/^v\d{1,2}\.\d$/.test(version)) problems.push('FACEBOOK_GRAPH_VERSION must look like v27.0.');
   return { pageId: problems.length ? null : pageId, token: problems.length ? null : token, appSecret: env.FACEBOOK_APP_SECRET?.trim() || null, version, problems };
+}
+
+/**
+ * The catalog repository. Defaults to WAD's catalog (Reinel2004/WAD-CATALOG on branch main, live at
+ * wadfurniture-catalog.vercel.app); only the token must be set to switch it on.
+ */
+export function catalogConfig(env: NodeJS.ProcessEnv): CatalogConfig {
+  const repo = env.CATALOG_GITHUB_REPO?.trim() || 'Reinel2004/WAD-CATALOG';
+  const branch = env.CATALOG_GITHUB_BRANCH?.trim() || 'main';
+  // WAD's repository keeps the site in its WAD-CATALOG folder; CATALOG_GITHUB_FOLDER= (empty) = top level.
+  const folder = (env.CATALOG_GITHUB_FOLDER === undefined ? 'WAD-CATALOG' : env.CATALOG_GITHUB_FOLDER.trim()).replace(/^\/+|\/+$/g, '');
+  const token = env.CATALOG_GITHUB_TOKEN?.trim() || null;
+  const site = env.CATALOG_SITE_URL === undefined ? 'https://wadfurniture-catalog.vercel.app' : env.CATALOG_SITE_URL.trim();
+  const problems: string[] = [];
+  if (!/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(repo) || repo.includes('..')) problems.push('CATALOG_GITHUB_REPO must look like owner/name.');
+  if (!/^[A-Za-z0-9._/-]{1,100}$/.test(branch) || branch.includes('..') || branch.startsWith('/') || branch.endsWith('/')) problems.push('CATALOG_GITHUB_BRANCH is not a valid branch name.');
+  if (folder && (!/^[A-Za-z0-9._ -]+(\/[A-Za-z0-9._ -]+)*$/.test(folder) || folder.split('/').some((p) => p === '.' || p === '..')))
+    problems.push('CATALOG_GITHUB_FOLDER must be a folder in the repository, like WAD-CATALOG.');
+  if (!token) problems.push('CATALOG_GITHUB_TOKEN is not set.');
+  else if (!/^[!-~]{20,255}$/.test(token)) problems.push('CATALOG_GITHUB_TOKEN does not look like a GitHub token.');
+  let siteUrl: string | null = null;
+  if (site) {
+    try {
+      const u = new URL(site);
+      if (u.protocol !== 'https:' || u.username || u.password) throw new Error();
+      siteUrl = u.origin + u.pathname.replace(/\/$/, '');
+    } catch {
+      problems.push('CATALOG_SITE_URL must be an https address.');
+    }
+  }
+  const ok = !problems.length;
+  return { repo: ok ? repo : null, branch, folder, token: ok ? token : null, siteUrl, problems };
 }

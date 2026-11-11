@@ -9,6 +9,7 @@ import type { LiveStore } from '../../live/store';
 import { IconCamera, IconCheck, IconClose, IconRetry } from '../icons';
 import { shrinkPhoto, useLive } from './LiveViews';
 import type { PostWhen } from '../../live/caption';
+import { formatDuration, isVideoFile, prepareVideo, type VideoPick } from '../../live/video';
 export { captionFrom } from '../../live/caption';
 
 const newKey = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `k-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`);
@@ -28,12 +29,14 @@ export function FacebookComposer({
   store,
   initialMessage = '',
   initialPhoto = null,
+  initialVideo = null,
   initialWhen = null,
   onClose,
 }: {
   store: LiveStore;
   initialMessage?: string;
   initialPhoto?: string | null;
+  initialVideo?: VideoPick | null;
   /** The time Carlo read from the request, to start from. */
   initialWhen?: PostWhen | null;
   onClose?: () => void;
@@ -41,7 +44,9 @@ export function FacebookComposer({
   useLive(store);
   const today = manilaDate();
   const [message, setMessage] = useState(initialMessage);
-  const [photo, setPhoto] = useState<string | null>(initialPhoto);
+  const [photo, setPhoto] = useState<string | null>(initialVideo ? null : initialPhoto);
+  const [video, setVideo] = useState<VideoPick | null>(initialVideo);
+  const [progress, setProgress] = useState('');
   const [mode, setMode] = useState<'now' | 'schedule'>(initialWhen?.kind === 'at' ? 'schedule' : 'now');
   const [date, setDate] = useState(initialWhen?.kind === 'at' ? initialWhen.date : addDays(today, 1));
   const [time, setTime] = useState(initialWhen?.kind === 'at' ? initialWhen.time : '09:00');
@@ -77,7 +82,8 @@ export function FacebookComposer({
     setBusy(true);
     setError(null);
     try {
-      const r = await store.postToFacebook({ key, message: text, photo: photo ?? undefined, scheduleAt: mode === 'schedule' ? scheduleIso! : undefined });
+      const scheduleAt = mode === 'schedule' ? scheduleIso! : undefined;
+      const r = video ? await store.postVideo({ video, message: text, scheduleAt }, setProgress) : await store.postToFacebook({ key, message: text, photo: photo ?? undefined, scheduleAt });
       setDone({ link: r.link, scheduledAt: r.scheduledAt });
       if (r.scheduledAt) void store.loadScheduled();
     } catch (e) {
@@ -107,6 +113,7 @@ export function FacebookComposer({
               setKey(newKey());
               setMessage('');
               setPhoto(null);
+              setVideo(null);
             }}
           >
             Write another
@@ -123,9 +130,20 @@ export function FacebookComposer({
   return (
     <div className="fb-composer stack">
       <p className="muted small">
-        Posting to <b>{page}</b>. Check the text and photo: this will be public.
+        Posting to <b>{page}</b>. Check the text and the photo or video: this will be public.
       </p>
-      <PhotoPicker photo={photo} setPhoto={changed(setPhoto)} />
+      <PhotoPicker
+        photo={photo}
+        video={video}
+        setPhoto={changed((p: string | null) => {
+          setPhoto(p);
+          if (p) setVideo(null);
+        })}
+        setVideo={changed((v: VideoPick | null) => {
+          setVideo(v);
+          if (v) setPhoto(null);
+        })}
+      />
       <label className="sr-only" htmlFor="fb-text">
         Post text
       </label>
@@ -156,7 +174,7 @@ export function FacebookComposer({
       )}
       {scheduleProblem && <p className="photo-note small">{scheduleProblem}</p>}
       <label className="fb-confirm">
-        <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} /> I checked the text and photo, and approve this post.
+        <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} /> I checked the text and {video ? 'video' : 'photo'}, and approve this post.
       </label>
       {error && (
         <p className="photo-note small" role="alert">
@@ -165,7 +183,7 @@ export function FacebookComposer({
       )}
       <div className="row wrap gap-s">
         <button className="btn primary" disabled={!ready} onClick={() => void submit()}>
-          {busy ? 'Sending…' : mode === 'now' ? `Post now to ${page}` : scheduleIso && !scheduleProblem ? `Schedule for ${formatManila(scheduleIso)}` : 'Schedule'}
+          {busy ? progress || 'Sending…' : mode === 'now' ? `Post now to ${page}` : scheduleIso && !scheduleProblem ? `Schedule for ${formatManila(scheduleIso)}` : 'Schedule'}
         </button>
         {onClose && (
           <button className="btn ghost" onClick={onClose} disabled={busy}>
@@ -177,13 +195,33 @@ export function FacebookComposer({
   );
 }
 
-function PhotoPicker({ photo, setPhoto }: { photo: string | null; setPhoto: (p: string | null) => void }) {
+function PhotoPicker({
+  photo,
+  video,
+  setPhoto,
+  setVideo,
+}: {
+  photo: string | null;
+  video: VideoPick | null;
+  setPhoto: (p: string | null) => void;
+  setVideo: (v: VideoPick | null) => void;
+}) {
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const id = 'fb-photo-input';
   return (
     <div className="fb-photo">
-      {photo ? (
+      {video ? (
+        <div className="fb-photo-preview">
+          <video src={video.url} controls preload="metadata" aria-label="Video for the post" />
+          <button type="button" className="icon-btn" aria-label="Remove video" onClick={() => setVideo(null)}>
+            <IconClose size={12} />
+          </button>
+          <p className="muted small">
+            {formatDuration(video.durationSec)} · {Math.round(video.file.size / 1048576)} MB
+          </p>
+        </div>
+      ) : photo ? (
         <div className="fb-photo-preview">
           <img src={photo} alt="Photo for the post" />
           <button type="button" className="icon-btn" aria-label="Remove photo" onClick={() => setPhoto(null)}>
@@ -192,13 +230,13 @@ function PhotoPicker({ photo, setPhoto }: { photo: string | null; setPhoto: (p: 
         </div>
       ) : (
         <label className="btn sm" htmlFor={id} aria-disabled={busy}>
-          <IconCamera size={15} /> {busy ? 'Reading…' : 'Add a photo'}
+          <IconCamera size={15} /> {busy ? 'Reading…' : 'Add a photo or video'}
         </label>
       )}
       <input
         id={id}
         type="file"
-        accept="image/jpeg,image/png,image/webp"
+        accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,.mp4,.m4v,.mov"
         hidden
         onChange={async (e) => {
           const f = e.target.files?.[0];
@@ -207,7 +245,8 @@ function PhotoPicker({ photo, setPhoto }: { photo: string | null; setPhoto: (p: 
           setBusy(true);
           setNote(null);
           try {
-            setPhoto(await shrinkPhoto(f));
+            if (isVideoFile(f)) setVideo(await prepareVideo(f));
+            else setPhoto(await shrinkPhoto(f));
           } catch (err) {
             setNote((err as Error).message);
           } finally {
@@ -230,17 +269,24 @@ export function CarloReadyPost({
   jobId,
   message,
   photo,
+  video = null,
+  hadVideo = false,
   when,
 }: {
   store: LiveStore;
   jobId: string;
   message: string;
   photo: string | null;
+  /** The video sent with Carlo's task (this tab only). */
+  video?: VideoPick | null;
+  /** The task had a video, even if this tab no longer has it. */
+  hadVideo?: boolean;
   when: PostWhen;
 }) {
   useLive(store);
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ link: string | null; scheduledAt: string | null } | null>(null);
   const page = store.facebook?.pageName ?? 'your Facebook Page';
@@ -250,7 +296,7 @@ export function CarloReadyPost({
   const tooLong = text.length > MAX_POST_CHARS;
 
   if (editing)
-    return <FacebookComposer store={store} initialMessage={message} initialPhoto={photo} initialWhen={when} onClose={() => setEditing(false)} />;
+    return <FacebookComposer store={store} initialMessage={message} initialPhoto={photo} initialVideo={video} initialWhen={when} onClose={() => setEditing(false)} />;
   if (done)
     return (
       <div className="fb-composer stack">
@@ -265,13 +311,16 @@ export function CarloReadyPost({
       </div>
     );
 
+  const missingVideo = hadVideo && !video;
   const approve = async () => {
-    if (busy || problem || !text || tooLong) return;
+    if (busy || problem || !text || tooLong || missingVideo) return;
     setBusy(true);
     setError(null);
     try {
-      // One key per Carlo task: a second click (or a resend) never makes a second post.
-      const r = await store.postToFacebook({ key: `carlo-${jobId}`, message: text, photo: photo ?? undefined, scheduleAt: iso ?? undefined });
+      // One key per Carlo task (one upload per video): a second click or a resend never makes a second post.
+      const r = video
+        ? await store.postVideo({ video, message: text, scheduleAt: iso ?? undefined }, setProgress)
+        : await store.postToFacebook({ key: `carlo-${jobId}`, message: text, photo: photo ?? undefined, scheduleAt: iso ?? undefined });
       setDone({ link: r.link, scheduledAt: r.scheduledAt });
       if (r.scheduledAt) void store.loadScheduled();
     } catch (e) {
@@ -287,7 +336,7 @@ export function CarloReadyPost({
         <b>Ready for your approval</b> · {page}
       </p>
       <div className="fb-ready-body">
-        {photo && <img src={photo} alt="Photo for the post" />}
+        {video ? <video src={video.url} controls preload="metadata" aria-label="Video for the post" /> : photo && <img src={photo} alt="Photo for the post" />}
         <p className="fb-ready-text">{text || '(no caption)'}</p>
       </div>
       <p className="fb-ready-when">
@@ -295,21 +344,26 @@ export function CarloReadyPost({
       </p>
       {problem && <p className="photo-note small">Carlo picked a time Facebook won't accept. {problem} Click Edit to change it.</p>}
       {tooLong && <p className="photo-note small">The caption is longer than {MAX_POST_CHARS.toLocaleString()} characters. Click Edit to shorten it.</p>}
-      {!photo && <p className="muted small">No photo is attached (photos are not kept after a page reload). Click Edit to add one.</p>}
+      {missingVideo ? (
+        <p className="photo-note small">The video is not in this browser any more (videos are not kept after a page reload). Click Edit and add it again, or post without it.</p>
+      ) : (
+        !photo && !video && <p className="muted small">No photo is attached (photos are not kept after a page reload). Click Edit to add one.</p>
+      )}
       {error && (
         <p className="photo-note small" role="alert">
           {error}
         </p>
       )}
       <div className="row wrap gap-s">
-        <button className="btn primary" disabled={busy || !!problem || !text || tooLong} onClick={() => void approve()}>
-          <IconCheck size={15} /> {busy ? 'Sending…' : when.kind === 'now' ? 'Approve & post now' : 'Approve & schedule'}
+        <button className="btn primary" disabled={busy || !!problem || !text || tooLong || missingVideo} onClick={() => void approve()}>
+          <IconCheck size={15} /> {busy ? progress || 'Sending…' : when.kind === 'now' ? 'Approve & post now' : 'Approve & schedule'}
         </button>
         <button className="btn" disabled={busy} onClick={() => setEditing(true)}>
           Edit
         </button>
       </div>
-      <p className="muted small">Check the photo, text and time: clicking Approve publishes it {when.kind === 'now' ? 'right away' : 'at that time'}. You can still cancel a scheduled post under Pending posts.</p>
+      {video && busy && <p className="muted small">Keep this tab open until the video is on Facebook. Large videos can take a few minutes.</p>}
+      <p className="muted small">Check the {video ? 'video' : 'photo'}, text and time: clicking Approve publishes it {when.kind === 'now' ? 'right away' : 'at that time'}. You can still cancel a scheduled post under Pending posts.</p>
     </div>
   );
 }
@@ -343,6 +397,7 @@ export function FacebookPending({ store }: { store: LiveStore }) {
               <span className="fb-msg">{p.message || '(no text)'}</span>
               <span className="row wrap gap-s">
                 {p.hasPicture && <span className="tag">with photo</span>}
+                {p.isVideo && <span className="tag">video</span>}
                 {p.link && (
                   <a className="btn sm ghost" href={p.link} target="_blank" rel="noopener noreferrer">
                     Open

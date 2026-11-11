@@ -96,6 +96,7 @@ const LENS: Record<LiveAgentId, { lens: string; domains: EvidenceDomain[] }> = {
   rosa: { lens: 'Finance: downpayments, balances and getting paid on time', domains: ['finance', 'orders'] },
   mika: { lens: 'Data analysis: what the numbers do and do not support, trends over time', domains: ['orders', 'production', 'finance', 'quality'] },
   carlo: { lens: 'Marketing: what customers see and how WAD communicates', domains: ['orders'] },
+  kat: { lens: 'Catalog: which products customers can see online, clear names, photos and descriptions', domains: ['orders'] },
   joy: { lens: 'Customer service: what customers ask and complain about, keeping promises', domains: ['orders'] },
   tess: { lens: 'Quality control: complete specifications, inspection before delivery, rework and defects', domains: ['orders', 'production', 'quality'] },
   dev: { lens: 'Development: feasibility, data quality, changes to the order system, testing', domains: ['quality', 'orders', 'production'] },

@@ -1,4 +1,4 @@
-export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
+export type AgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'kat' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
 
 export type RoomId =
   | 'intel'

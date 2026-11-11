@@ -28,6 +28,7 @@ const SUGGESTIONS: Record<AgentId, string> = {
   rosa: 'List orders with an unpaid balance',
   mika: 'Which products sell best?',
   carlo: 'Write a caption for a carved door',
+  kat: 'Draft a catalog entry for a new door',
   joy: 'Reply to a customer asking about their order',
   tess: 'Make an inspection checklist for a panel door',
   dev: 'Check the order data for mistakes',

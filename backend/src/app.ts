@@ -12,8 +12,9 @@ import { shopCounts } from './reports/calc';
 import { LiveRefresher } from './live/refresher';
 import { HealthLog, SecurityLog } from './monitor/monitor';
 import { DiscussionError, type DiscussionService } from './discuss/discussions';
-import { FB_MAX_SCHEDULE_DAYS, FB_MIN_SCHEDULE_MINUTES, MAX_IMAGE_BYTES, MAX_POST_CHARS, type FacebookStatus } from '../shared/live';
+import { FB_MAX_SCHEDULE_DAYS, FB_MIN_SCHEDULE_MINUTES, MAX_IMAGE_BYTES, MAX_POST_CHARS, VIDEO_CHUNK_BYTES, type FacebookStatus, CATALOG_MAX_IMAGE_BYTES, type CatalogAddResult, type CatalogProductInput, type CatalogStatus } from '../shared/live';
 import { FacebookClient, FacebookError, type PostResult } from './social/facebook';
+import { readRaw, VideoUploadError, type VideoUploads } from './social/videos';
 import { manilaDate, validateRange } from '../shared/manila';
 import type { FinanceSource, OrderSource } from './adapters/types';
 import { Auth, SESSION_COOKIE, parseCookies } from './auth';
@@ -23,6 +24,7 @@ import { IntegrationError } from './http/errors';
 import { validateLimits, type AiUsageMeter } from './ai/usage';
 import { buildAttention, ordersWebUrl } from './attention/attention';
 import type { OrderRecord } from './adapters/types';
+import { CatalogError, checkCatalogImage, checkProduct, type CatalogClient } from './catalog/catalog';
 
 export interface AppDeps {
   config: AppConfig;
@@ -42,8 +44,12 @@ export interface AppDeps {
   discussions?: DiscussionService | null;
   /** UI Review (Aya, Kim, Rey); absent when not wired. */
   uiReviews?: UiReviewService | null;
+  /** Video uploads for Facebook video posts; absent when not wired. */
+  videos?: VideoUploads | null;
   /** AI usage tracker (requests, tokens, limits); absent when not wired. */
   aiUsage?: AiUsageMeter | null;
+  /** The online catalog (Kat adds approved products); absent when not set up. */
+  catalog?: CatalogClient | null;
   log?: (line: string) => void;
 }
 
@@ -63,7 +69,7 @@ const SECURITY_HEADERS: Record<string, string> = {
   'Referrer-Policy': 'no-referrer',
   'X-Frame-Options': 'DENY',
   'Content-Security-Policy':
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 };
 
 function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
@@ -215,6 +221,12 @@ export function createApp(deps: AppDeps) {
         appSecretProof: !!config.facebook.appSecret,
         ...(deps.health?.summary('facebook') ?? {}),
       },
+      catalog: {
+        setup: deps.catalog ? 'ready' : 'not_configured',
+        repo: config.catalog.repo,
+        problems: deps.catalog ? [] : config.catalog.problems,
+        ...(deps.health?.summary('github') ?? {}),
+      },
       liveUpdates: refresher.status(),
       tasks: runner.stats(),
       notes: [
@@ -363,6 +375,7 @@ export function createApp(deps: AppDeps) {
           img ? { mimeType: img.mimeType as string, data: img.data as string } : undefined,
           body.orderRef as string | undefined,
           typeof body.key === 'string' ? body.key.slice(0, 64) : undefined,
+          body.video,
         );
         return send(res, deduplicated ? 200 : 202, { job: structuredClone(job), deduplicated });
       } catch (e) {
@@ -414,6 +427,7 @@ export function createApp(deps: AppDeps) {
       return send(res, 200, { attention: report });
     }
     if (path.startsWith('/api/facebook/')) return handleFacebook(req, res, path, method, s.user);
+    if (path.startsWith('/api/catalog/')) return handleCatalog(req, res, path, method, s.user);
     if (path === '/api/discussions' || path.startsWith('/api/discussions/')) return handleDiscussions(req, res, path, method, s.user);
     if (path === '/api/ui-reviews' || path.startsWith('/api/ui-reviews/')) return handleUiReviews(req, res, path, method, s.user);
 
@@ -545,6 +559,72 @@ export function createApp(deps: AppDeps) {
     throw e;
   }
 
+  // ---------------------------------------------------------------- Catalog (Kat)
+  // A person approves every product in the office; the AI never calls these. One approval (key)
+  // adds at most one product, even if the button is pressed twice or the request is resent.
+  const catKeys = new Map<string, { at: number; pending: boolean; result?: CatalogAddResult }>();
+  const catRecent = new Map<string, number[]>();
+
+  async function catalogStatus(): Promise<CatalogStatus> {
+    const c = deps.catalog;
+    if (!c) return { configured: false, repo: null, branch: null, siteUrl: config.catalog.siteUrl, products: null, problems: config.catalog.problems.length ? config.catalog.problems : ['The catalog is not set up.'] };
+    try {
+      return { configured: true, repo: c.repo, branch: c.branch, siteUrl: c.siteUrl, products: await c.productCount(), problems: [] };
+    } catch (e) {
+      return { configured: true, repo: c.repo, branch: c.branch, siteUrl: c.siteUrl, products: null, problems: [e instanceof CatalogError ? e.message : 'The catalog could not be read.'] };
+    }
+  }
+
+  async function handleCatalog(req: IncomingMessage, res: ServerResponse, path: string, method: string, user: SessionUser) {
+    if (!user.permissions.includes('catalog:write')) return send(res, 403, { error: 'Your account cannot add products to the catalog.' });
+    if (path === '/api/catalog/status' && method === 'GET') return send(res, 200, { catalog: await catalogStatus() });
+    if (path !== '/api/catalog/products' || method !== 'POST') return send(res, 404, { error: 'Not found.' });
+    if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+    const c = deps.catalog;
+    if (!c) return send(res, 503, { error: 'The catalog is not set up on the server (CATALOG_GITHUB_TOKEN).' });
+    let body: Record<string, unknown>;
+    try {
+      body = await readJson(req, Math.ceil((CATALOG_MAX_IMAGE_BYTES * 4) / 3) + 32 * 1024);
+    } catch {
+      return send(res, 413, { error: 'The request is too large. Use a smaller photo.' }, { Connection: 'close' });
+    }
+    const key = typeof body.key === 'string' && /^[\w-]{8,64}$/.test(body.key) ? `${user.username}|${body.key}` : null;
+    if (!key) return send(res, 400, { error: 'Missing request key.' });
+    const seen = catKeys.get(key);
+    if (seen?.pending) return send(res, 409, { error: 'This product is already being added.' });
+    if (seen?.result) return send(res, 200, { product: seen.result, repeated: true });
+    let product: CatalogProductInput;
+    let image: ReturnType<typeof checkCatalogImage>;
+    try {
+      product = checkProduct(body.product);
+      image = checkCatalogImage(body.image);
+    } catch (e) {
+      if (e instanceof CatalogError) return send(res, e.httpStatus, { error: e.message, code: e.code });
+      throw e;
+    }
+    const now = Date.now();
+    const recent = (catRecent.get(user.username) ?? []).filter((t) => now - t < 3_600_000);
+    if (recent.length >= 20) return send(res, 429, { error: 'That is 20 products in the last hour. Please wait before adding more.' });
+    catRecent.set(user.username, [...recent, now]);
+    catKeys.set(key, { at: now, pending: true });
+    for (const [k, v] of catKeys) if (now - v.at > 86_400_000) catKeys.delete(k);
+    try {
+      const result = await c.add(product, image, user.username);
+      catKeys.set(key, { at: now, pending: false, result });
+      deps.audit?.({ event: 'catalog.added', user: user.username, productId: result.productId, commit: result.commitSha, category: product.category, imageBytes: image.bytes, at: new Date().toISOString() });
+      deps.log?.(`[catalog] product ${result.productId} added by ${user.username}`);
+      return send(res, 200, { product: result, repeated: false });
+    } catch (e) {
+      // A timeout may still have gone through: keep the key blocked so a re-press can't add it twice.
+      if (e instanceof CatalogError && e.code === 'TIMEOUT') catKeys.set(key, { at: now, pending: true });
+      else catKeys.delete(key);
+      deps.audit?.({ event: 'catalog.failed', user: user.username, code: e instanceof CatalogError ? e.code : 'ERROR', at: new Date().toISOString() });
+      if (e instanceof CatalogError)
+        return send(res, e.httpStatus, { error: e.code === 'TIMEOUT' ? `${e.message} It may still have been added: check the catalog before trying again.` : e.message, code: e.code });
+      throw e;
+    }
+  }
+
   /**
    * Team discussions. Every route is limited to the signed-in owner; the discussion itself only
    * ever sees data this user's permissions allow (checked when the evidence is gathered).
@@ -670,6 +750,75 @@ export function createApp(deps: AppDeps) {
         if (e instanceof FacebookError && e.code !== 'INVALID')
           return send(res, e.httpStatus, { error: `${e.message} You can also cancel it in Meta Business Suite → Planner.`, code: e.code });
         return fbFail(res, e);
+      }
+    }
+
+    // ---------------------------------------------------------------- videos
+    // 1) POST /api/facebook/videos {bytes, mimeType}          -> an upload id
+    // 2) PUT  /api/facebook/videos/:id?offset=N  (raw piece)   -> progress   (repeat)
+    // 3) POST /api/facebook/videos/:id/post {message, scheduleAt} -> posting starts (202)
+    // 4) GET  /api/facebook/videos/:id                         -> state, progress, the post
+    if (path.startsWith('/api/facebook/videos')) {
+      const vids = deps.videos;
+      if (!vids) return send(res, 503, { error: 'Video posting is not available on this server.' });
+      const vfail = (e: unknown) => {
+        if (e instanceof VideoUploadError) return send(res, e.status, { error: e.message }, e.status === 413 ? { Connection: 'close' } : {});
+        return fbFail(res, e);
+      };
+      if (method !== 'GET' && !csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      try {
+        if (path === '/api/facebook/videos' && method === 'POST') {
+          const body = await readJson(req, 4 * 1024).catch(() => null);
+          if (!body) return send(res, 400, { error: 'Invalid request body.' });
+          return send(res, 201, { upload: vids.create(user.username, body.bytes, body.mimeType) });
+        }
+        const one = path.match(/^\/api\/facebook\/videos\/([0-9a-f-]{36})(\/post)?$/);
+        if (!one) return send(res, 404, { error: 'Not found.' });
+        const id = one[1];
+        if (!one[2] && method === 'GET') return send(res, 200, { upload: vids.status(user.username, id) });
+        if (!one[2] && method === 'DELETE') {
+          vids.discard(user.username, id);
+          return send(res, 200, { ok: true });
+        }
+        if (!one[2] && method === 'PUT') {
+          const offset = Number(new URL(req.url ?? '', 'http://x').searchParams.get('offset'));
+          if (!Number.isSafeInteger(offset) || offset < 0) return send(res, 400, { error: 'Missing offset.' });
+          const chunk = await readRaw(req, VIDEO_CHUNK_BYTES);
+          return send(res, 200, { upload: await vids.append(user.username, id, offset, chunk) });
+        }
+        if (one[2] && method === 'POST') {
+          const body = await readJson(req, 16 * 1024).catch(() => null);
+          if (!body) return send(res, 400, { error: 'Invalid request body.' });
+          const message = typeof body.message === 'string' ? body.message.replace(/\r\n/g, '\n').trim() : '';
+          if (!message) return send(res, 400, { error: 'Write the post text first.' });
+          if (message.length > MAX_POST_CHARS) return send(res, 400, { error: `Keep the post under ${MAX_POST_CHARS} characters.` });
+          let at: number | undefined;
+          if (body.scheduleAt !== undefined && body.scheduleAt !== null) {
+            const t = typeof body.scheduleAt === 'string' ? Date.parse(body.scheduleAt) : NaN;
+            if (!Number.isFinite(t)) return send(res, 400, { error: 'Choose a valid date and time.' });
+            if (t < Date.now() + FB_MIN_SCHEDULE_MINUTES * 60_000) return send(res, 400, { error: `Schedule at least ${FB_MIN_SCHEDULE_MINUTES} minutes ahead (Facebook's rule).` });
+            if (t > Date.now() + FB_MAX_SCHEDULE_DAYS * 86_400_000) return send(res, 400, { error: `Facebook can schedule at most ${FB_MAX_SCHEDULE_DAYS} days ahead.` });
+            at = Math.floor(t / 1000);
+          }
+          const current = vids.status(user.username, id);
+          if (current.state === 'received') {
+            const now = Date.now();
+            const recent = (fbRecent.get(user.username) ?? []).filter((x) => now - x < 3_600_000);
+            if (recent.length >= 10) return send(res, 429, { error: 'That is 10 posts in the last hour. Please wait before posting more.' });
+            fbRecent.set(user.username, [...recent, now]);
+          }
+          const upload = vids.post(user.username, id, { message, at }, fb, {
+            done: (r) => {
+              if (at) refresher.poke('fb-scheduled');
+              deps.audit?.({ event: at ? 'facebook.video.scheduled' : 'facebook.video.posted', user: user.username, postId: r.postId, scheduledAt: r.scheduledAt, messageChars: message.length, videoBytes: current.bytes, at: new Date().toISOString() });
+            },
+            failed: (e) => deps.audit?.({ event: 'facebook.video.failed', user: user.username, code: e instanceof FacebookError ? e.code : 'ERROR', at: new Date().toISOString() }),
+          });
+          return send(res, 202, { upload });
+        }
+        return send(res, 404, { error: 'Not found.' });
+      } catch (e) {
+        return vfail(e);
       }
     }
 

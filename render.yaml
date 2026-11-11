@@ -44,6 +44,10 @@ services:
         sync: false
       - key: FACEBOOK_APP_SECRET
         sync: false
+      # Online catalog (Kat): a fine-grained GitHub token with "Contents: read and write" on the
+      # catalog repository only. Repository, branch and site default to WAD's catalog.
+      - key: CATALOG_GITHUB_TOKEN
+        sync: false
       # Live updates: seconds between the server's checks while an office is open (0 = off).
       - key: LIVE_REFRESH_SECONDS
         value: "120"
