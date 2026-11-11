@@ -136,6 +136,20 @@ export async function buildAttention(user: SessionUser, deps: AttentionDeps): Pr
   const recent = (iso: string | null | undefined) => !!iso && Date.parse(iso) >= since;
   const blocked: AttentionItem[] = [];
   for (const j of deps.jobs(user)) {
+    // An agent waiting for your answer is blocked on you.
+    if (j.status === 'needs_info' && recent(j.finishedAt ?? j.createdAt)) {
+      blocked.push({
+        id: `job-info:${j.id}`,
+        version: j.finishedAt ?? j.createdAt,
+        kind: 'blocked',
+        severity: 'info',
+        title: `Waiting for your answer: ${j.title}`,
+        detail: 'The agent needs more information before it can finish. Reply in the task.',
+        at: j.finishedAt ?? j.createdAt,
+        link: { kind: 'job', id: j.id, label: 'Open the task' },
+      });
+      continue;
+    }
     if (j.status !== 'failed' || !recent(j.finishedAt ?? j.createdAt)) continue;
     const err = j.error ?? j.steps.find((s) => s.status === 'failed')?.error;
     const limit = err?.code === 'AI_LIMIT';

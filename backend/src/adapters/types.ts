@@ -13,6 +13,40 @@ export interface FinanceRecord {
   category: string | null;
   /** Shared order ID — only set from a field the documentation confirms links to orders. */
   orderId: string | null;
+  /** Income only: the system's status text (Received, Pending, Partial), when sent. */
+  status?: string | null;
+}
+
+/** One employee cash advance from WAD Furniture Management. */
+export interface CashAdvance {
+  ref: string; // CA-<id>
+  /** "EMP-<employee id>": what the AI sees instead of the name. */
+  employeeRef: string;
+  /** Display only (never sent to the AI provider). */
+  employeeName: string | null;
+  position: string | null;
+  dateIssued: string;
+  centavos: number;
+  remainingCentavos: number;
+  status: string;
+}
+
+export interface CashAdvanceRepayment {
+  ref: string; // CAP-<id>
+  advanceRef: string;
+  employeeRef: string | null;
+  date: string;
+  centavos: number;
+}
+
+export interface CashAdvanceData {
+  currency: string;
+  /** Issued within the range (any status). */
+  issued: CashAdvance[];
+  /** Every advance not yet fully paid, whatever its date. */
+  outstanding: CashAdvance[];
+  /** Repayments within the range; null when the system has no repayment records. */
+  repayments: CashAdvanceRepayment[] | null;
 }
 
 export interface BudgetRecord {
@@ -106,6 +140,8 @@ export interface FinanceSource {
   listIncome(range: DateRange): Promise<FinanceRecord[]>;
   listExpenses(range: DateRange): Promise<FinanceRecord[]>;
   listBudgets(range: DateRange): Promise<BudgetRecord[]>;
+  /** Employee cash advances (api/ceo/cash-advances.php); absent = not supported by this adapter. */
+  listCashAdvances?(range: DateRange): Promise<CashAdvanceData>;
 }
 
 export interface OrderSource {

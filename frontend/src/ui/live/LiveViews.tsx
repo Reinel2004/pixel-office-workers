@@ -16,24 +16,15 @@ import { CarloReadyPost, FacebookComposer, FacebookPanel } from './Facebook';
 import { CopyReply, CustomerReplyPanel } from './CustomerService';
 import { ChecklistPanel } from './Checklist';
 import { UiReviewList } from '../UiReview';
+import { LookupList, TASK_STATUS_CLASS, TASK_STATUS_LABEL, TaskActions, TaskBoard, TaskConversation, TaskInstructions, TaskProgress } from './TaskBoard';
 import { AiUsagePanel } from './AiUsage';
 
 export function useLive(store: LiveStore) {
   return useSyncExternalStore(store.subscribe, store.getVersion);
 }
 
-export const JOB_STATUS_LABEL: Record<Job['status'], string> = {
-  queued: 'Queued',
-  working: 'Working',
-  completed: 'Completed',
-  failed: 'Failed',
-};
-const STATUS_CLASS: Record<Job['status'], string> = {
-  queued: 'status-queued',
-  working: 'status-running',
-  completed: 'status-completed',
-  failed: 'status-failed',
-};
+export const JOB_STATUS_LABEL: Record<Job['status'], string> = TASK_STATUS_LABEL;
+const STATUS_CLASS: Record<Job['status'], string> = TASK_STATUS_CLASS;
 export function JobChip({ status }: { status: Job['status'] }) {
   return <span className={`chip ${STATUS_CLASS[status]}`}>{JOB_STATUS_LABEL[status]}</span>;
 }
@@ -385,7 +376,7 @@ export function LiveFeed({
   mobile: boolean;
 }) {
   useLive(store);
-  const [tab, setTab] = useState<'activity' | 'reports' | 'discuss' | 'ui' | 'systems'>('activity');
+  const [tab, setTab] = useState<'activity' | 'tasks' | 'discuss' | 'ui' | 'systems'>('activity');
   // An Attention link can ask for the Systems tab (connections, AI usage).
   const request = store.feedTabRequest?.n ?? 0;
   useEffect(() => {
@@ -404,9 +395,9 @@ export function LiveFeed({
     <aside className={`panel feed ${mobile ? 'sheet' : ''}`} aria-label="Live activity">
       <div className="panel-head">
         <div className="tabs" role="tablist">
-          {(['activity', 'reports', 'discuss', 'ui', 'systems'] as const).map((t) => (
+          {(['activity', 'tasks', 'discuss', 'ui', 'systems'] as const).map((t) => (
             <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>
-              {t === 'activity' ? 'Activity' : t === 'reports' ? 'Reports' : t === 'discuss' ? 'Discuss' : t === 'ui' ? 'UI' : 'Systems'}
+              {t === 'activity' ? 'Activity' : t === 'tasks' ? `Tasks${store.jobs.some((j) => j.status === 'needs_info' || j.status === 'ready_for_review') ? ` (${store.jobs.filter((j) => j.status === 'needs_info' || j.status === 'ready_for_review').length})` : ''}` : t === 'discuss' ? 'Discuss' : t === 'ui' ? 'UI' : 'Systems'}
             </button>
           ))}
         </div>
@@ -433,31 +424,7 @@ export function LiveFeed({
               ))}
             </ul>
           ))}
-        {tab === 'reports' &&
-          (store.jobs.length === 0 ? (
-            <Empty title="No reports yet" text="Live reports you run appear here. They are kept on the server, not in this browser." />
-          ) : (
-            <ul className="task-list">
-              {store.jobs.map((j) => (
-                <li key={j.id}>
-                  <button className="task-row" onClick={() => onOpenJob(j.id)}>
-                    <span className="avatars">
-                      {[...new Set(j.steps.map((s) => s.agent))].map((a) => (
-                        <Avatar key={a} id={a} size={22} />
-                      ))}
-                    </span>
-                    <span className="task-row-main">
-                      <span className="task-row-title">{j.title}</span>
-                      <span className="task-row-sub">
-                        {j.range.from} to {j.range.to}
-                      </span>
-                    </span>
-                    <JobChip status={j.status} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ))}
+        {tab === 'tasks' && <TaskBoard store={store} onOpen={onOpenJob} />}
         {tab === 'discuss' &&
           (!store.discussionsLoaded && store.server === 'signed_in' ? (
             <p className="muted small">Loading discussions…</p>
@@ -525,11 +492,16 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
   useLive(store);
   const isAi = job.type === 'ai.task';
   const can = isAi ? store.canAssign() : store.canSubmit(job.type as ReportType);
+  const agentName = AGENT_BY_ID[job.agent ?? job.steps[0].agent].name;
+  const latest = job.steps[0]?.result;
+  const names = latest?.customers ?? {};
+  const employees = latest?.employees ?? {};
+  const answered = job.status === 'ready_for_review' || job.status === 'completed';
   return (
     <div className="stack">
       <div>
-        <span className="live-tag">{isAi ? 'AI task · live data' : 'Live data'}</span>
-        <h2>{isAi ? `Task for ${AGENT_BY_ID[job.agent ?? job.steps[0].agent].name}` : job.title}</h2>
+        <span className="live-tag">{isAi ? 'Assigned task · live data' : 'Report · live data'}</span>
+        <h2>{isAi ? `Task for ${agentName}` : job.title}</h2>
         <div className="row wrap gap-s">
           <JobChip status={job.status} />
           {!isAi && (
@@ -538,35 +510,43 @@ export function JobDetail({ store, job, onOpenAgent }: { store: LiveStore; job: 
             </span>
           )}
         </div>
-        {isAi && <blockquote className="prompt">{job.prompt}</blockquote>}
-        {isAi && job.orderRef && <p className="muted small">Order picked for this reply: {job.orderRef}</p>}
-        {isAi && !!job.redacted && (
-          <p className="muted small">
-            {job.redacted} phone number(s) or email(s) were removed before the AI saw the message.
-          </p>
-        )}
-        {isAi && job.image && (
-          store.images.get(job.id) ? (
-            <img className="task-photo" src={store.images.get(job.id)} alt="Photo sent with this task" />
-          ) : (
-            <p className="muted small">A photo was sent with this task (not kept after a reload).</p>
-          )
-        )}
-        <p className="muted small">Requested {formatManila(job.createdAt)} by {job.requestedBy}</p>
+        {job.status === 'needs_info' && <p className="note warn">{agentName} needs more information before finishing. Answer below to continue.</p>}
+        {job.status === 'ready_for_review' && <p className="note">Check the answer, then mark it complete, or send a follow-up below.</p>}
+        <p className="muted small">
+          Requested {formatManila(job.createdAt)} by {job.requestedBy}
+          {job.updatedAt && job.updatedAt !== job.createdAt ? ` · last update ${formatManila(job.updatedAt)}` : ''}
+        </p>
       </div>
+      <TaskInstructions job={job} />
+      {isAi && job.orderRef && <p className="muted small">Order picked for this reply: {job.orderRef}</p>}
+      {isAi && !!job.redacted && (
+        <p className="muted small">
+          {job.redacted} phone number(s) or email(s) were removed before the AI saw the message.
+        </p>
+      )}
+      {isAi && job.image && (
+        store.images.get(job.id) ? (
+          <img className="task-photo" src={store.images.get(job.id)} alt="Photo sent with this task" />
+        ) : (
+          <p className="muted small">A photo was sent with this task (not kept after a reload).</p>
+        )
+      )}
+      <TaskProgress job={job} />
+      <TaskConversation job={job} render={(t) => <Markdownish text={t} names={names} employees={employees} />} />
       {job.steps.map((s) => (
         <StepCard key={s.id} step={s} onOpenAgent={onOpenAgent} />
       ))}
-      {isAi && job.agent === 'carlo' && job.status === 'completed' && <PostFromTask store={store} job={job} />}
-      {isAi && job.agent === 'joy' && job.status === 'completed' && <CopyReply job={job} />}
-      {job.status === 'failed' && (
+      {isAi && job.agent === 'carlo' && answered && <PostFromTask store={store} job={job} />}
+      {isAi && job.agent === 'joy' && answered && <CopyReply job={job} />}
+      <TaskActions store={store} job={job} />
+      {(job.status === 'failed' || job.status === 'cancelled') && (
         <button
           className="btn"
           disabled={!can.ok}
           title={can.reason}
           onClick={() => (isAi ? store.submitAi(job.agent!, job.prompt!, store.images.get(job.id), job.orderRef) : store.submit(job.type as ReportType, job.range))}
         >
-          <IconRetry size={15} /> Run again
+          <IconRetry size={15} /> Run again as a new task
         </button>
       )}
     </div>
@@ -652,6 +632,7 @@ function ResultView({ r }: { r: StepResult }) {
 }
 
 const TOOL_LABEL: Record<string, string> = {
+  auto_lookup: 'Looked up automatically',
   get_orders: 'Orders by date',
   get_open_orders: 'Open orders',
   get_finance: 'Finance records',
@@ -669,9 +650,11 @@ const TOOL_LABEL: Record<string, string> = {
 function AiResultView({ r }: { r: StepResult }) {
   return (
     <div className="stack result">
+      <LookupList lookups={r.dataLookups ?? []} />
       <div className="ai-answer">
-        <Markdownish text={r.answer ?? ''} names={r.customers ?? {}} />
+        <Markdownish text={r.answer ?? ''} names={r.customers ?? {}} employees={r.employees ?? {}} />
       </div>
+      {Object.keys(r.employees ?? {}).length > 0 && <p className="muted small">Employee names are added by the office from WAD Furniture Management. The AI only saw EMP-codes.</p>}
       {Object.keys(r.customers ?? {}).length > 0 && (
         <p className="muted small">Customer names are added by the office from WAD Order Management. The AI only saw order numbers.</p>
       )}
@@ -731,7 +714,8 @@ const ORDER_REF = /\b(ORD-[A-Za-z0-9]+)\b/g;
  * happens only in the browser. If the answer is about exactly one named order, a
  * "[Customer name]" placeholder in a draft is filled in too.
  */
-function withNames(text: string, names: Record<string, string>): string {
+function withNames(text: string, names: Record<string, string>, employees: Record<string, string> = {}): string {
+  if (Object.keys(employees).length) text = text.replace(/\b(EMP-\d+)\b/g, (ref) => (employees[ref] ? `${employees[ref]} (${ref})` : ref));
   if (!Object.keys(names).length) return text;
   const mentioned = [...new Set([...text.matchAll(ORDER_REF)].map((m) => m[1]))].filter((r) => names[r]);
   let out = text.replace(ORDER_REF, (ref) => (names[ref] ? `${names[ref]} (${ref})` : ref));
@@ -742,8 +726,8 @@ function withNames(text: string, names: Record<string, string>): string {
 }
 
 /** Renders the AI's light Markdown (paragraphs, "- " bullets, **bold**, headings) as plain React text — never as HTML. */
-function Markdownish({ text: raw0, names = {} }: { text: string; names?: Record<string, string> }) {
-  const text = withNames(raw0, names);
+function Markdownish({ text: raw0, names = {}, employees = {} }: { text: string; names?: Record<string, string>; employees?: Record<string, string> }) {
+  const text = withNames(raw0, names, employees);
   const inline = (s: string): ReactNode[] =>
     s.split(/(\*\*[^*]+\*\*)/g).map((part, i) => (part.startsWith('**') && part.endsWith('**') && part.length > 4 ? <b key={i}>{part.slice(2, -2)}</b> : <Fragment key={i}>{part}</Fragment>));
   const blocks: ReactNode[] = [];

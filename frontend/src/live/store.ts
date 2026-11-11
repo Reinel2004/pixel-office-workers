@@ -23,6 +23,15 @@ export interface LiveLogEntry {
   jobId?: string;
 }
 
+/** A one-time key for a submission, so a resent request is not run twice. */
+function newKey() {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
 class HttpError extends Error {
   constructor(
     public status: number,
@@ -831,7 +840,8 @@ export class LiveStore {
     this.emit();
     try {
       const image = photo ? { mimeType: photo.slice(5, photo.indexOf(';')), data: photo.slice(photo.indexOf(',') + 1) } : undefined;
-      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, ...(image ? { image } : {}), ...(orderRef ? { orderRef } : {}) }) });
+      // The key makes a resent request (double click, retry after a dropped connection) harmless.
+      const { job } = await api<{ job: Job; deduplicated: boolean }>('/api/ai/tasks', { method: 'POST', body: JSON.stringify({ agent, prompt, key: newKey(), ...(image ? { image } : {}), ...(orderRef ? { orderRef } : {}) }) });
       if (photo) this.images.set(job.id, photo);
       this.applyJob(job, false);
       return job;
@@ -844,6 +854,39 @@ export class LiveStore {
       this.submitting.delete(key);
       this.emit();
     }
+  }
+
+  // ---------------------------------------------------------------- Task Board actions
+  /** Tasks with an action in flight (buttons are disabled meanwhile). */
+  jobBusy = new Set<string>();
+
+  private async jobAction(id: string, action: 'cancel' | 'complete' | 'follow-up', body: Record<string, unknown> = {}): Promise<string | null> {
+    if (this.jobBusy.has(id)) return 'Already sending.';
+    this.jobBusy.add(id);
+    this.emit();
+    try {
+      const { job } = await api<{ job: Job }>(`/api/jobs/${id}/${action}`, { method: 'POST', body: JSON.stringify(body) });
+      this.applyJob(job, false);
+      return null;
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) this.signedOut('Your session expired. Sign in again to continue.');
+      return (e as Error).message;
+    } finally {
+      this.jobBusy.delete(id);
+      this.emit();
+    }
+  }
+
+  /** Answers the agent's question or asks a follow-up: the same task runs again with the conversation. */
+  followUp(id: string, text: string) {
+    return this.jobAction(id, 'follow-up', { text, key: newKey() });
+  }
+  cancelJob(id: string) {
+    return this.jobAction(id, 'cancel');
+  }
+  /** A person checked the answer. */
+  completeJob(id: string) {
+    return this.jobAction(id, 'complete');
   }
 
   /** Merge a server job snapshot and drive the office agents from its step statuses. */
@@ -870,12 +913,25 @@ export class LiveStore {
       if (!(fromSnapshot && first)) {
         const what = job.type === 'ai.task' ? 'Task' : 'Report';
         const who = job.steps.at(-1)?.agent;
+        const followUp = (job.thread ?? []).filter((t) => t.role === 'user').length > 1;
         if (job.status === 'queued')
-          this.addLog(job.type === 'ai.task' ? `Task assigned — ${job.title}` : `Report queued: ${job.title} (${job.range.from} to ${job.range.to}).`, 'info', who, job.id);
+          this.addLog(
+            job.type === 'ai.task' ? (followUp ? `Follow-up sent — ${job.title}` : `Task assigned — ${job.title}`) : `Report queued: ${job.title} (${job.range.from} to ${job.range.to}).`,
+            'info',
+            who,
+            job.id,
+          );
         if (job.status === 'completed') this.addLog(`${what} completed: ${job.title}.`, 'success', who, job.id);
+        if (job.status === 'ready_for_review') this.addLog(`Ready for your review: ${job.title}.`, 'success', who, job.id);
+        if (job.status === 'needs_info') {
+          this.addLog(`${who ? AGENT_BY_ID[who].name : 'The agent'} needs more information: ${job.title}. Open the task to answer.`, 'warn', who, job.id);
+          if (who) this.engine.liveSay(who, 'I need more information');
+        }
+        if (job.status === 'cancelled') this.addLog(`${what} cancelled: ${job.title}.`, 'warn', who, job.id);
         if (job.status === 'failed') this.addLog(`${what} failed: ${job.title} — ${job.error?.message ?? 'see details.'}`, 'error', who, job.id);
-        if (job.type === 'ai.task' && (job.status === 'completed' || job.status === 'failed')) this.aiFinished(job);
-        if (job.status === 'failed' || job.status === 'completed') this.refreshAttentionSoon();
+        const ended = job.status === 'ready_for_review' || job.status === 'needs_info' || job.status === 'failed' || job.status === 'cancelled';
+        if (job.type === 'ai.task' && ended) this.aiFinished(job);
+        if (ended || job.status === 'completed') this.refreshAttentionSoon();
       }
     }
     if (job.type === 'ai.task') this.updateAiThinking();
@@ -912,7 +968,9 @@ export class LiveStore {
     if (this.jobs.some((j) => j.type === 'ai.task' && (j.status === 'queued' || j.status === 'working'))) return;
     const who = job.agent ? AGENT_BY_ID[job.agent].name : 'worker';
     const code = job.error?.code ?? job.steps[0]?.error?.code;
-    if (job.status === 'completed') this.engine.setAiActivity('done', `Answer ready · ${who}`, 5000);
+    if (job.status === 'cancelled') this.engine.setAiActivity('idle');
+    else if (job.status === 'needs_info') this.engine.setAiActivity('done', `Question for you · ${who}`, 5000);
+    else if (job.status === 'completed' || job.status === 'ready_for_review') this.engine.setAiActivity('done', `Answer ready · ${who}`, 5000);
     else if (code === 'RATE_LIMITED') this.engine.setAiActivity('limited', 'AI usage limit reached', 30000);
     else if (code === 'AI_LIMIT') this.engine.setAiActivity('limited', 'Office AI limit reached', 30000);
     else this.engine.setAiActivity('error', 'AI request failed', 8000);
@@ -945,6 +1003,13 @@ export class LiveStore {
         if (this.isPhotoTask(job)) this.leaveEasel(job);
         if (who === 'paolo' || job.type.startsWith('orders.') || job.type === 'combined.report') void this.loadWorkshop();
         this.addLog(`${step.label}: ${step.result?.summary ?? 'done'}`, step.result?.empty ? 'warn' : 'success', who, job.id);
+        break;
+      case 'cancelled':
+        e.setLiveAgent(who, null);
+        e.liveSay(who, 'Stopped');
+        if (who === 'chief') e.stageAgent(who, 'seat');
+        if (who === 'paolo') e.leaveShop(who);
+        if (this.isPhotoTask(job)) this.leaveEasel(job);
         break;
       case 'failed':
         e.setLiveAgent(who, { state: 'failed', activity: step.error?.message ?? 'Failed', jobId: job.id });

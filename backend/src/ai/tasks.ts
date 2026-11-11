@@ -20,7 +20,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import type { DateRange, LiveAgentId, Money, Permission, SessionUser, SourceInfo, SystemId } from '../../shared/live';
+import type { DataLookup, DateRange, LiveAgentId, Money, Permission, SessionUser, SourceInfo, SystemId, TaskTurn } from '../../shared/live';
 import { SYSTEM_NAMES } from '../../shared/live';
 import { buildChecklist, hardwareMentions } from '../../shared/qc';
 import { manilaDate, validateRange } from '../../shared/manila';
@@ -39,6 +39,7 @@ import {
   productMix,
 } from '../reports/calc';
 import type { FunctionDeclaration, GeminiClient, GeminiContent, GeminiPart } from './gemini';
+import { AUTO_LOOKUP_AGENTS, planLookup, runLookups } from './lookup';
 
 type ToolName =
   | 'get_orders'
@@ -322,7 +323,29 @@ export interface AiTaskOutcome {
   recordCount: number;
   /** Order number -> customer name, for the browser only. */
   customers: Record<string, string>;
+  /** EMP-code -> employee name, for the browser only. */
+  employees: Record<string, string>;
+  /** What the office looked up by code before the AI answered. */
+  dataLookups: DataLookup[];
+  /** The agent asked a question instead of answering. */
+  needsInfo: boolean;
 }
+
+/** Added to every task: how to ask for missing information, so the Task Board can show "Needs information". */
+const NEEDS_INFO_RULE = `
+- If you cannot do the request without more information from the user (for example which order, which period, which employee or what exactly they want), ask for exactly what you need in one or two short questions and end your answer with this line on its own: **Needs information:** yes`;
+
+/** Added when the office looked up records before the AI answers. */
+const AUTO_RULES = `
+
+Records retrieved for this question:
+- The office already read the records this question is about (below, "Live data the office retrieved"). Answer from them first; use your tools only for more detail.
+- Every total there is calculated by code: quote it exactly with its period, and never re-add records yourself.
+- If a topic's status is "unavailable" or "not_allowed", say plainly that this part could not be checked and why (for example "WAD Furniture Management is not connected"). Never estimate it, and never fill it in from memory or examples.
+- Always say which period the figures cover. If the period was chosen by default ("no period was named"), say so in one short sentence.
+- Employees appear as codes (EMP-…): refer to them by code; the office shows their names. Orders appear by number (ORD-…).`;
+
+const NEEDS_INFO_LINE = /\n?[ \t]*\*\*Needs information:?\*\*:?[ \t]*yes\.?[ \t]*$/i;
 
 /** Added to the instructions when a photo comes with the task. */
 const PHOTO_RULES = `
@@ -389,6 +412,12 @@ export async function runAiTask(
   prompt: string,
   image?: { mimeType: string; data: string },
   orderRef?: string,
+  opts: {
+    /** Cancels the AI requests (the Task Board's Cancel). */
+    signal?: AbortSignal;
+    /** Earlier messages of this task (follow-ups); the current `prompt` is not included. */
+    history?: TaskTurn[];
+  } = {},
 ): Promise<AiTaskOutcome> {
   const today = manilaDate(deps.now?.());
   const tools = toolsFor(agent, user);
@@ -414,14 +443,41 @@ export async function runAiTask(
       : await selectedOrder(deps, orderRef, today, user.permissions.includes('finance:read'), track)
     : null;
 
+  // Automatic data lookup: questions about orders, expenses, payments or cash advances get the
+  // relevant records read BY CODE before the AI answers (permissions and connections checked).
+  const history = (opts.history ?? []).slice(-12);
+  const employees: Record<string, string> = {};
+  let dataLookups: DataLookup[] = [];
+  let autoFacts: Record<string, unknown>[] | null = null;
+  if ((AUTO_LOOKUP_AGENTS as readonly string[]).includes(agent)) {
+    const context = history.filter((t) => t.role === 'user').map((t) => t.text).join('\n');
+    const plan = planLookup(prompt, today, deps.maxRangeDays, context);
+    if (plan) {
+      const auto = await runLookups(plan, user, prompt, deps, today);
+      dataLookups = auto.lookups;
+      autoFacts = auto.facts;
+      sources.push(...auto.sources);
+      for (const s of auto.sources) recordCount += s.recordCount;
+      auto.references.forEach((r) => refs.add(r));
+      Object.assign(customers, auto.customers);
+      Object.assign(employees, auto.employees);
+      for (const l of auto.lookups)
+        lookups.push({ tool: 'auto_lookup', detail: `${l.title}${l.range ? `, ${l.range.from} to ${l.range.to}` : ''} — ${l.status === 'ok' ? 'retrieved' : l.status === 'empty' ? 'no records' : l.message ?? l.status}`, ok: l.status === 'ok' || l.status === 'empty' });
+    }
+  }
+  if (opts.signal?.aborted) throw new IntegrationError('TIMEOUT', 'The task was cancelled.');
+
   // A photo goes in the same first message as the request, before the text.
+  // Earlier messages of this task first (follow-ups), then the current message with its data.
   const contents: GeminiContent[] = [
+    ...history.map((t): GeminiContent => ({ role: t.role === 'user' ? 'user' : 'model', parts: [{ text: t.text.slice(0, 8000) }] })),
     {
       role: 'user',
       parts: [
         ...(image ? [{ inlineData: image }] : []),
-        { text: prompt },
+        { text: history.length ? `Follow-up from ${user.username}: ${prompt}` : prompt },
         ...(orderFacts ? [{ text: `Selected order (from WAD Order Management, exact):\n${JSON.stringify(orderFacts)}` }] : []),
+        ...(autoFacts ? [{ text: `Live data the office retrieved for this question before you answer (exact, calculated by code; retrieved ${new Date().toISOString()}):\n${JSON.stringify(autoFacts)}` }] : []),
       ],
     },
   ];
@@ -436,7 +492,9 @@ export async function runAiTask(
             (image ? PHOTO_RULES : '') +
             (agent === 'carlo' ? carloRules(deps.now?.() ?? new Date()) : '') +
             (agent === 'joy' ? CS_RULES + (orderRef ? '' : '\nNo order was selected for this message.') : '') +
-            (agent === 'tess' ? QC_RULES + (orderRef ? '' : "\nNo order was selected: answer generally, and say that picking the order in Tess's panel gives an exact checklist.") : ''),
+            (agent === 'tess' ? QC_RULES + (orderRef ? '' : "\nNo order was selected: answer generally, and say that picking the order in Tess's panel gives an exact checklist.") : '') +
+            (autoFacts ? AUTO_RULES : '') +
+            NEEDS_INFO_RULE,
         },
       ],
     },
@@ -449,7 +507,7 @@ export async function runAiTask(
   // Bounded: rounds 0..maxToolRounds, and the last round cannot ask for data.
   for (let round = 0; round <= deps.maxToolRounds; round++) {
     const last = round === deps.maxToolRounds || toolCalls >= MAX_TOOL_CALLS;
-    const { content, finishReason } = await deps.ai.generate(request(!last), { tag: { feature: 'task', agent, user: user.username }, retries: 1 });
+    const { content, finishReason } = await deps.ai.generate(request(!last), { tag: { feature: 'task', agent, user: user.username }, retries: 1, signal: opts.signal });
     const calls = content.parts.filter((p): p is Extract<GeminiPart, { functionCall: unknown }> => 'functionCall' in p);
     if (!calls.length) {
       const answer = content.parts
@@ -459,7 +517,10 @@ export async function runAiTask(
         .trim();
       if (!answer)
         throw new IntegrationError('INVALID_RESPONSE', finishReason === 'MAX_TOKENS' ? 'Gemini ran out of space before answering. Try a shorter or more specific request.' : 'Gemini returned an empty answer.');
-      return { answer: answer.slice(0, MAX_ANSWER_CHARS), model: deps.ai.model, lookups, sources, references: [...refs].slice(0, 50), recordCount, customers };
+      // "**Needs information:** yes" on the last line: the agent asked a question (the line is removed).
+      const needsInfo = NEEDS_INFO_LINE.test(answer);
+      const text = needsInfo ? answer.replace(NEEDS_INFO_LINE, '').trim() : answer;
+      return { answer: text.slice(0, MAX_ANSWER_CHARS), model: deps.ai.model, lookups, sources, references: [...refs].slice(0, 50), recordCount, customers, employees, dataLookups, needsInfo };
     }
     if (last) break; // asked for data although it was told to answer: stop, never loop
 

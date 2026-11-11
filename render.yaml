@@ -54,6 +54,9 @@ services:
       # UI Reviews (text only; screenshots are never written to disk). Also wiped on redeploy.
       - key: UI_REVIEWS_FILE
         value: data/ui-reviews.json
+      # Task Board (reports and assigned tasks, with their conversations). Wiped on redeploy without a disk.
+      - key: TASKS_FILE
+        value: data/tasks.json
       # AI usage tracker: totals and limits changed in the office (wiped on redeploy without a disk).
       - key: AI_USAGE_FILE
         value: data/ai-usage.json

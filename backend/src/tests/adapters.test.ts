@@ -44,7 +44,7 @@ test('finance adapter reads records.php once per report with the Bearer token', 
   assert.equal(seen.length, 1);
   assert.equal(seen[0].url, 'https://finance.test/api/ceo/records?from=2026-10-01&to=2026-10-31');
   assert.equal(seen[0].auth, 'Bearer secret-token');
-  assert.deepEqual(inc[0], { ref: 'INC-7', kind: 'income', date: '2026-10-03', centavos: 1500000, currency: 'PHP', category: null, orderId: null });
+  assert.deepEqual(inc[0], { ref: 'INC-7', kind: 'income', date: '2026-10-03', centavos: 1500000, currency: 'PHP', category: null, orderId: null, status: 'Received' });
   assert.equal(exp[0].centavos, 120050);
   assert.equal(exp[0].category, 'Utilities');
   assert.equal(bud[0].ref, 'BUDGET-2026-10');

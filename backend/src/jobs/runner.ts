@@ -1,11 +1,19 @@
-// Job runner for Connected Mode reports. Each job has steps owned by an office agent; the UI
-// animates agents from these step events. A step is "completed" only after its result has
-// been received AND validated. Nothing here waits on animations.
+// Job runner for Connected Mode reports and assigned tasks (the Task Board). Each job has steps
+// owned by an office agent; the UI animates agents from these step events. A step is "completed"
+// only after its result has been received AND validated. Nothing here waits on animations.
+//
+// Task Board statuses: queued -> working -> ready_for_review (an AI answer for a person to check)
+// or needs_info (the agent asked a question) or completed (reports calculated by code), or failed;
+// a person can cancel, reply (follow-up: the same task runs again with the conversation so far)
+// and mark an answer complete. Tasks are saved to TASKS_FILE so they survive a restart; photos and
+// customer/employee names never are.
 
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { EventEmitter } from 'node:events';
-import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId } from '../../shared/live';
-import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES } from '../../shared/live';
+import type { DateRange, Job, JobStep, JobTypeInfo, LiveAgentId, Permission, ReportType, SessionUser, StepResult, SystemId, TaskTurn } from '../../shared/live';
+import { IMAGE_AGENTS, IMAGE_TYPES, LIVE_AGENT_IDS, MAX_CS_PROMPT_CHARS, MAX_FOLLOW_UPS, MAX_IMAGE_BYTES, MAX_PROMPT_CHARS, ORDER_AGENTS, ORDER_REF_PATTERN, SYSTEM_NAMES } from '../../shared/live';
 import { redactContacts } from '../ai/redact';
 import { manilaDate } from '../../shared/manila';
 import type { FinanceRecord, FinanceSource, OrderRecord, OrderSource } from '../adapters/types';
@@ -75,6 +83,42 @@ export interface RunnerDeps {
   now?: () => Date;
   /** Free-text AI tasks; absent when no AI provider is configured. */
   ai?: Omit<AiTaskDeps, 'finance' | 'orders' | 'now'> | null;
+  /** Where tasks are saved (survive a restart); absent or null = memory only. */
+  store?: TaskStore | null;
+}
+
+/**
+ * Saves the Task Board to a JSON file. Photos are never kept (only their size and fingerprint),
+ * and the customer and employee names shown next to order numbers and EMP-codes are left out:
+ * after a restart those tasks show the numbers only.
+ */
+export class TaskStore {
+  constructor(private file: string | null) {}
+
+  load(): Job[] {
+    if (!this.file || !existsSync(this.file)) return [];
+    try {
+      const v = JSON.parse(readFileSync(this.file, 'utf8')) as { jobs?: Job[] };
+      return Array.isArray(v.jobs) ? v.jobs.filter((j) => j && typeof j.id === 'string' && typeof j.requestedBy === 'string' && Array.isArray(j.steps)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  save(jobs: Job[]) {
+    if (!this.file) return;
+    try {
+      const clean = jobs.map((j) => ({
+        ...j,
+        steps: j.steps.map((st) => (st.result ? { ...st, result: { ...st.result, customers: undefined, employees: undefined } } : st)),
+      }));
+      mkdirSync(dirname(this.file), { recursive: true });
+      writeFileSync(`${this.file}.tmp`, JSON.stringify({ version: 1, jobs: clean }), { encoding: 'utf8', mode: 0o600 });
+      renameSync(`${this.file}.tmp`, this.file);
+    } catch {
+      /* a storage problem must not stop the office; the in-memory board stays correct */
+    }
+  }
 }
 
 export class SubmitError extends Error {
@@ -94,9 +138,52 @@ export class JobRunner extends EventEmitter {
   private queue: Job[] = [];
   private running = 0;
   private recentSubmits = new Map<string, number[]>();
+  /** Running work that can be cancelled. */
+  private ctrls = new Map<string, AbortController>();
+  /** Submission keys from the browser (user|key -> job id), so a resent request is not run twice. */
+  private keys = new Map<string, { id: string; at: number }>();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private deps: RunnerDeps) {
     super();
+    // Tasks still queued or working when the server stopped are marked interrupted, never resumed silently.
+    const at = new Date().toISOString();
+    for (const j of deps.store?.load() ?? []) {
+      if (j.status === 'queued' || j.status === 'working') {
+        j.status = 'failed';
+        j.error = { code: 'INTERNAL', message: 'Interrupted: the server restarted while this task was running. Run it again or send a follow-up.', retryable: true };
+        j.finishedAt = at;
+        j.updatedAt = at;
+        for (const st of j.steps) if (st.status === 'queued' || st.status === 'working') st.status = 'cancelled';
+      }
+      this.jobs.push(j);
+    }
+    if (this.jobs.length > HISTORY) this.jobs.length = HISTORY;
+  }
+
+  /** Writes the board to its file now (also called on shutdown). */
+  flush() {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    this.deps.store?.save(this.jobs);
+  }
+
+  private scheduleSave() {
+    if (!this.deps.store || this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.flush(), 500);
+    this.saveTimer.unref?.();
+  }
+
+  /** A repeated submission key returns the task it already created (10 minutes). */
+  private fromKey(user: SessionUser, key: string | undefined): Job | null {
+    if (!key) return null;
+    const now = Date.now();
+    for (const [k, v] of this.keys) if (now - v.at > 600_000) this.keys.delete(k);
+    const hit = this.keys.get(`${user.username}|${key}`);
+    return hit ? (this.jobs.find((j) => j.id === hit.id) ?? null) : null;
+  }
+  private rememberKey(user: SessionUser, key: string | undefined, job: Job) {
+    if (key) this.keys.set(`${user.username}|${key}`, { id: job.id, at: Date.now() });
   }
 
   /** For the Systems Monitor: task counts only (no prompts, users or results). */
@@ -139,6 +226,7 @@ export class JobRunner extends EventEmitter {
       requestedBy: user.username,
       status: 'queued',
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       steps: def.steps.map((s, i) => ({ id: `s${i + 1}`, agent: s.agent, label: s.label, system: s.system, status: 'queued' as const })),
     };
     this.enqueue(job);
@@ -152,8 +240,11 @@ export class JobRunner extends EventEmitter {
     rawPrompt: string,
     rawImage?: { mimeType: string; data: string },
     rawOrderRef?: string,
+    key?: string,
   ): { job: Job; deduplicated: boolean } {
     if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
+    const again = this.fromKey(user, key);
+    if (again) return { job: again, deduplicated: true };
     if (!LIVE_AGENT_IDS.includes(agent)) throw new SubmitError(400, 'Unknown agent.');
     const image = rawImage ? checkImage(agent, rawImage) : null;
     const orderRef = rawOrderRef?.trim() || undefined;
@@ -198,8 +289,11 @@ export class JobRunner extends EventEmitter {
       requestedBy: user.username,
       status: 'queued',
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       steps: [{ id: 's1', agent, label: prompt.length > 120 ? `${prompt.slice(0, 117)}…` : prompt, system: null, status: 'queued' }],
+      thread: [{ role: 'user', text: prompt, at: new Date().toISOString() }],
     };
+    this.rememberKey(user, key, job);
     this.users.set(job.id, user);
     if (image) this.images.set(job.id, { mimeType: image.meta.mimeType, data: image.data });
     this.enqueue(job);
@@ -210,6 +304,89 @@ export class JobRunner extends EventEmitter {
   private users = new Map<string, SessionUser>();
   /** Photos for pending AI tasks, in memory only; removed as soon as the task ends. */
   private images = new Map<string, { mimeType: string; data: string }>();
+
+  /**
+   * A follow-up message on an AI task (an answer to the agent's question, or a further request):
+   * the same task runs again with the conversation so far. Not while it is still running.
+   */
+  followUp(user: SessionUser, id: string, rawText: string, key?: string): { job: Job; deduplicated: boolean } {
+    const job = this.get(id, user);
+    if (!job) throw new SubmitError(404, 'Task not found.');
+    if (job.type !== 'ai.task' || !job.agent) throw new SubmitError(400, 'Only assigned tasks take follow-up messages. Run the report again instead.');
+    if (!this.deps.ai) throw new SubmitError(503, 'AI tasks are not set up on the server (GEMINI_API_KEY is missing).');
+    const again = this.fromKey(user, key);
+    if (again) return { job: again, deduplicated: true };
+    const { text: cleaned, count: redacted } = redactContacts(typeof rawText === 'string' ? rawText : '');
+    const text = cleaned.replace(/\s+/g, ' ').trim();
+    if (!text) throw new SubmitError(400, 'Type a message first.');
+    const maxChars = ORDER_AGENTS.includes(job.agent) ? MAX_CS_PROMPT_CHARS : MAX_PROMPT_CHARS;
+    if (text.length > maxChars) throw new SubmitError(400, `Keep the message under ${maxChars} characters.`);
+    const last = [...(job.thread ?? [])].reverse().find((t) => t.role === 'user');
+    if (job.status === 'queued' || job.status === 'working') {
+      if (last?.text === text) return { job, deduplicated: true };
+      throw new SubmitError(409, `${AGENT_PROFILES[job.agent].name} is still working on this task. Wait for the answer, or cancel it first.`);
+    }
+    if (job.status === 'cancelled') throw new SubmitError(409, 'This task was cancelled. Assign it again as a new task.');
+    const followUps = (job.thread ?? []).filter((t) => t.role === 'user').length - 1;
+    if (followUps >= MAX_FOLLOW_UPS) throw new SubmitError(409, `This task already has ${MAX_FOLLOW_UPS} follow-ups. Start a new task to continue.`);
+    this.rateLimit(user);
+    const at = new Date().toISOString();
+    job.thread = [...(job.thread ?? [{ role: 'user', text: job.prompt ?? '', at: job.createdAt }]), { role: 'user', text, at }];
+    job.status = 'queued';
+    job.updatedAt = at;
+    job.finishedAt = undefined;
+    job.error = undefined;
+    job.reviewedBy = undefined;
+    job.reviewedAt = undefined;
+    if (redacted) job.redacted = (job.redacted ?? 0) + redacted;
+    const step = job.steps[0];
+    Object.assign(step, { status: 'queued', label: text.length > 120 ? `${text.slice(0, 117)}…` : text, result: undefined, error: undefined, startedAt: undefined, finishedAt: undefined });
+    this.rememberKey(user, key, job);
+    this.users.set(job.id, user);
+    this.queue.push(job);
+    this.audit(job, 'follow-up', { messageChars: text.length });
+    this.emitJob(job);
+    this.pump();
+    return { job, deduplicated: false };
+  }
+
+  /** Stops a task: removed from the queue, or its AI requests aborted. Finished tasks stay as they are. */
+  cancel(user: SessionUser, id: string): Job {
+    const job = this.get(id, user);
+    if (!job) throw new SubmitError(404, 'Task not found.');
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') throw new SubmitError(409, 'This task has already finished.');
+    const at = new Date().toISOString();
+    const qi = this.queue.indexOf(job);
+    if (qi >= 0) this.queue.splice(qi, 1);
+    this.ctrls.get(job.id)?.abort();
+    for (const st of job.steps) if (st.status === 'queued' || st.status === 'working') Object.assign(st, { status: 'cancelled', finishedAt: at });
+    const wasRunning = job.status === 'queued' || job.status === 'working';
+    job.status = 'cancelled';
+    job.cancelledBy = user.username;
+    job.finishedAt = at;
+    job.updatedAt = at;
+    if (job.type === 'ai.task' && wasRunning) job.thread = [...(job.thread ?? []), { role: 'agent', text: `Cancelled by ${user.username}.`, at, outcome: 'cancelled' }];
+    this.users.delete(job.id);
+    this.images.delete(job.id);
+    this.audit(job, 'cancelled');
+    this.emitJob(job);
+    return job;
+  }
+
+  /** A person checked the answer: ready for review (or a question nobody needs to answer) -> completed. */
+  complete(user: SessionUser, id: string): Job {
+    const job = this.get(id, user);
+    if (!job) throw new SubmitError(404, 'Task not found.');
+    if (job.status !== 'ready_for_review' && job.status !== 'needs_info') throw new SubmitError(409, 'Only an answer waiting for review can be marked complete.');
+    const at = new Date().toISOString();
+    job.status = 'completed';
+    job.reviewedBy = user.username;
+    job.reviewedAt = at;
+    job.updatedAt = at;
+    this.audit(job, 'reviewed');
+    this.emitJob(job);
+    return job;
+  }
 
   private rateLimit(user: SessionUser) {
     const now = Date.now();
@@ -242,7 +419,9 @@ export class JobRunner extends EventEmitter {
 
   private emitJob(job: Job) {
     job.rev++;
+    job.updatedAt = new Date().toISOString();
     this.emit('job', structuredClone(job));
+    this.scheduleSave();
   }
 
   private audit(job: Job, event: string, extra: Record<string, unknown> = {}) {
@@ -256,8 +435,11 @@ export class JobRunner extends EventEmitter {
   }
 
   private async execute(job: Job) {
+    if (job.status !== 'queued') return; // cancelled while waiting
     job.status = 'working';
-    job.startedAt = new Date().toISOString();
+    job.startedAt ??= new Date().toISOString();
+    const ctrl = new AbortController();
+    this.ctrls.set(job.id, ctrl);
     this.audit(job, 'started');
     this.emitJob(job);
     try {
@@ -275,17 +457,36 @@ export class JobRunner extends EventEmitter {
           await this.combinedJob(job);
           break;
         case 'ai.task':
-          await this.runStep(job, job.steps[0], () => this.aiStep(job));
+          await this.runStep(job, job.steps[0], () => this.aiStep(job, ctrl.signal));
           break;
       }
-      const failed = job.steps.find((s) => s.status === 'failed');
-      job.status = failed ? 'failed' : 'completed';
-      if (failed) job.error = failed.error;
     } catch (e) {
-      job.status = 'failed';
-      job.error = toLiveError(e);
+      if ((job.status as Job['status']) !== 'cancelled') {
+        job.status = 'failed';
+        job.error = toLiveError(e);
+      }
     }
-    job.finishedAt = new Date().toISOString();
+    this.ctrls.delete(job.id);
+    // Cancelled meanwhile: cancel() already recorded everything; a late result is dropped.
+    if ((job.status as Job['status']) === 'cancelled') return;
+    const failed = job.steps.find((s) => s.status === 'failed');
+    const at = new Date().toISOString();
+    if (failed || job.status === 'failed') {
+      job.status = 'failed';
+      job.error ??= failed?.error;
+    } else if (job.type === 'ai.task') {
+      // An AI answer is checked by a person; a question from the agent waits for a reply.
+      job.status = job.steps[0].result?.needsInfo ? 'needs_info' : 'ready_for_review';
+    } else job.status = 'completed';
+    if (job.type === 'ai.task') {
+      const r = job.steps[0].result;
+      const turn: TaskTurn =
+        job.status === 'failed'
+          ? { role: 'agent', text: job.error?.message ?? 'The task failed.', at, outcome: 'failed' }
+          : { role: 'agent', text: r?.answer ?? '', at, outcome: job.status === 'needs_info' ? 'needs_info' : 'answered' };
+      job.thread = [...(job.thread ?? [{ role: 'user', text: job.prompt ?? '', at: job.createdAt }]), turn];
+    }
+    job.finishedAt = at;
     this.users.delete(job.id);
     this.images.delete(job.id);
     this.audit(job, 'finished', {
@@ -302,12 +503,18 @@ export class JobRunner extends EventEmitter {
     this.emitJob(job);
     try {
       const result = await work();
+      if (this.isCancelled(job)) throw new IntegrationError('TIMEOUT', 'Cancelled.');
       const problem = validateStepResult(result);
       if (problem) throw new IntegrationError('INVALID_RESPONSE', `The result failed validation: ${problem}`, step.system ?? undefined);
       step.result = result;
       step.status = 'completed';
       return result;
     } catch (e) {
+      if (this.isCancelled(job)) {
+        step.status = 'cancelled';
+        step.result = undefined;
+        return null;
+      }
       step.status = 'failed';
       step.error = toLiveError(e, step.system ?? undefined);
       return null;
@@ -317,12 +524,29 @@ export class JobRunner extends EventEmitter {
     }
   }
 
+  private isCancelled(job: Job) {
+    return job.status === 'cancelled';
+  }
+
   // ---------------------------------------------------------------- steps
-  private async aiStep(job: Job): Promise<StepResult> {
+  private async aiStep(job: Job, signal: AbortSignal): Promise<StepResult> {
     const ai = this.deps.ai;
     const user = this.users.get(job.id);
     if (!ai || !user || !job.agent || !job.prompt) throw new IntegrationError('NOT_CONFIGURED', 'AI tasks are not set up on the server.');
-    const out = await runAiTask({ ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now }, user, job.agent, job.prompt, this.images.get(job.id), job.orderRef);
+    // The latest message is the request; earlier answered messages are the conversation so far.
+    const thread = job.thread ?? [{ role: 'user' as const, text: job.prompt, at: job.createdAt }];
+    const current = [...thread].reverse().find((t) => t.role === 'user')?.text ?? job.prompt;
+    const history = thread.slice(0, thread.lastIndexOf(thread.filter((t) => t.role === 'user').at(-1)!)).filter((t) => t.role === 'user' || t.outcome === 'answered' || t.outcome === 'needs_info');
+    const followUp = history.length > 0;
+    const out = await runAiTask(
+      { ...ai, finance: this.deps.finance, orders: this.deps.orders, now: this.deps.now },
+      user,
+      job.agent,
+      followUp && job.image ? `${current}\n(A photo came with the first message; it is no longer available.)` : current,
+      followUp ? undefined : this.images.get(job.id),
+      job.orderRef,
+      { signal, history },
+    );
     const ok = out.lookups.filter((l) => l.ok).length;
     return {
       summary: out.lookups.length
@@ -340,6 +564,9 @@ export class JobRunner extends EventEmitter {
       model: out.model,
       lookups: out.lookups,
       customers: out.customers,
+      employees: out.employees,
+      dataLookups: out.dataLookups,
+      needsInfo: out.needsInfo,
     };
   }
 

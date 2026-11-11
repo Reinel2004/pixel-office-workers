@@ -14,7 +14,7 @@ import { FacebookClient } from './social/facebook';
 import { loadEnvFile } from './env';
 import { ApiClient } from './http/client';
 import { createTaskLog } from './jobs/log';
-import { JobRunner } from './jobs/runner';
+import { JobRunner, TaskStore } from './jobs/runner';
 import { HealthLog } from './monitor/monitor';
 import { DiscussionService, DiscussionStore } from './discuss/discussions';
 import { UiReviewService, UiReviewStore } from './uireview/uireview';
@@ -56,7 +56,7 @@ const aiStatus = () => ({
   model: ai ? config.ai.model : null,
   problems: ai ? [] : ['GEMINI_API_KEY is not set.'],
 });
-const runner = new JobRunner({ finance, orders, maxConcurrent: config.maxConcurrentJobs, log: taskLog, ai });
+const runner = new JobRunner({ finance, orders, maxConcurrent: config.maxConcurrentJobs, log: taskLog, ai, store: new TaskStore(config.tasksFile) });
 const auth = new Auth(config);
 const fb = config.facebook;
 const facebook =
@@ -85,6 +85,7 @@ const server = createServer(app.handler);
 for (const sig of ['SIGTERM', 'SIGINT'] as const)
   process.once(sig, () => {
     aiUsage.save();
+    runner.flush();
     process.exit(0);
   });
 server.on('error', (e: NodeJS.ErrnoException) => {

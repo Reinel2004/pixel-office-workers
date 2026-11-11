@@ -66,7 +66,7 @@ function runner(ai: GeminiClient, over: { orders?: OrderSource; knowledgeDir?: s
 function done(r: JobRunner, id: string): Promise<Job> {
   return new Promise((resolve) => {
     const on = (j: Job) => {
-      if (j.id === id && (j.status === 'completed' || j.status === 'failed')) {
+      if (j.id === id && ['ready_for_review', 'needs_info', 'completed', 'failed', 'cancelled'].includes(j.status)) {
         r.off('job', on);
         resolve(j);
       }
@@ -84,12 +84,17 @@ test('an AI task calls a data tool, gets code-calculated data, and returns the a
   const { job } = r.submitAi(admin, 'paolo', '  Which orders are overdue?  ');
   assert.equal(job.prompt, 'Which orders are overdue?');
   const final = await done(r, job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const res = final.steps[0].result!;
   assert.equal(res.generatedBy, 'ai');
   assert.equal(res.answer, 'ORD-A is **16 days** overdue.');
   assert.equal(res.model, 'gemini-test');
-  assert.deepEqual(res.lookups, [{ tool: 'get_open_orders', detail: 'all open orders', ok: true }]);
+  // The question is about orders, so the office read the open orders by code first; then the AI's own lookup.
+  assert.deepEqual(res.lookups, [
+    { tool: 'auto_lookup', detail: 'Open orders (right now) — retrieved', ok: true },
+    { tool: 'get_open_orders', detail: 'all open orders', ok: true },
+  ]);
+  assert.equal(res.dataLookups?.[0].status, 'ok');
   assert.equal(res.sources[0].system, 'orders');
   assert.deepEqual(res.references, ['ORD-A']);
 
@@ -114,7 +119,7 @@ test('finance totals are given to the AI already calculated, in pesos', async ()
   ]);
   const r = runner(g.ai);
   const final = await done(r, r.submitAi(admin, 'bea', 'How did October go?').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   assert.deepEqual(resp.totals.net, [{ currency: 'PHP', amount: '13799.50' }]);
   assert.equal(resp.expensesByCategory[0].category, 'Utilities');
@@ -143,7 +148,7 @@ test('a failed data lookup is reported to the AI as unavailable, never filled in
   ]);
   const r = runner(g.ai, { orders: orders({ listOpenOrders: async () => Promise.reject(new IntegrationError('TIMEOUT', 'Order system timed out.', 'orders')) }) });
   const final = await done(r, r.submitAi(admin, 'nina', 'Plan deliveries').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   assert.equal(resp.error, 'Order system timed out.');
   assert.match(final.steps[0].result!.summary, /some lookups failed/);
@@ -188,7 +193,7 @@ test('identical lookups are fetched once, and one task makes at most MAX_TOOL_CA
   ]);
   const r = runner(g.ai, { orders: src });
   const final = await done(r, r.submitAi(admin, 'paolo', 'Check October').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   assert.equal(fetches, MAX_TOOL_CALLS); // 10 asked + 1 repeat, only 6 distinct fetched
   assert.equal(g.bodies.length, 3);
   assert.deepEqual(g.bodies[2].toolConfig, { functionCallingConfig: { mode: 'NONE' } });
@@ -235,7 +240,7 @@ test('Rosa reads balances calculated by code; operations users get no balances',
   ]);
   const r = runner(g.ai, { orders: src });
   const final = await done(r, r.submitAi(admin, 'rosa', 'Who owes us?').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   assert.equal(resp.totalBalance, '23000.50');
   assert.equal(resp.totalDownpayments, '15000.00');
@@ -271,7 +276,7 @@ test('business notes from the knowledge folder reach the AI; README is skipped',
   const g = fakeGemini([{ candidates: [{ content: { role: 'model', parts: [{ text: 'Quotation draft…' }] } }] }]);
   const r = runner(g.ai, { knowledgeDir: dir });
   const final = await done(r, r.submitAi(admin, 'marco', 'Quote 2 flush doors').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const sys = JSON.stringify(g.bodies[0].systemInstruction);
   assert.match(sys, /Flush door, 36x80/);
   assert.doesNotMatch(sys, /instructions for humans/);
@@ -318,7 +323,7 @@ test('Mika: trends, product mix and pipeline are calculated by code; values only
   ]);
   const r = runner(g.ai, { orders: src });
   const final = await done(r, r.submitAi(admin, 'mika', 'How are we doing?').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const [trends, mix, pipe] = (g.bodies[1].contents as any[])[2].parts.map((p: any) => p.functionResponse.response);
   assert.deepEqual(trends.periods.map((p: any) => [p.period, p.orders]), [['2026-08', 1], ['2026-09', 1], ['2026-10', 1]]);
   assert.equal(trends.totalOrderValue, '42000.50');
@@ -369,7 +374,7 @@ test('Mika: monthly finance trends with best and worst month', async () => {
   ]);
   const r = new JobRunner({ finance: fin, orders: orders(), maxConcurrent: 1, now: () => new Date('2026-11-05T02:00:00Z'), ai: { ai: g.ai, maxToolRounds: 3, maxRangeDays: 366, knowledgeDir: 'nope' } });
   const final = await done(r, r.submitAi(admin, 'mika', 'Best month?').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const t = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   assert.deepEqual(t.months.map((m: any) => [m.month, m.net]), [['2026-09', '40000.00'], ['2026-10', '-5000.00']]);
   assert.equal(t.bestMonthByNet, '2026-09');
@@ -391,7 +396,7 @@ test('Carlo: a photo goes to Gemini with the request, and is never logged or kep
   assert.equal(job.image?.bytes, 204);
   assert.equal(job.image?.sha256.length, 16);
   const final = await done(r, job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   // The photo comes first, then the text, in the first message; the photo rules are in the instructions.
   const parts = (g.bodies[0].contents as any[])[0].parts;
   assert.deepEqual(parts[0], { inlineData: { mimeType: 'image/jpeg', data: JPEG } });
@@ -440,7 +445,7 @@ test('Joy: contact details are removed, the picked order is looked up by code, a
   assert.equal(job.orderRef, 'ORD-J1');
   assert.ok(!job.prompt!.includes('0917') && !job.prompt!.includes('gmail') && !job.prompt!.includes('8123'));
   const final = await done(r, job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const sent = JSON.stringify(g.bodies);
   assert.ok(!sent.includes('Maria') && !sent.includes('0917') && !sent.includes('gmail'));
   const parts = (g.bodies[0].contents as any[])[0].parts;
@@ -492,7 +497,7 @@ test('Dev runs the data checks by code and the AI gets order numbers only', asyn
   ]);
   const r = runner(g.ai, { orders: src });
   const final = await done(r, r.submitAi(ops, 'dev', 'Check the order data').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   const by = Object.fromEntries(resp.checks.map((c: any) => [c.id, c]));
   assert.deepEqual(by.missing_due_date.orders, ['ORD-N']);
@@ -534,7 +539,7 @@ test('Sam and Ivy read the systems reports; only admin accounts get those tools'
   });
   const sysAdmin: SessionUser = { ...admin, permissions: [...admin.permissions, 'system:read'] };
   const final = await done(r, r.submitAi(sysAdmin, 'sam', 'Is everything working?').job.id);
-  assert.equal(final.status, 'completed');
+  assert.equal(final.status, 'ready_for_review');
   const resp = (g.bodies[1].contents as any[])[2].parts[0].functionResponse.response;
   assert.equal(resp.systems[0].failuresInARowNow, 3);
   assert.equal(resp.measuredByServer, true);

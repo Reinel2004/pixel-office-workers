@@ -362,6 +362,7 @@ export function createApp(deps: AppDeps) {
           body.prompt,
           img ? { mimeType: img.mimeType as string, data: img.data as string } : undefined,
           body.orderRef as string | undefined,
+          typeof body.key === 'string' ? body.key.slice(0, 64) : undefined,
         );
         return send(res, deduplicated ? 200 : 202, { job: structuredClone(job), deduplicated });
       } catch (e) {
@@ -487,6 +488,26 @@ export function createApp(deps: AppDeps) {
     if (m && method === 'GET') {
       const job = runner.get(m[1], s.user);
       return job ? send(res, 200, { job }) : send(res, 404, { error: 'Report not found.' });
+    }
+    // Task Board actions (owner only): cancel, reply to the agent, mark an answer complete.
+    const act = path.match(/^\/api\/jobs\/([0-9a-f-]{36})\/(cancel|follow-up|complete)$/);
+    if (act && method === 'POST') {
+      if (!csrfOk(req)) return send(res, 403, { error: 'Request blocked by cross-site protection.' });
+      let body: Record<string, unknown> = {};
+      try {
+        body = await readJson(req, 16 * 1024);
+      } catch {
+        return send(res, 400, { error: 'Invalid request body.' });
+      }
+      try {
+        if (act[2] === 'cancel') return send(res, 200, { job: structuredClone(runner.cancel(s.user, act[1])) });
+        if (act[2] === 'complete') return send(res, 200, { job: structuredClone(runner.complete(s.user, act[1])) });
+        const { job, deduplicated } = runner.followUp(s.user, act[1], typeof body.text === 'string' ? body.text : '', typeof body.key === 'string' ? body.key.slice(0, 64) : undefined);
+        return send(res, deduplicated ? 200 : 202, { job: structuredClone(job), deduplicated });
+      } catch (e) {
+        if (e instanceof SubmitError) return send(res, e.status, { error: e.message });
+        throw e;
+      }
     }
 
     if (path === '/api/events' && method === 'GET') {

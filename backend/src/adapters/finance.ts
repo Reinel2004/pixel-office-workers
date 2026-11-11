@@ -15,7 +15,7 @@ import type { DateRange, SystemStatus } from '../../shared/live';
 import type { SystemConfig } from '../config';
 import type { ApiClient } from '../http/client';
 import { IntegrationError } from '../http/errors';
-import type { BudgetRecord, FinanceCapabilities, FinanceRecord, FinanceSource } from './types';
+import type { BudgetRecord, CashAdvance, CashAdvanceData, FinanceCapabilities, FinanceRecord, FinanceSource } from './types';
 
 interface RecordsPayload {
   income: FinanceRecord[];
@@ -59,6 +59,62 @@ export class FinanceAdapter implements FinanceSource {
     return (await this.records(range)).budgets;
   }
 
+  /**
+   * Employee cash advances: GET {base}ceo/cash-advances?from=&to= (api/ceo/cash-advances.php).
+   * 404 = that file is not uploaded yet. Employee names are kept for display only.
+   */
+  async listCashAdvances(range: DateRange): Promise<CashAdvanceData> {
+    ensureConfigured(this.config, this.authConfigured, this.id);
+    const name = this.config.name;
+    let body: unknown;
+    try {
+      ({ data: body } = await this.client.getJson<unknown>('ceo/cash-advances', { query: { from: range.from, to: range.to } }));
+    } catch (e) {
+      if (e instanceof IntegrationError && e.httpStatus === 404)
+        throw new IntegrationError('NOT_SUPPORTED', `${name} does not have api/ceo/cash-advances.php yet (upload it to the server).`, this.id, 404);
+      throw e;
+    }
+    const data = envelope(body, name, this.id);
+    if (data.truncated === true) throw new IntegrationError('RESULT_TOO_LARGE', `${name} has too many cash advance records for this range. Choose a shorter date range.`, this.id);
+    const currency = typeof data.currency === 'string' && data.currency ? data.currency : null;
+    if (!currency) throw invalid(name, this.id, 'currency');
+    const list = (k: string) => {
+      const v = data[k];
+      if (!Array.isArray(v)) throw invalid(name, this.id, k);
+      return v as Record<string, unknown>[];
+    };
+    const text = (v: unknown, max: number) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+    const advance = (r: Record<string, unknown>): CashAdvance => {
+      const emp = Number(r.employee_id);
+      if (!Number.isInteger(emp) || emp <= 0) throw invalid(name, this.id, 'employee_id');
+      return {
+        ref: `CA-${idOf(r, name, this.id)}`,
+        employeeRef: `EMP-${emp}`,
+        employeeName: text(r.employee_name, 100),
+        position: text(r.position, 40),
+        dateIssued: dateOf(r.date_issued, name, this.id),
+        centavos: toCentavos(r.amount, name, this.id),
+        remainingCentavos: toCentavos(r.remaining_balance, name, this.id),
+        status: text(r.status, 30) ?? 'Unknown',
+      };
+    };
+    return {
+      currency,
+      issued: list('issued').map(advance),
+      outstanding: list('outstanding').map(advance),
+      repayments:
+        data.repayments_available === true
+          ? list('repayments').map((r) => ({
+              ref: `CAP-${idOf(r, name, this.id)}`,
+              advanceRef: `CA-${Number(r.cash_advance_id)}`,
+              employeeRef: Number.isInteger(Number(r.employee_id)) && Number(r.employee_id) > 0 ? `EMP-${Number(r.employee_id)}` : null,
+              date: dateOf(r.payment_date, name, this.id),
+              centavos: toCentavos(r.amount, name, this.id),
+            }))
+          : null,
+    };
+  }
+
   private records(range: DateRange): Promise<RecordsPayload> {
     ensureConfigured(this.config, this.authConfigured, this.id);
     const key = `${range.from}|${range.to}`;
@@ -93,6 +149,7 @@ export class FinanceAdapter implements FinanceSource {
       currency,
       category: null,
       orderId: null,
+      status: typeof r.status === 'string' && r.status.trim() ? r.status.trim().slice(0, 30) : null,
     }));
     const expenses = list('expenses').map((r): FinanceRecord => ({
       ref: `EXP-${idOf(r, name, this.id)}`,

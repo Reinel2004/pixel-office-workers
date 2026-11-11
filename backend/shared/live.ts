@@ -37,7 +37,17 @@ export const MAX_POST_CHARS = 5000;
 export type ReportType = 'finance.summary' | 'orders.status' | 'orders.overdue' | 'combined.report';
 /** "ai.task" is a free-text task answered by the AI provider, using read-only data tools. */
 export type JobType = ReportType | 'ai.task';
-export type JobStatus = 'queued' | 'working' | 'completed' | 'failed';
+/**
+ * Task Board statuses. AI tasks end in "ready_for_review" (a person checks the answer and marks it
+ * complete) or "needs_info" (the agent asked a question; reply to continue). Reports calculated by
+ * code end in "completed".
+ */
+export type JobStatus = 'queued' | 'working' | 'needs_info' | 'ready_for_review' | 'completed' | 'failed' | 'cancelled';
+/** A step inside a task (one agent's part of the work). */
+export type StepStatus = 'queued' | 'working' | 'completed' | 'failed' | 'cancelled';
+export const JOB_ACTIVE: JobStatus[] = ['queued', 'working'];
+/** Most follow-up messages one task can take. */
+export const MAX_FOLLOW_UPS = 10;
 export type LiveAgentId = 'lia' | 'marco' | 'paolo' | 'nina' | 'bea' | 'rosa' | 'mika' | 'carlo' | 'joy' | 'tess' | 'dev' | 'sam' | 'ivy' | 'aya' | 'rey' | 'kim' | 'chief';
 /** Agents that accept a photo with their task (e.g. Carlo writes a caption for a door photo). */
 export const IMAGE_AGENTS: LiveAgentId[] = ['carlo'];
@@ -163,6 +173,15 @@ export interface StepResult {
   /** 'code' = calculated by code; 'ai' = written by the AI provider from the data its tools returned. */
   generatedBy: 'code' | 'ai';
   report: ReportPayload | null;
+  /**
+   * AI tasks: records the office retrieved by code BEFORE the AI answered (orders, expenses,
+   * payments, cash advances), with totals, date range, source and retrieval time, or why not.
+   */
+  dataLookups?: DataLookup[];
+  /** AI tasks: the agent asked for more information instead of answering. */
+  needsInfo?: boolean;
+  /** Employee code (EMP-…) -> name, for display only; never sent to the AI provider or saved to disk. */
+  employees?: Record<string, string>;
   /** AI tasks only: the answer text (plain text with light Markdown), the model, and the data lookups it made. */
   answer?: string;
   model?: string;
@@ -179,7 +198,7 @@ export interface JobStep {
   agent: LiveAgentId;
   label: string;
   system: SystemId | null;
-  status: JobStatus;
+  status: StepStatus;
   startedAt?: string;
   finishedAt?: string;
   error?: LiveError;
@@ -208,10 +227,26 @@ export interface Job {
   requestedBy: string;
   status: JobStatus;
   createdAt: string;
+  /** Last change of any kind (status, progress, a follow-up). */
+  updatedAt?: string;
   startedAt?: string;
   finishedAt?: string;
   steps: JobStep[];
   error?: LiveError;
+  /** AI tasks: the conversation so far (the first message is the original request). */
+  thread?: TaskTurn[];
+  /** Who marked it complete, and when. */
+  reviewedBy?: string;
+  reviewedAt?: string;
+  cancelledBy?: string;
+}
+
+export interface TaskTurn {
+  role: 'user' | 'agent';
+  text: string;
+  at: string;
+  /** Agent turns: how that answer ended. */
+  outcome?: 'answered' | 'needs_info' | 'failed' | 'cancelled';
 }
 
 export type SystemState = 'not_configured' | 'awaiting_documentation' | 'ready';
@@ -758,4 +793,26 @@ export interface AttentionReport {
   /** Overdue orders in total (the list shows the most overdue first, up to a limit); null = not checked. */
   overdueTotal: number | null;
   notes: string[];
+}
+
+// ---------------------------------------------------------------- Automatic data lookup
+export type LookupDomain = 'orders' | 'expenses' | 'payments' | 'cash_advances';
+export const LOOKUP_LABEL: Record<LookupDomain, string> = { orders: 'Orders', expenses: 'Expenses', payments: 'Payments', cash_advances: 'Employee cash advances' };
+
+/** One automatic lookup: what was retrieved for the question, or exactly why it could not be. */
+export interface DataLookup {
+  domain: LookupDomain;
+  /** What was looked up, e.g. "Payments received (income records)". */
+  title: string;
+  status: 'ok' | 'empty' | 'unavailable' | 'not_allowed';
+  /** The period used, or null for "right now" data (e.g. all open orders). */
+  range: DateRange | null;
+  /** How the period was chosen, e.g. "last month (from your question)" or "this month (default)". */
+  rangeLabel: string;
+  retrievedAt: string | null;
+  source: SourceInfo | null;
+  /** Totals and counts calculated by code (display strings). */
+  figures: { label: string; value: string }[];
+  /** Limitation or note, e.g. "WAD Furniture Management is not connected: …". */
+  message: string | null;
 }

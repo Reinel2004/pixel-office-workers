@@ -52,6 +52,8 @@ export interface AppConfig {
   discussionsFile: string | null;
   /** UI Reviews are saved here (JSON, without the screenshots); null = kept in memory only. */
   uiReviewsFile: string | null;
+  /** The Task Board (reports and assigned tasks) is saved here (JSON); null = memory only. */
+  tasksFile: string | null;
   /** AI usage totals and office-set limits are saved here (JSON); null = memory only. */
   aiUsageFile: string | null;
   /** Default AI usage limits and prices (an admin can change them in the office). */
@@ -176,6 +178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: AppC
     taskLogFile: env.TASK_LOG_FILE === '' ? null : env.TASK_LOG_FILE || 'logs/tasks.jsonl',
     discussionsFile: env.DISCUSSIONS_FILE === undefined ? 'data/discussions.json' : env.DISCUSSIONS_FILE.trim() || null,
     uiReviewsFile: env.UI_REVIEWS_FILE === undefined ? 'data/ui-reviews.json' : env.UI_REVIEWS_FILE.trim() || null,
+    tasksFile: env.TASKS_FILE === undefined ? 'data/tasks.json' : env.TASKS_FILE.trim() || null,
     aiUsageFile: env.AI_USAGE_FILE === undefined ? 'data/ai-usage.json' : env.AI_USAGE_FILE.trim() || null,
     aiLimits: aiLimits(env, problems),
     staticDir: env.STATIC_DIR || null,
