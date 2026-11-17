@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { TemplateBrain } from './agents/brain';
 import { AGENT_BY_ID } from './agents/roster';
 import { Bus, type Insets } from './bridge';
 import { OfficeCanvas } from './office/OfficeCanvas';
+import { Office3D } from './office/Office3D';
 import { LiveStore } from './live/store';
 import { Engine, type StorageLike } from './sim/engine';
 import { playCue } from './sim/sound';
@@ -67,6 +68,8 @@ export default function App() {
   const [progress, setProgress] = useState(0.05);
   const [ready, setReady] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [view3d, setView3d] = useState(() => { try { return window.localStorage.getItem('wad-view3d') === '1'; } catch { return false; } });
+  const toggleView = () => setView3d((v) => { const n = !v; try { window.localStorage.setItem('wad-view3d', n ? '1' : '0'); } catch { /* ignore */ } return n; });
   const [assignAgent, setAssignAgent] = useState<AgentId>('lia');
   const [focusSignal, setFocusSignal] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -171,7 +174,7 @@ export default function App() {
       className={`app ${engine.paused ? 'is-paused' : ''} ${engine.settings.reducedMotion ? 'reduced' : ''}`}
       style={{ ['--bottom' as string]: `${bottomH + 24}px` }}
     >
-      <OfficeCanvas engine={engine} bus={bus} insets={insets} />
+      {view3d ? <Office3D key="3d" engine={engine} bus={bus} insets={insets} /> : <OfficeCanvas key="2d" engine={engine} bus={bus} insets={insets} />}
       <div className="vignette" aria-hidden="true" />
 
       <TopBar
@@ -225,6 +228,7 @@ export default function App() {
       )}
 
       <div className="camera-controls" style={{ bottom: bottomH + 20, right: !mobile && feedOpen ? 340 : 12 }}>
+        <button className="icon-btn view-toggle" onClick={toggleView} aria-label="Switch 2D or 3D view" title="Switch 2D / 3D view">{view3d ? '2D' : '3D'}</button>
         <button className="icon-btn" onClick={() => bus.emit('camera:zoom', { factor: 1.25 })} aria-label="Zoom in" title="Zoom in">
           <IconPlus />
         </button>
@@ -285,3 +289,4 @@ export default function App() {
     </div>
   );
 }
+
